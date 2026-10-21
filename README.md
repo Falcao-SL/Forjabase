@@ -9,8 +9,10 @@ Forja is a reimplementation inspired by [PocketBase](https://pocketbase.io)
 (© Gani Georgiev, MIT). Its REST API follows PocketBase's, so existing clients
 keep working.
 
-> **Status: 0.0.1, early development.** Today: the workspace builds, `forja serve`
-> runs and answers `/api/health`, and the admin shell compiles to WebAssembly.
+> **Status: 0.0.2, early development.** Working today: `forja serve`, superuser
+> login, base collections, records with filters, sorting, pagination and
+> access rules, all on SQLite and in PocketBase's API format (PocketBase's
+> Python client already works against it). The admin dashboard is still a shell.
 > Forja reaches **1.0.0 only when it is stable** (criteria in
 > [`docs/PLANO.md`](docs/PLANO.md) §6).
 
@@ -41,6 +43,7 @@ How to use each part: [`docs/GUIA.md`](docs/GUIA.md).
 ```sh
 git clone https://github.com/iramarfalcao/forjabase.git
 cd forjabase
+cargo run -p forja -- superuser upsert admin@example.com 'a-strong-password'
 cargo run -p forja -- serve
 curl http://127.0.0.1:8090/api/health
 ```

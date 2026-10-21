@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.0.2 — 2026-10-21
+
+- SQLite por projeto (`forja_data/default/data.db`, WAL) atrás do trait `Banco`, pronto para um Postgres opcional por projeto.
+- Superusuários: `forja superuser upsert`, login (`auth-with-password`) e `auth-refresh`; senha em Argon2id; token JWT invalidado ao trocar a senha.
+- Coleções base: listar, criar, ver e apagar; campos `text`, `editor`, `number`, `bool`, `email`, `url`, `date`, `select` e `json` com validação e códigos de erro do PocketBase.
+- Registros: listar (paginação, `filter`, `sort`, `skipTotal`), criar, ver, atualizar e apagar, com regras de acesso por operação e campos `hidden`.
+- Filtros do PocketBase convertidos em SQL com parâmetros (SQLite e Postgres), recusando campos desconhecidos.
+- `--dir` para a pasta de dados.
+
 ## 0.0.1 — 2026-10-21
 
 - Workspace Rust com quatro crates: `forja`, `forja-core`, `forja-server`, `forja-admin`.

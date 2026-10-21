@@ -23,7 +23,11 @@ pub fn hash_senha(senha: &str) -> Resultado<String> {
 
 pub fn conferir_senha(hash: &str, senha: &str) -> bool {
     PasswordHash::new(hash)
-        .map(|h| Argon2::default().verify_password(senha.as_bytes(), &h).is_ok())
+        .map(|h| {
+            Argon2::default()
+                .verify_password(senha.as_bytes(), &h)
+                .is_ok()
+        })
         .unwrap_or(false)
 }
 
@@ -47,7 +51,13 @@ fn agora_s() -> u64 {
         .unwrap_or(0)
 }
 
-pub fn emitir(segredo: &str, id: &str, colecao: &str, token_key: &str, validade: u64) -> Resultado<String> {
+pub fn emitir(
+    segredo: &str,
+    id: &str,
+    colecao: &str,
+    token_key: &str,
+    validade: u64,
+) -> Resultado<String> {
     let claims = Claims {
         id: id.into(),
         tipo: "auth".into(),
@@ -56,8 +66,12 @@ pub fn emitir(segredo: &str, id: &str, colecao: &str, token_key: &str, validade:
         tk: token_key.into(),
         exp: agora_s() + validade,
     };
-    encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(segredo.as_bytes()))
-        .map_err(|e| Erro::Interno(format!("jwt: {e}")))
+    encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(segredo.as_bytes()),
+    )
+    .map_err(|e| Erro::Interno(format!("jwt: {e}")))
 }
 
 /// Confere assinatura e validade. A `tokenKey` é conferida por quem chama.
@@ -66,7 +80,9 @@ pub fn validar(segredo: &str, token: &str) -> Resultado<Claims> {
     v.leeway = 0;
     decode::<Claims>(token, &DecodingKey::from_secret(segredo.as_bytes()), &v)
         .map(|d| d.claims)
-        .map_err(|_| Erro::NaoAutorizado("The request requires valid record authorization token.".into()))
+        .map_err(|_| {
+            Erro::NaoAutorizado("The request requires valid record authorization token.".into())
+        })
 }
 
 #[cfg(test)]

@@ -7,7 +7,7 @@ acrescenta (vários projetos, extensões em WebAssembly) e os SDKs.
 
 **Legenda:** ✅ feito · 🔨 em construção · 📋 planejado · ➕ só no Forja
 
-Versão atual: **0.0.1**. O Forja só vira **1.0.0** quando estiver estável
+Versão atual: **0.0.2**. O Forja só vira **1.0.0** quando estiver estável
 (critérios em [`PLANO.md`](PLANO.md) §6).
 
 ---
@@ -20,12 +20,14 @@ Versão atual: **0.0.1**. O Forja só vira **1.0.0** quando estiver estável
 | `forja serve` — sobe o servidor (porta padrão 8090, como o PocketBase) | ✅ |
 | `forja --version` | ✅ |
 | `serve` com HTTPS automático (Let's Encrypt) ao receber um domínio | 📋 |
-| `forja superuser create | upsert | update | delete | otp` | 📋 |
+| `forja superuser upsert` (criar ou trocar a senha) | ✅ |
+| `forja superuser create | update | delete | otp` | 📋 |
 | `forja migrate up | down | create | collections | history-sync` | 📋 |
 | Migrações automáticas ao mudar coleções pelo painel (automigrate) | 📋 |
 | `forja update` — atualização do próprio executável pelo GitHub Releases | 📋 |
 | Instalador do primeiro superusuário (link de uso único aberto no navegador) | 📋 |
-| Pasta de dados configurável (`--dir`), pasta pública (`--publicDir`), origens CORS (`--origins`) | 📋 |
+| Pasta de dados configurável (`--dir`, padrão `forja_data`) | ✅ |
+| Pasta pública (`--publicDir`) e origens CORS (`--origins`) | 📋 |
 | Modo de desenvolvimento (`--dev`): log de SQL e erros detalhados | 📋 |
 | Encerramento gracioso | 📋 |
 
@@ -33,8 +35,10 @@ Versão atual: **0.0.1**. O Forja só vira **1.0.0** quando estiver estável
 
 | Funcionalidade | Estado |
 |---|---|
-| SQLite em modo WAL, um arquivo por projeto (`data.db`) e outro para logs (`auxiliary.db`) | 📋 |
-| Consultas preparadas, transações e limite de conexões | 📋 |
+| SQLite em modo WAL, um arquivo por projeto (`forja_data/<projeto>/data.db`) | ✅ |
+| Banco separado para logs (`auxiliary.db`) | 📋 |
+| Consultas preparadas e transações | ✅ |
+| Pool de conexões | 📋 |
 | Índices (simples e únicos) definidos por coleção | 📋 |
 | Endpoint de SQL para superusuários (`/api/sql`) | 📋 |
 | Compatibilidade do arquivo com o PocketBase (abrir um `pb_data` existente) | 📋 (meta, ver PLANO §4) |
@@ -44,8 +48,10 @@ Versão atual: **0.0.1**. O Forja só vira **1.0.0** quando estiver estável
 
 | Funcionalidade | Estado |
 |---|---|
-| Tipos **base**, **auth** e **view** (view = consulta SQL somente leitura) | ✅ (modelo) · 📋 (comportamento) |
-| CRUD de coleções (`/api/collections`) | 📋 |
+| Tipo **base** | ✅ |
+| Tipos **auth** e **view** (view = consulta SQL somente leitura) | ✅ (modelo) · 📋 (comportamento) |
+| Listar, criar, ver e apagar coleções (`/api/collections`) | ✅ |
+| Atualizar coleção (`PATCH`, com mudança de campos) | 📋 |
 | Importar coleções em lote (`PUT /api/collections/import`) | 📋 |
 | Esvaziar coleção (`DELETE /api/collections/{c}/truncate`) | 📋 |
 | Modelos prontos de coleção (`/api/collections/meta/scaffolds`) | 📋 |
@@ -57,68 +63,74 @@ Versão atual: **0.0.1**. O Forja só vira **1.0.0** quando estiver estável
 
 | Tipo | O que guarda | Estado |
 |---|---|---|
-| `text` | texto, com mínimo, máximo, padrão (regex) e valor gerado automaticamente | ✅ (tipo) |
-| `editor` | HTML rico (com sanitização) | ✅ (tipo) |
-| `number` | número, com mínimo, máximo e "só inteiros" | ✅ (tipo) |
-| `bool` | verdadeiro/falso | ✅ (tipo) |
-| `email` | e-mail, com domínios permitidos ou bloqueados | ✅ (tipo) |
-| `url` | URL, com domínios permitidos ou bloqueados | ✅ (tipo) |
-| `date` | data e hora UTC, com mínimo e máximo | ✅ (tipo) |
+| `text` | texto, com mínimo, máximo, padrão (regex) e valor gerado automaticamente | ✅ |
+| `editor` | HTML rico (com sanitização) | ✅ |
+| `number` | número, com mínimo, máximo e "só inteiros" | ✅ |
+| `bool` | verdadeiro/falso | ✅ |
+| `email` | e-mail, com domínios permitidos ou bloqueados | ✅ |
+| `url` | URL, com domínios permitidos ou bloqueados | ✅ |
+| `date` | data e hora UTC, com mínimo e máximo | ✅ |
 | `autodate` | data de criação ou atualização, preenchida sozinha | ✅ (tipo) |
-| `select` | um ou vários valores de uma lista | ✅ (tipo) |
+| `select` | um ou vários valores de uma lista | ✅ |
 | `file` | um ou vários arquivos, com tipos MIME, tamanho e miniaturas | ✅ (tipo) |
 | `relation` | um ou vários registros de outra coleção, com exclusão em cascata | ✅ (tipo) |
-| `json` | qualquer JSON, com tamanho máximo | ✅ (tipo) |
+| `json` | qualquer JSON, com tamanho máximo | ✅ |
 | `password` | senha com hash (bcrypt), nunca devolvida | ✅ (tipo) |
 | `geoPoint` | latitude e longitude | ✅ (tipo) |
 
 "✅ (tipo)" quer dizer que o tipo existe no modelo e serializa com o mesmo nome
-do PocketBase; validação e armazenamento ainda são 📋.
+do PocketBase, mas ainda não guarda valores: a coleção que o usa é recusada
+com uma mensagem clara. "✅" quer dizer validado e guardado.
 
 ### 3.2 Regras de acesso
 
 | Funcionalidade | Estado |
 |---|---|
-| Regras por operação: listar, ver, criar, atualizar, apagar | 📋 |
+| Regras por operação: listar, ver, criar, atualizar, apagar, com filtros sobre os campos do registro | ✅ |
 | Regras de auth: login (`authRule`) e gerenciar outros usuários (`manageRule`) | 📋 |
-| Regra vazia = só superusuário; `""` = público | 📋 |
-| Mesma sintaxe dos filtros (§4), com `@request.auth.*`, `@request.body.*`, `@request.query.*`, `@request.headers.*`, `@request.context` e `@collection.*` | 📋 |
+| Regra nula = só superusuário; `""` = público | ✅ |
+| Regras com `@request.auth.*`, `@request.body.*`, `@request.query.*`, `@request.headers.*`, `@request.context` e `@collection.*` | 📋 |
 
 ## 4. Registros (CRUD) e consulta
 
 | Funcionalidade | Estado |
 |---|---|
-| Listar com paginação (`page`, `perPage`, `skipTotal`) | 📋 |
-| Ver, criar, atualizar e apagar registros | 📋 |
-| **Filtros** com `=`, `!=`, `>`, `>=`, `<`, `<=`, `~` (contém), `!~`, e as versões "algum item" (`?=`, `?!=`, `?>`, `?~`…), `&&`, `||` e parênteses | 📋 |
+| Listar com paginação (`page`, `perPage`, `skipTotal`) | ✅ |
+| Ver, criar, atualizar e apagar registros (JSON) | ✅ |
+| **Filtros** com `=`, `!=`, `>`, `>=`, `<`, `<=`, `~` (contém), `!~`, `&&`, `||`, parênteses, textos, números, `true`, `false` e `null`, sempre como parâmetros de SQL | ✅ |
+| Operadores "algum item" (`?=`, `?!=`, `?>`, `?~`…) | 📋 |
 | Macros de data (`@now`, `@yesterday`, `@todayStart`, `@monthEnd`…) | 📋 |
 | Modificadores `:isset`, `:changed`, `:length`, `:each`, `:lower` | 📋 |
 | Funções `geoDistance()` e `strftime()` | 📋 |
-| Ordenação (`sort`, com `@random` e `@rowid`) | 📋 |
+| Ordenação (`sort`, com `-` e `@random`) | ✅ |
+| Ordenação por `@rowid` | 📋 |
 | Expandir relações (`expand`, inclusive aninhadas e reversas `coleção_via_campo`) | 📋 |
 | Escolher campos (`fields`, com `:excerpt`) | 📋 |
 | Modificadores de valor no envio (`campo+`, `+campo`, `campo-`) | 📋 |
 | Upload de arquivos em `multipart/form-data` | 📋 |
 | **Lote** (`/api/batch`): várias operações numa transação | 📋 |
-| Validação com mensagens de erro por campo, no formato do PocketBase | 📋 |
+| Validação com mensagens de erro por campo, no formato do PocketBase | ✅ |
+| Campos `hidden` só para superusuários | ✅ |
 
 ## 5. Autenticação
 
 | Funcionalidade | Estado |
 |---|---|
-| E-mail (ou outro campo de identidade) e senha | 📋 |
+| Superusuário com e-mail e senha (`_superusers/auth-with-password`), senha em Argon2id | ✅ |
+| Usuários de coleções auth com e-mail (ou outro campo de identidade) e senha | 📋 |
 | **OTP** por e-mail (código de uso único) | 📋 |
 | **MFA** (dois métodos diferentes em sequência) | 📋 |
 | **OAuth2** com os provedores do PocketBase: Apple, Bitbucket, Box, Discord, Facebook, Gitea, Gitee, GitHub, GitLab, Google, Instagram, Kakao, Lark, Linear, LiveChat, mailcow, Microsoft, monday.com, Notion, OpenID Connect (até 3 genéricos), Patreon, Planning Center, Spotify, Strava, Trakt, Twitch, Twitter/X, VK, WakaTime, Yandex | 📋 |
 | Fluxo OAuth2 de redirecionamento (`/api/oauth2-redirect`) e PKCE | 📋 |
-| Renovar token (`auth-refresh`) | 📋 |
+| Renovar token (`auth-refresh`) | ✅ (superusuário) |
 | Verificação de e-mail (pedir e confirmar) | 📋 |
 | Redefinir senha (pedir e confirmar) | 📋 |
 | Trocar e-mail (pedir e confirmar) | 📋 |
 | Personificação: superusuário gera token de outro usuário (`impersonate`) | 📋 |
 | Alerta de login de novo dispositivo (`authAlert`) | 📋 |
 | Métodos de login disponíveis por coleção (`auth-methods`) | 📋 |
-| Tokens JWT com segredo e validade por tipo (auth, verificação, senha, e-mail, arquivo) | 📋 |
+| Token JWT de autenticação, invalidado ao trocar a senha | ✅ |
+| Tokens de verificação, senha, e-mail e arquivo | 📋 |
 | Modelos de e-mail editáveis (verificação, senha, troca de e-mail, OTP, alerta) | 📋 |
 | Gerador do segredo do Sign in with Apple | 📋 |
 
@@ -271,7 +283,8 @@ remoto (com token).
 
 | Funcionalidade | Estado |
 |---|---|
-| Testes de unidade e de API em todo crate | 🔨 |
+| Testes de unidade e de API em todo crate | ✅ (23 testes) |
+| Cliente Python do PocketBase (`pocketbase` 0.16) funciona contra o Forja: login, CRUD, filtro e ordenação | ✅ (conferido à mão em 2026-10-21) |
 | Suíte de compatibilidade: as mesmas chamadas contra PocketBase e Forja, respostas iguais | 📋 |
 | CI no GitHub Actions (formatação, lint, testes, build do painel em WASM) | 🔨 |
 | Executáveis para macOS, Linux e Windows (x86_64 e arm64) no GitHub Releases | 📋 |

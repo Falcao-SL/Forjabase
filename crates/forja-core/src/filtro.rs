@@ -17,7 +17,11 @@ const MAX_FILTRO: usize = 3500;
 pub enum Expr {
     E(Box<Expr>, Box<Expr>),
     Ou(Box<Expr>, Box<Expr>),
-    Cmp { esq: Operando, op: Op, dir: Operando },
+    Cmp {
+        esq: Operando,
+        op: Op,
+        dir: Operando,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -163,7 +167,9 @@ fn tokens(s: &str) -> Resultado<Vec<Token>> {
             }
             a if a.is_ascii_alphabetic() || a == '_' || a == '@' => {
                 let ini = i;
-                while i < c.len() && (c[i].is_ascii_alphanumeric() || matches!(c[i], '_' | '.' | ':' | '@')) {
+                while i < c.len()
+                    && (c[i].is_ascii_alphanumeric() || matches!(c[i], '_' | '.' | ':' | '@'))
+                {
                     i += 1;
                 }
                 let palavra: String = c[ini..i].iter().collect();
@@ -234,7 +240,9 @@ impl Analisador {
         match t {
             Some(Token::Ident(n)) => Ok(Operando::Campo(n)),
             Some(Token::Lit(l)) => Ok(Operando::Valor(l)),
-            _ => Err(Erro::invalido("Invalid filter: expected a field or a value")),
+            _ => Err(Erro::invalido(
+                "Invalid filter: expected a field or a value",
+            )),
         }
     }
 }
@@ -244,7 +252,10 @@ pub fn analisar(s: &str) -> Resultado<Expr> {
     if s.len() > MAX_FILTRO {
         return Err(Erro::invalido("Invalid filter: too long"));
     }
-    let mut a = Analisador { t: tokens(s)?, i: 0 };
+    let mut a = Analisador {
+        t: tokens(s)?,
+        i: 0,
+    };
     let e = a.ou()?;
     if a.i != a.t.len() {
         return Err(Erro::invalido("Invalid filter: unexpected token"));
@@ -261,7 +272,9 @@ fn coluna(nome: &str, valido: &dyn Fn(&str) -> bool) -> Resultado<String> {
         )));
     }
     if !valido(nome) {
-        return Err(Erro::invalido(format!("Invalid filter: unknown field '{nome}'")));
+        return Err(Erro::invalido(format!(
+            "Invalid filter: unknown field '{nome}'"
+        )));
     }
     Ok(format!("\"{nome}\""))
 }
@@ -303,14 +316,23 @@ impl Escritor<'_> {
             let outro = if nulo(esq) { dir } else { esq };
             let col = self.operando(outro)?;
             let vazio = format!("({col} IS NULL OR {col} = '')");
-            return Ok(if op == Op::Igual { vazio } else { format!("NOT {vazio}") });
+            return Ok(if op == Op::Igual {
+                vazio
+            } else {
+                format!("NOT {vazio}")
+            });
         }
         if matches!(op, Op::Contem | Op::NaoContem) {
             let col = self.operando(esq)?;
             let padrao = match dir {
                 Operando::Valor(Literal::Texto(t)) if t.contains('%') => t.clone(),
                 Operando::Valor(Literal::Texto(t)) => {
-                    format!("%{}%", t.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"))
+                    format!(
+                        "%{}%",
+                        t.replace('\\', "\\\\")
+                            .replace('%', "\\%")
+                            .replace('_', "\\_")
+                    )
                 }
                 Operando::Valor(Literal::Numero(n)) => format!("%{n}%"),
                 _ => return Err(Erro::invalido("Invalid filter: '~' needs a text value")),
@@ -332,16 +354,27 @@ impl Escritor<'_> {
             Op::MenorIgual => "<=",
             Op::Contem | Op::NaoContem => unreachable!(),
         };
-        Ok(format!("{} {simbolo} {}", self.operando(esq)?, self.operando(dir)?))
+        Ok(format!(
+            "{} {simbolo} {}",
+            self.operando(esq)?,
+            self.operando(dir)?
+        ))
     }
 }
 
 /// Converte um filtro em SQL. `valido` diz quais nomes de campo existem.
 pub fn para_sql(filtro: &str, valido: &dyn Fn(&str) -> bool, dialeto: Dialeto) -> Resultado<Sql> {
     let e = analisar(filtro)?;
-    let mut w = Escritor { dialeto, params: vec![], valido };
+    let mut w = Escritor {
+        dialeto,
+        params: vec![],
+        valido,
+    };
     let texto = w.expr(&e)?;
-    Ok(Sql { texto, params: w.params })
+    Ok(Sql {
+        texto,
+        params: w.params,
+    })
 }
 
 /// `sort` do PocketBase (`-created,nome`, `@random`) em `ORDER BY`.
@@ -359,7 +392,8 @@ pub fn ordem(sort: &str, valido: &dyn Fn(&str) -> bool, dialeto: Dialeto) -> Res
             });
             continue;
         }
-        let col = coluna(nome, valido).map_err(|_| Erro::invalido(format!("Invalid sort field '{nome}'")))?;
+        let col = coluna(nome, valido)
+            .map_err(|_| Erro::invalido(format!("Invalid sort field '{nome}'")))?;
         partes.push(format!("{col} {}", if desc { "DESC" } else { "ASC" }));
     }
     Ok(partes.join(", "))
@@ -380,36 +414,61 @@ mod tests {
     #[test]
     fn comparacoes_e_precedencia() {
         let s = sql("preco < 50 && nome ~ 'café' || ativo = true");
-        assert_eq!(s.texto, "((\"preco\" < ? AND \"nome\" LIKE ? ESCAPE '\\') OR \"ativo\" = ?)");
+        assert_eq!(
+            s.texto,
+            "((\"preco\" < ? AND \"nome\" LIKE ? ESCAPE '\\') OR \"ativo\" = ?)"
+        );
         assert_eq!(
             s.params,
-            vec![Literal::Numero(50.0), Literal::Texto("%café%".into()), Literal::Bool(true)]
+            vec![
+                Literal::Numero(50.0),
+                Literal::Texto("%café%".into()),
+                Literal::Bool(true)
+            ]
         );
     }
 
     #[test]
     fn parenteses() {
         let s = sql("(preco >= 1 || preco <= 0) && nome != \"x\"");
-        assert_eq!(s.texto, "((\"preco\" >= ? OR \"preco\" <= ?) AND \"nome\" != ?)");
+        assert_eq!(
+            s.texto,
+            "((\"preco\" >= ? OR \"preco\" <= ?) AND \"nome\" != ?)"
+        );
     }
 
     #[test]
     fn nulo_vale_para_vazio() {
-        assert_eq!(sql("nome = null").texto, "(\"nome\" IS NULL OR \"nome\" = '')");
-        assert_eq!(sql("nome != null").texto, "NOT (\"nome\" IS NULL OR \"nome\" = '')");
+        assert_eq!(
+            sql("nome = null").texto,
+            "(\"nome\" IS NULL OR \"nome\" = '')"
+        );
+        assert_eq!(
+            sql("nome != null").texto,
+            "NOT (\"nome\" IS NULL OR \"nome\" = '')"
+        );
     }
 
     #[test]
     fn contem_escapa_curingas_e_respeita_porcento_explicito() {
-        assert_eq!(sql("nome ~ '50%_off'").params, vec![Literal::Texto("50%_off".into())]);
-        assert_eq!(sql("nome ~ 'a_b'").params, vec![Literal::Texto("%a\\_b%".into())]);
+        assert_eq!(
+            sql("nome ~ '50%_off'").params,
+            vec![Literal::Texto("50%_off".into())]
+        );
+        assert_eq!(
+            sql("nome ~ 'a_b'").params,
+            vec![Literal::Texto("%a\\_b%".into())]
+        );
         assert!(sql("nome !~ 'x'").texto.contains("NOT LIKE"));
     }
 
     #[test]
     fn postgres_usa_marcadores_numerados_e_ilike() {
         let s = para_sql("preco > 1 && nome ~ 'a'", &campos, Dialeto::Postgres).unwrap();
-        assert_eq!(s.texto, "(\"preco\" > $1 AND \"nome\" ILIKE $2 ESCAPE '\\')");
+        assert_eq!(
+            s.texto,
+            "(\"preco\" > $1 AND \"nome\" ILIKE $2 ESCAPE '\\')"
+        );
     }
 
     #[test]
@@ -427,8 +486,14 @@ mod tests {
 
     #[test]
     fn ordenacao() {
-        assert_eq!(ordem("-created,nome", &campos, Dialeto::Sqlite).unwrap(), "\"created\" DESC, \"nome\" ASC");
-        assert_eq!(ordem("@random", &campos, Dialeto::Sqlite).unwrap(), "RANDOM()");
+        assert_eq!(
+            ordem("-created,nome", &campos, Dialeto::Sqlite).unwrap(),
+            "\"created\" DESC, \"nome\" ASC"
+        );
+        assert_eq!(
+            ordem("@random", &campos, Dialeto::Sqlite).unwrap(),
+            "RANDOM()"
+        );
         assert!(ordem("nome; DROP", &campos, Dialeto::Sqlite).is_err());
     }
 }

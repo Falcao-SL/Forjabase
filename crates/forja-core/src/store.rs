@@ -29,7 +29,14 @@ pub struct Consulta {
 
 impl Default for Consulta {
     fn default() -> Self {
-        Consulta { filtro: None, ordem: None, pagina: 1, por_pagina: 30, pular_total: false, regra: None }
+        Consulta {
+            filtro: None,
+            ordem: None,
+            pagina: 1,
+            por_pagina: 30,
+            pular_total: false,
+            regra: None,
+        }
     }
 }
 
@@ -73,7 +80,13 @@ pub trait Banco: Send + Sync {
     fn listar(&self, c: &Collection, q: &Consulta) -> Resultado<Lista>;
     fn registro(&self, c: &Collection, id: &str, regra: Option<&str>) -> Resultado<Value>;
     fn criar(&self, c: &Collection, dados: &Map<String, Value>) -> Resultado<Value>;
-    fn atualizar(&self, c: &Collection, id: &str, dados: &Map<String, Value>, regra: Option<&str>) -> Resultado<Value>;
+    fn atualizar(
+        &self,
+        c: &Collection,
+        id: &str,
+        dados: &Map<String, Value>,
+        regra: Option<&str>,
+    ) -> Resultado<Value>;
     fn apagar(&self, c: &Collection, id: &str, regra: Option<&str>) -> Resultado<()>;
 
     fn superuser_salvar(&self, email: &str, senha: &str) -> Resultado<Superusuario>;
@@ -121,7 +134,8 @@ CREATE TABLE IF NOT EXISTS _superusers (
 impl Sqlite {
     /// Abre (ou cria) o banco de um projeto em `pasta/data.db`.
     pub fn abrir(pasta: &Path) -> Resultado<Sqlite> {
-        std::fs::create_dir_all(pasta).map_err(|e| Erro::Interno(format!("pasta de dados: {e}")))?;
+        std::fs::create_dir_all(pasta)
+            .map_err(|e| Erro::Interno(format!("pasta de dados: {e}")))?;
         Sqlite::iniciar(Connection::open(pasta.join("data.db"))?)
     }
 
@@ -135,7 +149,9 @@ impl Sqlite {
             "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 10000; PRAGMA synchronous = NORMAL;",
         )?;
         conn.execute_batch(ESQUEMA)?;
-        Ok(Sqlite { conn: Mutex::new(conn) })
+        Ok(Sqlite {
+            conn: Mutex::new(conn),
+        })
     }
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -150,7 +166,14 @@ fn nome_valido(n: &str) -> bool {
         && n.len() <= 100
 }
 
-const RESERVADOS: [&str; 6] = ["id", "created", "updated", "collectionId", "collectionName", "expand"];
+const RESERVADOS: [&str; 6] = [
+    "id",
+    "created",
+    "updated",
+    "collectionId",
+    "collectionName",
+    "expand",
+];
 
 fn tipo_sql(f: &Field) -> &'static str {
     match f.kind {
@@ -182,10 +205,19 @@ fn valor_do_campo(f: &Field, v: Option<&Value>, erros: &mut Map<String, Value>) 
         erro_campo(erros, n, "validation_required", "Cannot be blank.".into())
     };
     let invalido = |erros: &mut Map<String, Value>| {
-        erro_campo(erros, n, "validation_invalid_value", "Invalid value.".into())
+        erro_campo(
+            erros,
+            n,
+            "validation_invalid_value",
+            "Invalid value.".into(),
+        )
     };
     match f.kind {
-        FieldType::Text | FieldType::Editor | FieldType::Email | FieldType::Url | FieldType::Date => {
+        FieldType::Text
+        | FieldType::Editor
+        | FieldType::Email
+        | FieldType::Url
+        | FieldType::Date => {
             let t = match v {
                 None | Some(Value::Null) => String::new(),
                 Some(Value::String(s)) => s.clone(),
@@ -208,11 +240,21 @@ fn valor_do_campo(f: &Field, v: Option<&Value>, erros: &mut Map<String, Value>) 
                     if let Some(min) = f.opcao_f64("min").filter(|m| *m > 0.0)
                         && tam < min
                     {
-                        erro_campo(erros, n, "validation_min_text_constraint", format!("Must be at least {min} character(s)."));
+                        erro_campo(
+                            erros,
+                            n,
+                            "validation_min_text_constraint",
+                            format!("Must be at least {min} character(s)."),
+                        );
                     }
                     let max = f.opcao_f64("max").filter(|m| *m > 0.0).unwrap_or(5000.0);
                     if f.kind == FieldType::Text && tam > max {
-                        erro_campo(erros, n, "validation_max_text_constraint", format!("Must be less than {max} character(s)."));
+                        erro_campo(
+                            erros,
+                            n,
+                            "validation_max_text_constraint",
+                            format!("Must be less than {max} character(s)."),
+                        );
                     }
                 }
                 FieldType::Email => {
@@ -221,11 +263,18 @@ fn valor_do_campo(f: &Field, v: Option<&Value>, erros: &mut Map<String, Value>) 
                     }) && !t.contains(char::is_whitespace)
                         && t.matches('@').count() == 1;
                     if !ok {
-                        erro_campo(erros, n, "validation_is_email", "Must be a valid email address.".into());
+                        erro_campo(
+                            erros,
+                            n,
+                            "validation_is_email",
+                            "Must be a valid email address.".into(),
+                        );
                     }
                 }
                 FieldType::Url => {
-                    let resto = t.strip_prefix("https://").or_else(|| t.strip_prefix("http://"));
+                    let resto = t
+                        .strip_prefix("https://")
+                        .or_else(|| t.strip_prefix("http://"));
                     if !resto.is_some_and(|r| !r.is_empty() && !r.contains(char::is_whitespace)) {
                         erro_campo(erros, n, "validation_is_url", "Must be a valid url.".into());
                     }
@@ -239,7 +288,12 @@ fn valor_do_campo(f: &Field, v: Option<&Value>, erros: &mut Map<String, Value>) 
                         && b[7] == b'-'
                         && b[8..10].iter().all(u8::is_ascii_digit);
                     if !ok {
-                        erro_campo(erros, n, "validation_invalid_date", "Must be a valid date.".into());
+                        erro_campo(
+                            erros,
+                            n,
+                            "validation_invalid_date",
+                            "Must be a valid date.".into(),
+                        );
                     }
                 }
                 _ => {}
@@ -269,15 +323,30 @@ fn valor_do_campo(f: &Field, v: Option<&Value>, erros: &mut Map<String, Value>) 
             if let Some(min) = f.opcao_f64("min")
                 && x < min
             {
-                erro_campo(erros, n, "validation_min_number_constraint", format!("Must be larger than {min}."));
+                erro_campo(
+                    erros,
+                    n,
+                    "validation_min_number_constraint",
+                    format!("Must be larger than {min}."),
+                );
             }
             if let Some(max) = f.opcao_f64("max")
                 && x > max
             {
-                erro_campo(erros, n, "validation_max_number_constraint", format!("Must be less than {max}."));
+                erro_campo(
+                    erros,
+                    n,
+                    "validation_max_number_constraint",
+                    format!("Must be less than {max}."),
+                );
             }
             if f.opcao_bool("onlyInt") && x.fract() != 0.0 {
-                erro_campo(erros, n, "validation_only_int_constraint", "Decimal numbers are not allowed.".into());
+                erro_campo(
+                    erros,
+                    n,
+                    "validation_only_int_constraint",
+                    "Decimal numbers are not allowed.".into(),
+                );
             }
             Sv::Real(x)
         }
@@ -302,7 +371,11 @@ fn valor_do_campo(f: &Field, v: Option<&Value>, erros: &mut Map<String, Value>) 
                 .options
                 .get("values")
                 .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
             let escolhidos: Vec<String> = match v {
                 None | Some(Value::Null) => vec![],
@@ -329,7 +402,12 @@ fn valor_do_campo(f: &Field, v: Option<&Value>, erros: &mut Map<String, Value>) 
             }
             let max = f.opcao_f64("maxSelect").unwrap_or(1.0).max(1.0) as usize;
             if escolhidos.len() > max {
-                erro_campo(erros, n, "validation_too_many_values", format!("Select no more than {max}."));
+                erro_campo(
+                    erros,
+                    n,
+                    "validation_too_many_values",
+                    format!("Select no more than {max}."),
+                );
             }
             if escolhidos.is_empty() && f.required {
                 obrigatorio(erros);
@@ -371,7 +449,9 @@ fn para_json(f: &Field, v: Sv) -> Value {
         (FieldType::Number, Sv::Real(x)) => json!(x),
         (FieldType::Bool, Sv::Integer(i)) => json!(i != 0),
         (FieldType::Json, Sv::Text(t)) => serde_json::from_str(&t).unwrap_or(Value::Null),
-        (FieldType::Select, Sv::Text(t)) if f.multiplo() => serde_json::from_str(&t).unwrap_or(json!([])),
+        (FieldType::Select, Sv::Text(t)) if f.multiplo() => {
+            serde_json::from_str(&t).unwrap_or(json!([]))
+        }
         (_, Sv::Text(t)) => json!(t),
         (_, Sv::Integer(i)) => json!(i),
         (_, Sv::Real(x)) => json!(x),
@@ -403,16 +483,28 @@ fn linha_para_registro(c: &Collection, r: &rusqlite::Row) -> rusqlite::Result<Va
 }
 
 /// Regra de acesso + filtro do usuário em um `WHERE`, com os parâmetros.
-fn onde(c: &Collection, regra: Option<&str>, filtro_usuario: Option<&str>) -> Resultado<(String, Vec<Sv>)> {
+fn onde(
+    c: &Collection,
+    regra: Option<&str>,
+    filtro_usuario: Option<&str>,
+) -> Resultado<(String, Vec<Sv>)> {
     let valido = |n: &str| c.coluna_valida(n);
     let mut partes = vec![];
     let mut params = vec![];
-    for f in [regra, filtro_usuario].into_iter().flatten().filter(|f| !f.trim().is_empty()) {
+    for f in [regra, filtro_usuario]
+        .into_iter()
+        .flatten()
+        .filter(|f| !f.trim().is_empty())
+    {
         let sql = filtro::para_sql(f, &valido, Dialeto::Sqlite)?;
         partes.push(sql.texto);
         params.extend(sql.params.into_iter().map(literal_sql));
     }
-    let texto = if partes.is_empty() { String::new() } else { format!(" WHERE {}", partes.join(" AND ")) };
+    let texto = if partes.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", partes.join(" AND "))
+    };
     Ok((texto, params))
 }
 
@@ -452,8 +544,16 @@ fn ler_superuser(r: &rusqlite::Row) -> rusqlite::Result<Superusuario> {
 
 fn validar_colecao(c: &Collection) -> Resultado<()> {
     let mut erros = Map::new();
-    if !nome_valido(&c.name) || c.name.starts_with('_') || c.name.to_lowercase().starts_with("sqlite_") {
-        erro_campo(&mut erros, "name", "validation_invalid_name", "Invalid collection name.".into());
+    if !nome_valido(&c.name)
+        || c.name.starts_with('_')
+        || c.name.to_lowercase().starts_with("sqlite_")
+    {
+        erro_campo(
+            &mut erros,
+            "name",
+            "validation_invalid_name",
+            "Invalid collection name.".into(),
+        );
     }
     if c.kind != CollectionType::Base {
         erro_campo(
@@ -467,10 +567,20 @@ fn validar_colecao(c: &Collection) -> Resultado<()> {
     for (i, f) in c.fields.iter().enumerate() {
         let chave = format!("fields.{i}.name");
         if !nome_valido(&f.name) || RESERVADOS.contains(&f.name.as_str()) {
-            erro_campo(&mut erros, &chave, "validation_invalid_name", "Invalid field name.".into());
+            erro_campo(
+                &mut erros,
+                &chave,
+                "validation_invalid_name",
+                "Invalid field name.".into(),
+            );
         }
         if vistos.iter().any(|v| v.eq_ignore_ascii_case(&f.name)) {
-            erro_campo(&mut erros, &chave, "validation_duplicated_field_name", "Duplicated field name.".into());
+            erro_campo(
+                &mut erros,
+                &chave,
+                "validation_duplicated_field_name",
+                "Duplicated field name.".into(),
+            );
         }
         vistos.push(f.name.clone());
         if !f.kind.suportado() {
@@ -478,7 +588,13 @@ fn validar_colecao(c: &Collection) -> Resultado<()> {
                 &mut erros,
                 &format!("fields.{i}.type"),
                 "validation_not_supported",
-                format!("Field type '{}' is not supported in this version.", serde_json::to_value(f.kind).unwrap_or_default().as_str().unwrap_or("")),
+                format!(
+                    "Field type '{}' is not supported in this version.",
+                    serde_json::to_value(f.kind)
+                        .unwrap_or_default()
+                        .as_str()
+                        .unwrap_or("")
+                ),
             );
         }
     }
@@ -501,7 +617,10 @@ fn validar_colecao(c: &Collection) -> Resultado<()> {
     if erros.is_empty() {
         Ok(())
     } else {
-        Err(Erro::Invalido { mensagem: "Failed to create collection.".into(), campos: erros })
+        Err(Erro::Invalido {
+            mensagem: "Failed to create collection.".into(),
+            campos: erros,
+        })
     }
 }
 
@@ -513,20 +632,29 @@ impl Banco for Sqlite {
     fn segredo(&self) -> Resultado<String> {
         let conn = self.conn();
         if let Some(s) = conn
-            .query_row("SELECT value FROM _params WHERE id = 'jwtSecret'", [], |r| r.get::<_, String>(0))
+            .query_row(
+                "SELECT value FROM _params WHERE id = 'jwtSecret'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
             .optional()?
         {
             return Ok(s);
         }
         let s = id::aleatorio(50);
-        conn.execute("INSERT INTO _params (id, value) VALUES ('jwtSecret', ?1)", params![s])?;
+        conn.execute(
+            "INSERT INTO _params (id, value) VALUES ('jwtSecret', ?1)",
+            params![s],
+        )?;
         Ok(s)
     }
 
     fn colecoes(&self) -> Resultado<Vec<Collection>> {
         let conn = self.conn();
         let mut st = conn.prepare("SELECT * FROM _collections ORDER BY created, rowid")?;
-        let v = st.query_map([], ler_colecao)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let v = st
+            .query_map([], ler_colecao)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(v)
     }
 
@@ -544,13 +672,20 @@ impl Banco for Sqlite {
     fn criar_colecao(&self, mut c: Collection) -> Resultado<Collection> {
         validar_colecao(&c)?;
         let agora = agora();
-        c.id = if c.id.is_empty() { format!("pbc_{}", id::novo()) } else { c.id };
+        c.id = if c.id.is_empty() {
+            format!("pbc_{}", id::novo())
+        } else {
+            c.id
+        };
         c.system = false;
         c.created = agora.clone();
         c.updated = agora;
         for f in &mut c.fields {
             if f.id.is_empty() {
-                let tipo = serde_json::to_value(f.kind).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default();
+                let tipo = serde_json::to_value(f.kind)
+                    .ok()
+                    .and_then(|v| v.as_str().map(String::from))
+                    .unwrap_or_default();
                 f.id = format!("{tipo}{}", id::aleatorio(10));
             }
         }
@@ -563,14 +698,30 @@ impl Banco for Sqlite {
         )?;
         if existe {
             let mut erros = Map::new();
-            erro_campo(&mut erros, "name", "validation_collection_name_exists", "Collection name must be unique (case insensitive).".into());
-            return Err(Erro::Invalido { mensagem: "Failed to create collection.".into(), campos: erros });
+            erro_campo(
+                &mut erros,
+                "name",
+                "validation_collection_name_exists",
+                "Collection name must be unique (case insensitive).".into(),
+            );
+            return Err(Erro::Invalido {
+                mensagem: "Failed to create collection.".into(),
+                campos: erros,
+            });
         }
         let mut colunas_sql = vec!["\"id\" TEXT PRIMARY KEY NOT NULL".to_string()];
-        colunas_sql.extend(c.fields.iter().map(|f| format!("\"{}\" {}", f.name, tipo_sql(f))));
+        colunas_sql.extend(
+            c.fields
+                .iter()
+                .map(|f| format!("\"{}\" {}", f.name, tipo_sql(f))),
+        );
         colunas_sql.push("\"created\" TEXT NOT NULL DEFAULT ''".into());
         colunas_sql.push("\"updated\" TEXT NOT NULL DEFAULT ''".into());
-        tx.execute_batch(&format!("CREATE TABLE \"{}\" ({});", c.name, colunas_sql.join(", ")))?;
+        tx.execute_batch(&format!(
+            "CREATE TABLE \"{}\" ({});",
+            c.name,
+            colunas_sql.join(", ")
+        ))?;
         tx.execute(
             "INSERT INTO _collections (id, name, type, system, fields, listRule, viewRule, createRule, updateRule, deleteRule, indexes, created, updated)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
@@ -612,7 +763,12 @@ impl Banco for Sqlite {
         let pagina = q.pagina.max(1);
         let (onde_sql, params) = onde(c, q.regra.as_deref(), q.filtro.as_deref())?;
         let ordem = match q.ordem.as_deref().filter(|s| !s.trim().is_empty()) {
-            Some(s) => format!(" ORDER BY {}", filtro::ordem(s, &|n| c.coluna_valida(n), Dialeto::Sqlite)?),
+            // `rowid` desempata valores iguais: a mesma consulta devolve sempre a
+            // mesma ordem, e a paginação não repete nem pula registros.
+            Some(s) => format!(
+                " ORDER BY {}, rowid",
+                filtro::ordem(s, &|n| c.coluna_valida(n), Dialeto::Sqlite)?
+            ),
             None => " ORDER BY rowid".into(),
         };
         let conn = self.conn();
@@ -633,15 +789,31 @@ impl Banco for Sqlite {
         );
         let mut st = conn.prepare(&sql)?;
         let items = st
-            .query_map(params_from_iter(params.iter()), |r| linha_para_registro(c, r))?
+            .query_map(params_from_iter(params.iter()), |r| {
+                linha_para_registro(c, r)
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let paginas = if total < 0 { -1 } else { (total + por_pagina as i64 - 1) / por_pagina as i64 };
-        Ok(Lista { page: pagina, per_page: por_pagina, total_items: total, total_pages: paginas, items })
+        let paginas = if total < 0 {
+            -1
+        } else {
+            (total + por_pagina as i64 - 1) / por_pagina as i64
+        };
+        Ok(Lista {
+            page: pagina,
+            per_page: por_pagina,
+            total_items: total,
+            total_pages: paginas,
+            items,
+        })
     }
 
     fn registro(&self, c: &Collection, id: &str, regra: Option<&str>) -> Resultado<Value> {
         let (onde_sql, mut params) = onde(c, regra, None)?;
-        let filtro_id = if onde_sql.is_empty() { " WHERE \"id\" = ?".to_string() } else { format!("{onde_sql} AND \"id\" = ?") };
+        let filtro_id = if onde_sql.is_empty() {
+            " WHERE \"id\" = ?".to_string()
+        } else {
+            format!("{onde_sql} AND \"id\" = ?")
+        };
         params.push(Sv::Text(id.into()));
         let conn = self.conn();
         conn.query_row(
@@ -655,17 +827,33 @@ impl Banco for Sqlite {
 
     fn criar(&self, c: &Collection, dados: &Map<String, Value>) -> Resultado<Value> {
         let mut erros = Map::new();
-        let novo_id = match dados.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+        let novo_id = match dados
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
             Some(s) if id::valido(s) => s.to_string(),
             Some(_) => {
-                erro_campo(&mut erros, "id", "validation_invalid_id", "Must be 15 characters [a-z0-9].".into());
+                erro_campo(
+                    &mut erros,
+                    "id",
+                    "validation_invalid_id",
+                    "Must be 15 characters [a-z0-9].".into(),
+                );
                 String::new()
             }
             None => id::novo(),
         };
-        let valores: Vec<Sv> = c.fields.iter().map(|f| valor_do_campo(f, dados.get(&f.name), &mut erros)).collect();
+        let valores: Vec<Sv> = c
+            .fields
+            .iter()
+            .map(|f| valor_do_campo(f, dados.get(&f.name), &mut erros))
+            .collect();
         if !erros.is_empty() {
-            return Err(Erro::Invalido { mensagem: "Failed to create record.".into(), campos: erros });
+            return Err(Erro::Invalido {
+                mensagem: "Failed to create record.".into(),
+                campos: erros,
+            });
         }
         let agora = agora();
         let mut todos = vec![Sv::Text(novo_id.clone())];
@@ -676,22 +864,40 @@ impl Banco for Sqlite {
         {
             let conn = self.conn();
             let r = conn.execute(
-                &format!("INSERT INTO \"{}\" ({}) VALUES ({marcadores})", c.name, colunas(c)),
+                &format!(
+                    "INSERT INTO \"{}\" ({}) VALUES ({marcadores})",
+                    c.name,
+                    colunas(c)
+                ),
                 params_from_iter(todos.iter()),
             );
             if let Err(rusqlite::Error::SqliteFailure(e, _)) = &r
                 && e.code == rusqlite::ErrorCode::ConstraintViolation
             {
                 let mut erros = Map::new();
-                erro_campo(&mut erros, "id", "validation_invalid_id", "The id is invalid or already exists.".into());
-                return Err(Erro::Invalido { mensagem: "Failed to create record.".into(), campos: erros });
+                erro_campo(
+                    &mut erros,
+                    "id",
+                    "validation_invalid_id",
+                    "The id is invalid or already exists.".into(),
+                );
+                return Err(Erro::Invalido {
+                    mensagem: "Failed to create record.".into(),
+                    campos: erros,
+                });
             }
             r?;
         }
         self.registro(c, &novo_id, None)
     }
 
-    fn atualizar(&self, c: &Collection, id: &str, dados: &Map<String, Value>, regra: Option<&str>) -> Resultado<Value> {
+    fn atualizar(
+        &self,
+        c: &Collection,
+        id: &str,
+        dados: &Map<String, Value>,
+        regra: Option<&str>,
+    ) -> Resultado<Value> {
         let atual = self.registro(c, id, regra)?;
         let mut erros = Map::new();
         let mut sets = vec![];
@@ -707,13 +913,20 @@ impl Banco for Sqlite {
             }
         }
         if !erros.is_empty() {
-            return Err(Erro::Invalido { mensagem: "Failed to update record.".into(), campos: erros });
+            return Err(Erro::Invalido {
+                mensagem: "Failed to update record.".into(),
+                campos: erros,
+            });
         }
         sets.push("\"updated\" = ?".into());
         valores.push(Sv::Text(agora()));
         valores.push(Sv::Text(id.into()));
         self.conn().execute(
-            &format!("UPDATE \"{}\" SET {} WHERE \"id\" = ?", c.name, sets.join(", ")),
+            &format!(
+                "UPDATE \"{}\" SET {} WHERE \"id\" = ?",
+                c.name,
+                sets.join(", ")
+            ),
             params_from_iter(valores.iter()),
         )?;
         self.registro(c, id, None)
@@ -721,29 +934,51 @@ impl Banco for Sqlite {
 
     fn apagar(&self, c: &Collection, id: &str, regra: Option<&str>) -> Resultado<()> {
         self.registro(c, id, regra)?;
-        self.conn().execute(&format!("DELETE FROM \"{}\" WHERE \"id\" = ?1", c.name), params![id])?;
+        self.conn().execute(
+            &format!("DELETE FROM \"{}\" WHERE \"id\" = ?1", c.name),
+            params![id],
+        )?;
         Ok(())
     }
 
     fn superuser_salvar(&self, email: &str, senha: &str) -> Resultado<Superusuario> {
         let mut erros = Map::new();
         let email = email.trim();
-        let ok_email = email.split_once('@').is_some_and(|(a, d)| !a.is_empty() && d.contains('.'));
+        let ok_email = email
+            .split_once('@')
+            .is_some_and(|(a, d)| !a.is_empty() && d.contains('.'));
         if !ok_email {
-            erro_campo(&mut erros, "email", "validation_is_email", "Must be a valid email address.".into());
+            erro_campo(
+                &mut erros,
+                "email",
+                "validation_is_email",
+                "Must be a valid email address.".into(),
+            );
         }
         if senha.chars().count() < 10 {
-            erro_campo(&mut erros, "password", "validation_min_text_constraint", "Must be at least 10 character(s).".into());
+            erro_campo(
+                &mut erros,
+                "password",
+                "validation_min_text_constraint",
+                "Must be at least 10 character(s).".into(),
+            );
         }
         if !erros.is_empty() {
-            return Err(Erro::Invalido { mensagem: "Failed to save superuser.".into(), campos: erros });
+            return Err(Erro::Invalido {
+                mensagem: "Failed to save superuser.".into(),
+                campos: erros,
+            });
         }
         let hash = auth::hash_senha(senha)?;
         let chave = id::aleatorio(50);
         let agora = agora();
         let conn = self.conn();
         let existente: Option<String> = conn
-            .query_row("SELECT id FROM _superusers WHERE email = ?1 COLLATE NOCASE", params![email], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM _superusers WHERE email = ?1 COLLATE NOCASE",
+                params![email],
+                |r| r.get(0),
+            )
             .optional()?;
         let id_su = match existente {
             Some(i) => {
@@ -768,20 +1003,30 @@ impl Banco for Sqlite {
 
     fn superuser_por_email(&self, email: &str) -> Resultado<Superusuario> {
         self.conn()
-            .query_row("SELECT * FROM _superusers WHERE email = ?1 COLLATE NOCASE", params![email.trim()], ler_superuser)
+            .query_row(
+                "SELECT * FROM _superusers WHERE email = ?1 COLLATE NOCASE",
+                params![email.trim()],
+                ler_superuser,
+            )
             .optional()?
             .ok_or_else(|| Erro::NaoEncontrado("Superuser not found.".into()))
     }
 
     fn superuser(&self, id: &str) -> Resultado<Superusuario> {
         self.conn()
-            .query_row("SELECT * FROM _superusers WHERE id = ?1", params![id], ler_superuser)
+            .query_row(
+                "SELECT * FROM _superusers WHERE id = ?1",
+                params![id],
+                ler_superuser,
+            )
             .optional()?
             .ok_or_else(|| Erro::NaoEncontrado("Superuser not found.".into()))
     }
 
     fn total_superusers(&self) -> Resultado<i64> {
-        Ok(self.conn().query_row("SELECT COUNT(*) FROM _superusers", [], |r| r.get(0))?)
+        Ok(self
+            .conn()
+            .query_row("SELECT COUNT(*) FROM _superusers", [], |r| r.get(0))?)
     }
 }
 
@@ -822,11 +1067,16 @@ mod tests {
         let mut ruim = produtos();
         ruim.name = "x; DROP TABLE y".into();
         assert!(b.criar_colecao(ruim).is_err());
-        let ruim: Collection = serde_json::from_value(json!({"name":"a","fields":[{"name":"id","type":"text"}]})).unwrap();
+        let ruim: Collection =
+            serde_json::from_value(json!({"name":"a","fields":[{"name":"id","type":"text"}]}))
+                .unwrap();
         assert!(b.criar_colecao(ruim).is_err());
-        let ruim: Collection = serde_json::from_value(json!({"name":"b","fields":[{"name":"f","type":"file"}]})).unwrap();
+        let ruim: Collection =
+            serde_json::from_value(json!({"name":"b","fields":[{"name":"f","type":"file"}]}))
+                .unwrap();
         assert!(b.criar_colecao(ruim).is_err());
-        let ruim: Collection = serde_json::from_value(json!({"name":"c","listRule":"senha = 1"})).unwrap();
+        let ruim: Collection =
+            serde_json::from_value(json!({"name":"c","listRule":"senha = 1"})).unwrap();
         assert!(b.criar_colecao(ruim).is_err());
         b.apagar_colecao("produtos").unwrap();
         assert!(b.colecao("produtos").is_err());
@@ -836,30 +1086,69 @@ mod tests {
     fn registros_crud_filtro_ordem_e_paginas() {
         let b = Sqlite::em_memoria().unwrap();
         let c = b.criar_colecao(produtos()).unwrap();
-        for (nome, preco, ativo) in [("Café", 32.0, true), ("Chá", 18.5, true), ("Bolo", 45.0, false)] {
-            b.criar(&c, &obj(json!({"nome": nome, "preco": preco, "ativo": ativo, "tags": ["novo"]}))).unwrap();
+        for (nome, preco, ativo) in [
+            ("Café", 32.0, true),
+            ("Chá", 18.5, true),
+            ("Bolo", 45.0, false),
+        ] {
+            b.criar(
+                &c,
+                &obj(json!({"nome": nome, "preco": preco, "ativo": ativo, "tags": ["novo"]})),
+            )
+            .unwrap();
         }
-        let r = b.criar(&c, &obj(json!({"nome": "Pão", "preco": "7", "extra": {"a": 1}}))).unwrap();
+        let r = b
+            .criar(
+                &c,
+                &obj(json!({"nome": "Pão", "preco": "7", "extra": {"a": 1}})),
+            )
+            .unwrap();
         assert_eq!(r["preco"], json!(7));
         assert_eq!(r["extra"], json!({"a": 1}));
         assert_eq!(r["tags"], json!([]));
         assert_eq!(r["collectionName"], json!("produtos"));
         assert!(id::valido(r["id"].as_str().unwrap()));
 
-        let q = Consulta { filtro: Some("preco < 40 && ativo = true".into()), ordem: Some("-preco".into()), ..Default::default() };
+        let q = Consulta {
+            filtro: Some("preco < 40 && ativo = true".into()),
+            ordem: Some("-preco".into()),
+            ..Default::default()
+        };
         let l = b.listar(&c, &q).unwrap();
         assert_eq!(l.total_items, 2);
         assert_eq!(l.items[0]["nome"], json!("Café"));
         assert_eq!(l.items[1]["preco"], json!(18.5));
 
-        let p = b.listar(&c, &Consulta { por_pagina: 3, pagina: 2, ..Default::default() }).unwrap();
+        let p = b
+            .listar(
+                &c,
+                &Consulta {
+                    por_pagina: 3,
+                    pagina: 2,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert_eq!((p.total_items, p.total_pages, p.items.len()), (4, 2, 1));
-        let s = b.listar(&c, &Consulta { pular_total: true, ..Default::default() }).unwrap();
+        let s = b
+            .listar(
+                &c,
+                &Consulta {
+                    pular_total: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert_eq!((s.total_items, s.total_pages), (-1, -1));
 
         let pid = r["id"].as_str().unwrap();
-        let u = b.atualizar(&c, pid, &obj(json!({"preco": 9})), None).unwrap();
-        assert_eq!((u["preco"].clone(), u["nome"].clone()), (json!(9), json!("Pão")));
+        let u = b
+            .atualizar(&c, pid, &obj(json!({"preco": 9})), None)
+            .unwrap();
+        assert_eq!(
+            (u["preco"].clone(), u["nome"].clone()),
+            (json!(9), json!("Pão"))
+        );
         // A regra de visualização esconde o registro inativo.
         assert!(b.registro(&c, pid, Some("ativo = true")).is_err());
         assert!(b.registro(&c, pid, None).is_ok());
@@ -874,15 +1163,28 @@ mod tests {
         let e = b
             .criar(&c, &obj(json!({"preco": -1, "site": "ftp://x", "tags": ["outro", "novo", "promo"], "id": "CURTO"})))
             .unwrap_err();
-        let Erro::Invalido { campos, .. } = e else { panic!() };
+        let Erro::Invalido { campos, .. } = e else {
+            panic!()
+        };
         assert_eq!(campos["nome"]["code"], json!("validation_required"));
-        assert_eq!(campos["preco"]["code"], json!("validation_min_number_constraint"));
+        assert_eq!(
+            campos["preco"]["code"],
+            json!("validation_min_number_constraint")
+        );
         assert_eq!(campos["site"]["code"], json!("validation_is_url"));
         assert!(campos.contains_key("tags"));
         assert_eq!(campos["id"]["code"], json!("validation_invalid_id"));
         // Atualizar tirando um obrigatório também falha.
         let r = b.criar(&c, &obj(json!({"nome": "ok"}))).unwrap();
-        assert!(b.atualizar(&c, r["id"].as_str().unwrap(), &obj(json!({"nome": ""})), None).is_err());
+        assert!(
+            b.atualizar(
+                &c,
+                r["id"].as_str().unwrap(),
+                &obj(json!({"nome": ""})),
+                None
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -913,6 +1215,9 @@ mod tests {
         }
         let b = Sqlite::abrir(d.path()).unwrap();
         let c = b.colecao("produtos").unwrap();
-        assert_eq!(b.listar(&c, &Consulta::default()).unwrap().items[0]["nome"], json!("persistente"));
+        assert_eq!(
+            b.listar(&c, &Consulta::default()).unwrap().items[0]["nome"],
+            json!("persistente")
+        );
     }
 }

@@ -1,13 +1,16 @@
 # Guia de uso — Forja
 
 Como usar cada parte do Forja. Cada seção diz se já funciona na versão atual
-(**0.0.1**) ou se descreve como vai funcionar, para quem quiser acompanhar ou
+(**0.0.2**) ou se descreve como vai funcionar, para quem quiser acompanhar ou
 contribuir. A lista completa está em [`FUNCIONALIDADES.md`](FUNCIONALIDADES.md);
 o roteiro, em [`PLANO.md`](PLANO.md).
 
-> **0.0.1 é o começo.** Hoje funcionam: compilar, `forja serve`, `/api/health`
-> e a casca do painel em WebAssembly. O resto deste guia é a forma planejada,
-> marcada com *(planejado)*, e pode mudar até a 1.0.0.
+> **O que funciona na 0.0.2:** `forja serve`, `forja superuser upsert`,
+> `/api/health`, login de superusuário, coleções do tipo base (listar, criar,
+> ver, apagar), registros (listar com filtro, ordenação e paginação; criar,
+> ver, atualizar, apagar) com regras de acesso, e a casca do painel em
+> WebAssembly. O cliente Python do PocketBase já funciona contra o Forja. O
+> resto deste guia está marcado *(planejado)* e pode mudar até a 1.0.0.
 
 ---
 
@@ -21,7 +24,7 @@ Requisitos: Rust estável recente (`rustup`) e, para o painel, o alvo WASM.
 git clone https://github.com/iramarfalcao/forjabase.git
 cd forjabase
 cargo build --release -p forja
-./target/release/forja --version     # forja 0.0.1
+./target/release/forja --version     # forja 0.0.2
 ```
 
 ### Executável pronto *(planejado)*
@@ -33,22 +36,26 @@ x86_64 e arm64), ou usar a imagem Docker:
 docker run -p 8090:8090 -v ./forja_data:/data ghcr.io/iramarfalcao/forja serve --http 0.0.0.0:8090
 ```
 
-## 2. Subir o servidor (funciona na 0.0.1)
+## 2. Subir o servidor (funciona)
 
 ```sh
-forja serve                          # http://127.0.0.1:8090
+forja superuser upsert admin@exemplo.com 'uma-senha-forte'   # senha com 10+ caracteres
+forja serve                          # http://127.0.0.1:8090, dados em ./forja_data
+forja serve --dir /srv/forja         # outra pasta de dados
 forja serve --http 0.0.0.0:8090      # aceitar conexões de fora
 curl http://127.0.0.1:8090/api/health
 # {"code":200,"data":{},"message":"API is healthy."}
 ```
 
-*(planejado)* `forja serve exemplo.com` com HTTPS automático, `--dir` para a
-pasta de dados, `--origins` para CORS, `--dev` para logs de SQL.
+*(planejado)* `forja serve exemplo.com` com HTTPS automático, `--origins` para
+CORS, `--dev` para logs de SQL.
 
-## 3. Primeiro acesso e painel *(planejado)*
+## 3. Primeiro acesso e painel
 
-Na primeira execução, o Forja abre no navegador um link de uso único para
-criar o superusuário. Depois, o painel fica em `http://127.0.0.1:8090/_/`.
+Hoje o superusuário é criado pela CLI (`forja superuser upsert`, acima); o
+`serve` avisa se ainda não houver nenhum. *(planejado)* Na primeira execução,
+o Forja abre no navegador um link de uso único para criar o superusuário, e o
+painel fica em `http://127.0.0.1:8090/_/`.
 
 Para compilar o painel hoje (só a casca):
 
@@ -73,30 +80,63 @@ forja projects list
 | `loja` | `https://host/p/loja` |
 | `loja` com domínio mapeado | `https://api.loja.com` |
 
-## 5. Coleções e registros *(planejado)*
+## 5. Coleções e registros (funciona)
 
-Criar uma coleção pelo painel ou pela API:
+Entrar como superusuário e guardar o token:
 
 ```sh
-curl -X POST https://host/p/loja/api/collections \
-  -H "Authorization: $TOKEN_SUPERUSUARIO" -H "Content-Type: application/json" \
-  -d '{"name":"produtos","type":"base",
-       "fields":[{"name":"nome","type":"text","required":true},
+TOKEN=$(curl -s -X POST http://127.0.0.1:8090/api/collections/_superusers/auth-with-password \
+  -H "Content-Type: application/json" \
+  -d '{"identity":"admin@exemplo.com","password":"uma-senha-forte"}' | jq -r .token)
+```
+
+Criar uma coleção. Regra `""` = pública; `null` (ou ausente) = só superusuário;
+um filtro = só os registros que passam nele:
+
+```sh
+curl -X POST http://127.0.0.1:8090/api/collections \
+  -H "Authorization: $TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"produtos",
+       "fields":[{"name":"nome","type":"text","required":true,"max":80},
                  {"name":"preco","type":"number","min":0},
-                 {"name":"foto","type":"file","maxSelect":1}],
-       "listRule":"","viewRule":""}'
+                 {"name":"ativo","type":"bool"},
+                 {"name":"tags","type":"select","values":["novo","promo"],"maxSelect":2}],
+       "listRule":"ativo = true","viewRule":"ativo = true","createRule":null}'
 ```
 
-Consultar registros:
+Tipos de campo que já guardam valores: `text`, `editor`, `number`, `bool`,
+`email`, `url`, `date`, `select` e `json`. Os outros (`file`, `relation`,
+`password`, `autodate`, `geoPoint`) são recusados com uma mensagem clara até
+chegarem.
+
+Registros:
 
 ```sh
-curl "https://host/p/loja/api/collections/produtos/records?filter=(preco<50%20%26%26%20nome~'café')&sort=-created&perPage=20"
+curl -X POST http://127.0.0.1:8090/api/collections/produtos/records \
+  -H "Authorization: $TOKEN" -H "Content-Type: application/json" \
+  -d '{"nome":"Café","preco":32,"ativo":true,"tags":["novo"]}'
+
+curl "http://127.0.0.1:8090/api/collections/produtos/records?filter=(preco<50%20%26%26%20nome~'café')&sort=-created&perPage=20"
+curl -X PATCH  http://127.0.0.1:8090/api/collections/produtos/records/<id> -H "Authorization: $TOKEN" -H "Content-Type: application/json" -d '{"preco":30}'
+curl -X DELETE http://127.0.0.1:8090/api/collections/produtos/records/<id> -H "Authorization: $TOKEN"
 ```
 
-Filtros, ordenação, `expand` e `fields` seguem a sintaxe do PocketBase
-(FUNCIONALIDADES §4).
+Filtros já suportados: `=`, `!=`, `>`, `>=`, `<`, `<=`, `~` (contém), `!~`,
+`&&`, `||` e parênteses. Ordenação: `sort=-created,nome` e `@random`. Erros
+de validação vêm no formato do PocketBase:
 
-## 6. Autenticação *(planejado)*
+```json
+{"code":400,"message":"Failed to create record.","data":{"nome":{"code":"validation_required","message":"Cannot be blank."}}}
+```
+
+*(planejado)* `expand`, `fields`, operadores `?=`, macros `@request`, `PATCH`
+de coleção, e a URL por projeto (`https://host/p/loja`).
+
+## 6. Autenticação
+
+Superusuário: `auth-with-password` e `auth-refresh` em `_superusers` (seção 5),
+token no cabeçalho `Authorization` (puro ou com `Bearer `). Trocar a senha
+invalida os tokens antigos. *(planejado)* Usuários de coleções auth:
 
 ```sh
 curl -X POST https://host/p/loja/api/collections/users/auth-with-password \
@@ -117,7 +157,17 @@ GET /api/realtime            (Server-Sent Events; assinar "produtos" ou "produto
 
 ## 8. SDKs *(planejado)*
 
-Todos recebem a URL base do projeto.
+Enquanto os SDKs do Forja não saem, os do PocketBase funcionam com o projeto
+padrão. Conferido com o cliente Python (`pip install pocketbase`):
+
+```python
+from pocketbase import PocketBase
+pb = PocketBase("http://127.0.0.1:8090")
+pb.collection("_superusers").auth_with_password("admin@exemplo.com", "uma-senha-forte")
+pb.collection("produtos").get_list(1, 20, {"filter": "preco < 50", "sort": "-created"})
+```
+
+Os SDKs do Forja vão receber a URL base do projeto.
 
 **JavaScript / TypeScript** (React, Vue, Angular, Svelte, Node, Deno, Bun):
 
@@ -230,7 +280,7 @@ forja ext add ./pedidos.wasm --project loja
 
 Cada módulo roda isolado, com limite de memória e de tempo.
 
-## 12. Contribuir (funciona na 0.0.1)
+## 12. Contribuir (funciona)
 
 ```sh
 cargo fmt --all

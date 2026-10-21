@@ -7,7 +7,10 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Erro {
     /// 400, com os erros por campo em `campos`.
-    Invalido { mensagem: String, campos: Map<String, Value> },
+    Invalido {
+        mensagem: String,
+        campos: Map<String, Value>,
+    },
     /// 401
     NaoAutorizado(String),
     /// 403
@@ -20,7 +23,10 @@ pub enum Erro {
 
 impl Erro {
     pub fn invalido(mensagem: impl Into<String>) -> Erro {
-        Erro::Invalido { mensagem: mensagem.into(), campos: Map::new() }
+        Erro::Invalido {
+            mensagem: mensagem.into(),
+            campos: Map::new(),
+        }
     }
 
     /// Erro de validação de um campo, com código e mensagem como no PocketBase.
@@ -48,7 +54,10 @@ impl fmt::Display for Erro {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Erro::Invalido { mensagem, .. } => write!(f, "{mensagem}"),
-            Erro::NaoAutorizado(m) | Erro::Proibido(m) | Erro::NaoEncontrado(m) | Erro::Interno(m) => {
+            Erro::NaoAutorizado(m)
+            | Erro::Proibido(m)
+            | Erro::NaoEncontrado(m)
+            | Erro::Interno(m) => {
                 write!(f, "{m}")
             }
         }

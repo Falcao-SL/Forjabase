@@ -773,23 +773,24 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "forja"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "clap",
+ "forja-core",
  "forja-server",
  "tokio",
 ]
 
 [[package]]
 name = "forja-admin"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "leptos",
 ]
 
 [[package]]
 name = "forja-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "argon2",
  "jsonwebtoken",
@@ -802,7 +803,7 @@ dependencies = [
 
 [[package]]
 name = "forja-server"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "axum",
  "forja-core",

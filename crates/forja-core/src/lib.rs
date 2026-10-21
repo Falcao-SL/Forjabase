@@ -110,7 +110,10 @@ impl Field {
     }
 
     pub fn opcao_bool(&self, nome: &str) -> bool {
-        self.options.get(nome).and_then(Value::as_bool).unwrap_or(false)
+        self.options
+            .get(nome)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
     }
 
     /// `select` com `maxSelect` maior que 1 guarda uma lista.
@@ -164,7 +167,9 @@ impl Collection {
 /// Agora em UTC, no formato do PocketBase (`2026-10-21 14:05:09.123Z`).
 pub fn agora() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let d = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let (s, ms) = (d.as_secs() as i64, d.subsec_millis());
     let (dias, resto) = (s.div_euclid(86_400), s.rem_euclid(86_400));
     let (h, m, seg) = (resto / 3600, resto % 3600 / 60, resto % 60);
@@ -187,9 +192,18 @@ mod tests {
 
     #[test]
     fn nomes_iguais_aos_do_pocketbase() {
-        assert_eq!(serde_json::to_string(&CollectionType::Auth).unwrap(), "\"auth\"");
-        assert_eq!(serde_json::to_string(&FieldType::GeoPoint).unwrap(), "\"geoPoint\"");
-        assert_eq!(serde_json::to_string(&FieldType::Autodate).unwrap(), "\"autodate\"");
+        assert_eq!(
+            serde_json::to_string(&CollectionType::Auth).unwrap(),
+            "\"auth\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FieldType::GeoPoint).unwrap(),
+            "\"geoPoint\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FieldType::Autodate).unwrap(),
+            "\"autodate\""
+        );
         let t: FieldType = serde_json::from_str("\"relation\"").unwrap();
         assert_eq!(t, FieldType::Relation);
     }
@@ -209,11 +223,14 @@ mod tests {
     fn data_no_formato_do_pocketbase() {
         let a = agora();
         assert_eq!(a.len(), 24, "{a}");
-        assert!(a.ends_with('Z') && &a[4..5] == "-" && &a[10..11] == " ", "{a}");
+        assert!(
+            a.ends_with('Z') && &a[4..5] == "-" && &a[10..11] == " ",
+            "{a}"
+        );
     }
 
     #[test]
     fn versao() {
-        assert_eq!(VERSION, "0.0.1");
+        assert_eq!(VERSION, "0.0.2");
     }
 }

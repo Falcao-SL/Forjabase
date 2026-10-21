@@ -13,7 +13,9 @@ pub fn novo() -> String {
 /// Texto aleatório do mesmo alfabeto, para segredos e chaves de token.
 pub fn aleatorio(n: usize) -> String {
     let mut r = rand::rng();
-    (0..n).map(|_| ALFABETO[r.random_range(0..ALFABETO.len())] as char).collect()
+    (0..n)
+        .map(|_| ALFABETO[r.random_range(0..ALFABETO.len())] as char)
+        .collect()
 }
 
 pub fn valido(id: &str) -> bool {
