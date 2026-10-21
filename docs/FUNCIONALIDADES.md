@@ -1,0 +1,278 @@
+# Funcionalidades — Forja
+
+Lista de tudo o que o Forja vai ter. A base é o PocketBase (o fork
+`iramarfalcao/pocketbase`, igual ao `pocketbase/pocketbase` em 2026-10-21): cada
+item dele está aqui, com o equivalente no Forja. Depois vêm o que o Forja
+acrescenta (vários projetos, extensões em WebAssembly) e os SDKs.
+
+**Legenda:** ✅ feito · 🔨 em construção · 📋 planejado · ➕ só no Forja
+
+Versão atual: **0.0.1**. O Forja só vira **1.0.0** quando estiver estável
+(critérios em [`PLANO.md`](PLANO.md) §6).
+
+---
+
+## 1. Executável único e linha de comando
+
+| Funcionalidade | Estado |
+|---|---|
+| Um único executável, sem dependências externas (SQLite embutido) | 🔨 |
+| `forja serve` — sobe o servidor (porta padrão 8090, como o PocketBase) | ✅ |
+| `forja --version` | ✅ |
+| `serve` com HTTPS automático (Let's Encrypt) ao receber um domínio | 📋 |
+| `forja superuser create | upsert | update | delete | otp` | 📋 |
+| `forja migrate up | down | create | collections | history-sync` | 📋 |
+| Migrações automáticas ao mudar coleções pelo painel (automigrate) | 📋 |
+| `forja update` — atualização do próprio executável pelo GitHub Releases | 📋 |
+| Instalador do primeiro superusuário (link de uso único aberto no navegador) | 📋 |
+| Pasta de dados configurável (`--dir`), pasta pública (`--publicDir`), origens CORS (`--origins`) | 📋 |
+| Modo de desenvolvimento (`--dev`): log de SQL e erros detalhados | 📋 |
+| Encerramento gracioso | 📋 |
+
+## 2. Banco de dados
+
+| Funcionalidade | Estado |
+|---|---|
+| SQLite em modo WAL, um arquivo por projeto (`data.db`) e outro para logs (`auxiliary.db`) | 📋 |
+| Consultas preparadas, transações e limite de conexões | 📋 |
+| Índices (simples e únicos) definidos por coleção | 📋 |
+| Endpoint de SQL para superusuários (`/api/sql`) | 📋 |
+| Compatibilidade do arquivo com o PocketBase (abrir um `pb_data` existente) | 📋 (meta, ver PLANO §4) |
+
+## 3. Coleções
+
+| Funcionalidade | Estado |
+|---|---|
+| Tipos **base**, **auth** e **view** (view = consulta SQL somente leitura) | ✅ (modelo) · 📋 (comportamento) |
+| CRUD de coleções (`/api/collections`) | 📋 |
+| Importar coleções em lote (`PUT /api/collections/import`) | 📋 |
+| Esvaziar coleção (`DELETE /api/collections/{c}/truncate`) | 📋 |
+| Modelos prontos de coleção (`/api/collections/meta/scaffolds`) | 📋 |
+| Testar a consulta de uma view antes de salvar (`dry-run-view`) | 📋 |
+| Coleções de sistema: `_superusers`, `_externalAuths`, `_mfas`, `_otps`, `_authOrigins` | 📋 |
+| Renomear campos e coleções sem perder dados | 📋 |
+
+### 3.1 Tipos de campo
+
+| Tipo | O que guarda | Estado |
+|---|---|---|
+| `text` | texto, com mínimo, máximo, padrão (regex) e valor gerado automaticamente | ✅ (tipo) |
+| `editor` | HTML rico (com sanitização) | ✅ (tipo) |
+| `number` | número, com mínimo, máximo e "só inteiros" | ✅ (tipo) |
+| `bool` | verdadeiro/falso | ✅ (tipo) |
+| `email` | e-mail, com domínios permitidos ou bloqueados | ✅ (tipo) |
+| `url` | URL, com domínios permitidos ou bloqueados | ✅ (tipo) |
+| `date` | data e hora UTC, com mínimo e máximo | ✅ (tipo) |
+| `autodate` | data de criação ou atualização, preenchida sozinha | ✅ (tipo) |
+| `select` | um ou vários valores de uma lista | ✅ (tipo) |
+| `file` | um ou vários arquivos, com tipos MIME, tamanho e miniaturas | ✅ (tipo) |
+| `relation` | um ou vários registros de outra coleção, com exclusão em cascata | ✅ (tipo) |
+| `json` | qualquer JSON, com tamanho máximo | ✅ (tipo) |
+| `password` | senha com hash (bcrypt), nunca devolvida | ✅ (tipo) |
+| `geoPoint` | latitude e longitude | ✅ (tipo) |
+
+"✅ (tipo)" quer dizer que o tipo existe no modelo e serializa com o mesmo nome
+do PocketBase; validação e armazenamento ainda são 📋.
+
+### 3.2 Regras de acesso
+
+| Funcionalidade | Estado |
+|---|---|
+| Regras por operação: listar, ver, criar, atualizar, apagar | 📋 |
+| Regras de auth: login (`authRule`) e gerenciar outros usuários (`manageRule`) | 📋 |
+| Regra vazia = só superusuário; `""` = público | 📋 |
+| Mesma sintaxe dos filtros (§4), com `@request.auth.*`, `@request.body.*`, `@request.query.*`, `@request.headers.*`, `@request.context` e `@collection.*` | 📋 |
+
+## 4. Registros (CRUD) e consulta
+
+| Funcionalidade | Estado |
+|---|---|
+| Listar com paginação (`page`, `perPage`, `skipTotal`) | 📋 |
+| Ver, criar, atualizar e apagar registros | 📋 |
+| **Filtros** com `=`, `!=`, `>`, `>=`, `<`, `<=`, `~` (contém), `!~`, e as versões "algum item" (`?=`, `?!=`, `?>`, `?~`…), `&&`, `||` e parênteses | 📋 |
+| Macros de data (`@now`, `@yesterday`, `@todayStart`, `@monthEnd`…) | 📋 |
+| Modificadores `:isset`, `:changed`, `:length`, `:each`, `:lower` | 📋 |
+| Funções `geoDistance()` e `strftime()` | 📋 |
+| Ordenação (`sort`, com `@random` e `@rowid`) | 📋 |
+| Expandir relações (`expand`, inclusive aninhadas e reversas `coleção_via_campo`) | 📋 |
+| Escolher campos (`fields`, com `:excerpt`) | 📋 |
+| Modificadores de valor no envio (`campo+`, `+campo`, `campo-`) | 📋 |
+| Upload de arquivos em `multipart/form-data` | 📋 |
+| **Lote** (`/api/batch`): várias operações numa transação | 📋 |
+| Validação com mensagens de erro por campo, no formato do PocketBase | 📋 |
+
+## 5. Autenticação
+
+| Funcionalidade | Estado |
+|---|---|
+| E-mail (ou outro campo de identidade) e senha | 📋 |
+| **OTP** por e-mail (código de uso único) | 📋 |
+| **MFA** (dois métodos diferentes em sequência) | 📋 |
+| **OAuth2** com os provedores do PocketBase: Apple, Bitbucket, Box, Discord, Facebook, Gitea, Gitee, GitHub, GitLab, Google, Instagram, Kakao, Lark, Linear, LiveChat, mailcow, Microsoft, monday.com, Notion, OpenID Connect (até 3 genéricos), Patreon, Planning Center, Spotify, Strava, Trakt, Twitch, Twitter/X, VK, WakaTime, Yandex | 📋 |
+| Fluxo OAuth2 de redirecionamento (`/api/oauth2-redirect`) e PKCE | 📋 |
+| Renovar token (`auth-refresh`) | 📋 |
+| Verificação de e-mail (pedir e confirmar) | 📋 |
+| Redefinir senha (pedir e confirmar) | 📋 |
+| Trocar e-mail (pedir e confirmar) | 📋 |
+| Personificação: superusuário gera token de outro usuário (`impersonate`) | 📋 |
+| Alerta de login de novo dispositivo (`authAlert`) | 📋 |
+| Métodos de login disponíveis por coleção (`auth-methods`) | 📋 |
+| Tokens JWT com segredo e validade por tipo (auth, verificação, senha, e-mail, arquivo) | 📋 |
+| Modelos de e-mail editáveis (verificação, senha, troca de e-mail, OTP, alerta) | 📋 |
+| Gerador do segredo do Sign in with Apple | 📋 |
+
+## 6. Arquivos
+
+| Funcionalidade | Estado |
+|---|---|
+| Armazenamento local ou em S3 compatível (AWS, MinIO, R2…) | 📋 |
+| Servir arquivos (`/api/files/{coleção}/{registro}/{arquivo}`) | 📋 |
+| Miniaturas sob demanda (`?thumb=100x100`, com corte e ajuste) | 📋 |
+| Arquivos protegidos com token de arquivo de curta duração | 📋 |
+| Download forçado (`?download=1`) | 📋 |
+| Testar a conexão S3 pelo painel | 📋 |
+
+## 7. Tempo real
+
+| Funcionalidade | Estado |
+|---|---|
+| Server-Sent Events (`/api/realtime`) | 📋 |
+| Assinar uma coleção inteira ou um registro | 📋 |
+| Eventos de criação, atualização e exclusão, respeitando as regras de acesso | 📋 |
+| Opções por assinatura (filtro, expand, fields) | 📋 |
+
+## 8. Configurações e operação
+
+| Funcionalidade | Estado |
+|---|---|
+| Nome, URL e cor do app; remetente dos e-mails | 📋 |
+| SMTP (com teste de envio) ou sendmail | 📋 |
+| Limite de requisições por rota e por tipo de usuário | 📋 |
+| Proxy confiável (cabeçalhos de IP real) | 📋 |
+| IPs permitidos para superusuários | 📋 |
+| Limite de tamanho de corpo, CORS e compressão gzip | 📋 |
+| **Backups**: criar, baixar, enviar, restaurar e apagar; agendados (cron) com retenção; em S3 | 📋 |
+| **Logs** de requisições: listar, estatísticas, retenção em dias, nível mínimo, IP e usuário opcionais | 📋 |
+| **Cron**: listar e executar tarefas agendadas pelo painel | 📋 |
+| `/api/health` | ✅ |
+
+## 9. Painel administrativo (Rust → WebAssembly)
+
+| Funcionalidade | Estado |
+|---|---|
+| Painel embutido no executável, em Rust compilado para WebAssembly (Leptos) | 🔨 (casca) |
+| Editor de coleções, campos, regras e índices | 📋 |
+| Navegador de registros com filtro, ordenação e edição | 📋 |
+| Telas de configurações, backups, logs e cron | 📋 |
+| Visualização de logs com gráfico | 📋 |
+| Extensões de interface do painel | 📋 |
+| ➕ Seletor de projeto (§10) | 📋 |
+
+## 10. ➕ Vários projetos numa instância
+
+O PocketBase atende um projeto por processo. O Forja atende vários, isolados.
+
+| Funcionalidade | Estado |
+|---|---|
+| Cada projeto com o próprio banco, coleções, usuários, arquivos, configurações e logs (`data/<projeto>/`) | 📋 |
+| Endereço por caminho: `https://host/p/<projeto>/api/...` (a URL base dos SDKs) | 📋 |
+| Endereço por domínio ou subdomínio (`app.exemplo.com` → projeto) | 📋 |
+| Projeto padrão na raiz (`/api/...`), compatível com clientes do PocketBase sem mudança | 📋 |
+| Criar, renomear, pausar, apagar e duplicar projetos (CLI, API e painel) | 📋 |
+| Superusuários da instância (todos os projetos) e de projeto (só um) | 📋 |
+| Limites por projeto: tamanho do banco, armazenamento, requisições | 📋 |
+| Backup e restauração por projeto | 📋 |
+| Importar um `pb_data` do PocketBase como um projeto | 📋 |
+
+## 11. ➕ Extensões em WebAssembly (no lugar do JavaScript)
+
+O PocketBase estende o servidor com JavaScript (goja). O Forja usa módulos
+WebAssembly (wasmtime), escritos em qualquer linguagem que compile para WASM
+(Rust, Go, C, AssemblyScript, Zig…).
+
+| Funcionalidade | Estado |
+|---|---|
+| Hooks de eventos (antes e depois de criar, atualizar, apagar, autenticar, enviar e-mail…) | 📋 |
+| Rotas próprias | 📋 |
+| Tarefas agendadas (cron) | 📋 |
+| Migrações escritas como módulo | 📋 |
+| Isolamento: cada módulo com limite de memória e de tempo, sem acesso ao disco fora do permitido | 📋 |
+| Recarregar módulos sem reiniciar o servidor | 📋 |
+| Usar o Forja como biblioteca Rust (como o PocketBase em Go), com hooks em Rust | 📋 |
+
+## 12. SDKs
+
+Um núcleo único em Rust (`forja-sdk`) com a lógica comum (HTTP, armazenamento
+do token, renovação, tempo real, montagem de filtros) e camadas geradas para
+cada linguagem. Todos falam com qualquer projeto pela URL base (§10).
+
+| SDK | Plataformas | Como é feito | Estado |
+|---|---|---|---|
+| **JavaScript / TypeScript** | navegador, Node, Deno, Bun; serve a **React, Vue, Angular, Svelte**, Next, Nuxt, SvelteKit, Solid, Astro e qualquer projeto JS/TS | núcleo em Rust → WebAssembly (wasm-bindgen), tipos TypeScript gerados | 📋 |
+| React | hooks (`useRecord`, `useList`, `useAuth`, `useRealtime`) | camada fina sobre o SDK JS/TS | 📋 |
+| Vue | composables | camada fina sobre o SDK JS/TS | 📋 |
+| Angular | serviço injetável e Observables | camada fina sobre o SDK JS/TS | 📋 |
+| Svelte | stores | camada fina sobre o SDK JS/TS | 📋 |
+| **Kotlin** | Android (e JVM) | UniFFI | 📋 |
+| **Swift** | iOS, iPadOS, macOS, watchOS, visionOS | UniFFI, pacote SwiftPM | 📋 |
+| **Dart / Flutter** | Android, iOS, web, desktop | flutter_rust_bridge | 📋 |
+| **Rust** | qualquer alvo, inclusive WASM | o próprio núcleo, publicado no crates.io | 📋 |
+| **Java** | JVM (Spring, Android sem Kotlin) | sobre a camada Kotlin/JVM | 📋 |
+| **Python** | CPython 3.9+ | UniFFI, wheels no PyPI | 📋 |
+| **C#** | .NET 8+, Unity, MAUI | gerador UniFFI para C# | 📋 |
+| **Go** | Go 1.22+ | gerador UniFFI para Go | 📋 |
+
+Cada SDK cobre: autenticação (todos os métodos de §5) com armazenamento do
+token, CRUD e consulta (§4) com filtros montados com segurança, arquivos (§6),
+tempo real (§7), lote, chamadas a rotas próprias, e troca de projeto (§10).
+Como a API segue a do PocketBase, os SDKs oficiais dele (JS e Dart) também
+funcionam com o projeto padrão.
+
+## 13. ➕ MCP (Model Context Protocol), com segurança
+
+O Forja expõe um servidor MCP para agentes de IA (Claude, IDEs, outros
+clientes MCP) lerem e, se permitido, alterarem dados de um projeto.
+
+| Funcionalidade | Estado |
+|---|---|
+| Servidor MCP local pela CLI: `forja mcp --project <p>` (transporte stdio) | 📋 |
+| Servidor MCP remoto em `/mcp` (HTTP streamable), só com HTTPS | 📋 |
+| Ferramentas: listar coleções e esquemas, listar/ver/buscar registros, criar/atualizar/apagar registros, ver logs | 📋 |
+| Recursos: esquema das coleções e documentação do filtro, para o agente montar consultas certas | 📋 |
+| **Tokens de MCP** por projeto, com validade, criados e revogados pelo painel ou pela CLI | 📋 |
+| **Somente leitura por padrão**; escrita e exclusão só com escopo explícito no token | 📋 |
+| Lista de coleções e operações permitidas por token | 📋 |
+| As regras de acesso das coleções (§3.2) valem também pelo MCP, como um usuário comum | 📋 |
+| SQL bruto, configurações, backups e superusuários **fora** do MCP (sem opção de ligar remotamente) | 📋 |
+| Exclusão em massa exige confirmação no próprio fluxo (dry-run mostra o que vai sair) | 📋 |
+| Registro de auditoria de cada chamada (token, ferramenta, argumentos, resultado) | 📋 |
+| Limite de requisições e de linhas por resposta por token | 📋 |
+| Campos `password` e tokens nunca aparecem nas respostas | 📋 |
+
+## 14. ➕ CLI de administração
+
+Tudo o que o painel faz, também pelo terminal, local ou contra um servidor
+remoto (com token).
+
+| Funcionalidade | Estado |
+|---|---|
+| `forja projects list | create | rename | pause | delete | import-pb` | 📋 |
+| `forja collections list | show | create | import | export | truncate` | 📋 |
+| `forja records list | get | create | update | delete` com `--filter`, `--sort`, `--expand`, saída em tabela ou JSON | 📋 |
+| `forja users` / `forja superuser` (criar, redefinir senha, gerar OTP) | 📋 |
+| `forja tokens create | list | revoke` (inclusive tokens de MCP) | 📋 |
+| `forja backups create | list | restore | download` | 📋 |
+| `forja logs tail` | 📋 |
+| `forja login --url https://host/p/projeto` e perfis de servidores (`--profile`) | 📋 |
+| Saída em JSON estável para scripts (`--json`) | 📋 |
+
+## 15. Qualidade e distribuição
+
+| Funcionalidade | Estado |
+|---|---|
+| Testes de unidade e de API em todo crate | 🔨 |
+| Suíte de compatibilidade: as mesmas chamadas contra PocketBase e Forja, respostas iguais | 📋 |
+| CI no GitHub Actions (formatação, lint, testes, build do painel em WASM) | 🔨 |
+| Executáveis para macOS, Linux e Windows (x86_64 e arm64) no GitHub Releases | 📋 |
+| Imagem Docker | 📋 |
+| Site de documentação | 📋 |
