@@ -28,9 +28,12 @@ forjabase/
   sdks/            núcleo forja-sdk em Rust e as camadas por linguagem (futuro)
 ```
 
-- **Banco:** SQLite embutido (rusqlite, `bundled`), modo WAL, um diretório por
-  projeto; PostgreSQL opcional por projeto depois da 0.5 (decisão 7), pelo
-  mesmo trait `Banco`.
+- **Banco:** `store::Banco` tem toda a lógica (coleções, registros, regras,
+  validação) escrita uma vez, sobre um `motor::Executor` que só executa SQL.
+  Três executores: **SQLite** (rusqlite, `bundled`, WAL; o padrão),
+  **Turso** (Rust, mesmo arquivo) e **PostgreSQL/Supabase** (tokio-postgres +
+  deadpool, rustls, um esquema por projeto). O SQL sai sempre com `?`; o
+  executor do Postgres troca por `$n`. Decisões 7 e 8.
 - **Painel:** compilado com `trunk` para `wasm32-unknown-unknown` e embutido
   com `include_dir`/`rust-embed` em `/_/`.
 - **Extensões:** módulos WASM (component model, wasmtime) com uma interface
@@ -59,7 +62,9 @@ forjabase/
 | 4 | Extensões: só WASM, ou também JavaScript | Só WASM no começo, coerente com "Rust e WebAssembly"; JS seria um módulo WASM com um motor JS dentro, se houver demanda |
 | 5 | Nome dos pacotes nos registros (crates.io, npm, PyPI, NuGet, Maven, pub.dev) | `forja` / `forja-sdk` / `@forjabase/sdk`; reservar cedo |
 | 6 | MCP remoto ligado por padrão? | Não: desligado até o superusuário criar o primeiro token de MCP; o local (`forja mcp`) só funciona com acesso ao diretório de dados |
-| 7 | Só SQLite ou também PostgreSQL | Os dois: **SQLite padrão** (um arquivo, nada para manter) e **PostgreSQL opcional por projeto**, para escrita concorrente alta, vários servidores no mesmo banco ou Postgres gerenciado. Desde a 0.0.2 o armazenamento fica atrás do trait `Banco` e os filtros viram SQL por dialeto (`?`/`LIKE` no SQLite, `$1`/`ILIKE` no Postgres); a implementação Postgres entra depois da 0.5 |
+| 7 | Só SQLite ou também PostgreSQL | Os dois: **SQLite padrão** (um arquivo, nada para manter) e **PostgreSQL opcional por projeto**, para escrita concorrente alta, vários servidores no mesmo banco ou Postgres gerenciado. Desde a 0.0.2 o armazenamento fica atrás do trait `Banco` e os filtros viram SQL por dialeto (`?`/`LIKE` no SQLite, `$1`/`ILIKE` no Postgres); desde a 0.0.3 o Postgres funciona e passa a mesma bateria de conformidade. Um projeto Supabase é um Postgres: basta a URL dele |
+| 8 | Turso | **Terceiro motor**, mesmo dialeto do SQLite: abre o arquivo que o rusqlite gravou, então trocar de motor não exige migração. Fica opcional enquanto o Turso for beta; vira candidato a padrão quando estabilizar. Recursos dele (CDC, vetores, criptografia, MVCC) entram como extras sobre a mesma API |
+| 9 | Até onde ir no "Supabase" | A API continua a do PocketBase em todos os motores. Do Supabase vêm ideias para o motor Postgres: regras também como RLS, tempo real pela replicação lógica, pgvector. Não reimplementar PostgREST nem GoTrue: a API do Forja já cobre esses papéis |
 
 ## 5. Fases e versões
 

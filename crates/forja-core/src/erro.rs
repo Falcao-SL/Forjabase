@@ -17,6 +17,9 @@ pub enum Erro {
     Proibido(String),
     /// 404
     NaoEncontrado(String),
+    /// Violação de unicidade no banco (id ou nome repetido). Quem chama
+    /// transforma em erro de validação do campo certo.
+    Duplicado(String),
     /// 500 (a mensagem vai para o log, não para o cliente).
     Interno(String),
 }
@@ -45,6 +48,7 @@ impl Erro {
             Erro::NaoAutorizado(_) => 401,
             Erro::Proibido(_) => 403,
             Erro::NaoEncontrado(_) => 404,
+            Erro::Duplicado(_) => 400,
             Erro::Interno(_) => 500,
         }
     }
@@ -57,6 +61,7 @@ impl fmt::Display for Erro {
             Erro::NaoAutorizado(m)
             | Erro::Proibido(m)
             | Erro::NaoEncontrado(m)
+            | Erro::Duplicado(m)
             | Erro::Interno(m) => {
                 write!(f, "{m}")
             }
@@ -65,16 +70,5 @@ impl fmt::Display for Erro {
 }
 
 impl std::error::Error for Erro {}
-
-impl From<rusqlite::Error> for Erro {
-    fn from(e: rusqlite::Error) -> Erro {
-        match e {
-            rusqlite::Error::QueryReturnedNoRows => {
-                Erro::NaoEncontrado("The requested resource wasn't found.".into())
-            }
-            outro => Erro::Interno(outro.to_string()),
-        }
-    }
-}
 
 pub type Resultado<T> = Result<T, Erro>;

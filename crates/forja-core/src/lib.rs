@@ -10,7 +10,9 @@ pub mod auth;
 pub mod erro;
 pub mod filtro;
 pub mod id;
+pub mod motor;
 pub mod store;
+pub mod valor;
 
 pub use erro::Erro;
 
@@ -231,6 +233,6 @@ mod tests {
 
     #[test]
     fn versao() {
-        assert_eq!(VERSION, "0.0.2");
+        assert_eq!(VERSION, "0.0.3");
     }
 }

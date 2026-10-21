@@ -9,11 +9,34 @@ rust-version.workspace = true
 
 [dependencies]
 argon2 = "0.6.0"
+async-trait = "0.1.92"
+bytes = { version = "1.12.1", optional = true }
+deadpool-postgres = { version = "0.14.2", optional = true }
 jsonwebtoken = { version = "11.1.0", default-features = false, features = ["rust_crypto"] }
 rand = "0.10.3"
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { optional = true, version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+tokio = { version = "1.54.0", features = ["rt", "rt-multi-thread", "sync", "macros"] }
+tokio-postgres = { version = "0.7.18", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+tokio-postgres-rustls = { version = "0.14", optional = true }
+turso = { version = "0.8.3", optional = true }
+webpki-roots = { version = "1", optional = true }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[features]
+# Os três motores vêm ligados; desligar um tira a dependência do executável.
+default = ["sqlite", "turso", "postgres"]
+sqlite = ["dep:rusqlite"]
+turso = ["dep:turso"]
+postgres = [
+    "dep:tokio-postgres",
+    "dep:deadpool-postgres",
+    "dep:bytes",
+    "dep:tokio-postgres-rustls",
+    "dep:rustls",
+    "dep:webpki-roots",
+]

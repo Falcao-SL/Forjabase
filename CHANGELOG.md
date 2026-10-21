@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.0.3 — 2026-10-21
+
+- Três motores de banco com a mesma API, escolhidos com `--engine` (ou `FORJA_ENGINE`):
+  - **SQLite** (rusqlite), o padrão;
+  - **Turso**, que abre o mesmo arquivo do SQLite;
+  - **PostgreSQL / Supabase** (`FORJA_PG_URL`), com TLS por rustls e um esquema `forja_<projeto>` por projeto.
+- `store::Banco` passa a ser um só, assíncrono, sobre o trait `motor::Executor`; a lógica de coleções, registros, regras e validação não depende mais do motor.
+- Bateria de conformidade (`store::conformidade`) que todo motor precisa passar; o CI ganhou um job com Postgres 17.
+- Ordenação estável por `"id"` em vez de `rowid`, igual em todos os motores.
+
 ## 0.0.2 — 2026-10-21
 
 - SQLite por projeto (`forja_data/default/data.db`, WAL) atrás do trait `Banco`, pronto para um Postgres opcional por projeto.

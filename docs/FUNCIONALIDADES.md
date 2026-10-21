@@ -36,13 +36,35 @@ Versão atual: **0.0.2**. O Forja só vira **1.0.0** quando estiver estável
 | Funcionalidade | Estado |
 |---|---|
 | SQLite em modo WAL, um arquivo por projeto (`forja_data/<projeto>/data.db`) | ✅ |
+| ➕ Três motores com a mesma API, escolhidos por projeto (`--engine sqlite\|turso\|postgres`) | ✅ |
+| ➕ Bateria de conformidade: os mesmos testes passam nos três motores (o CI roda o Postgres) | ✅ |
 | Banco separado para logs (`auxiliary.db`) | 📋 |
 | Consultas preparadas e transações | ✅ |
 | Pool de conexões | 📋 |
 | Índices (simples e únicos) definidos por coleção | 📋 |
 | Endpoint de SQL para superusuários (`/api/sql`) | 📋 |
 | Compatibilidade do arquivo com o PocketBase (abrir um `pb_data` existente) | 📋 (meta, ver PLANO §4) |
-| ➕ PostgreSQL como banco opcional por projeto (mesma API; SQLite continua o padrão) | 📋 |
+| ➕ PostgreSQL como banco opcional por projeto (mesma API; SQLite continua o padrão) | ✅ |
+
+### 2.1 Motores
+
+| Motor | Para quê | Estado |
+|---|---|---|
+| **SQLite** (rusqlite) | Padrão. Um arquivo, nada para manter | ✅ |
+| **Turso** ([tursodatabase/turso](https://github.com/tursodatabase/turso), Rust) | Mesmo arquivo do SQLite, com escrita concorrente; troca de motor sem migrar dados | ✅ |
+| **PostgreSQL / Supabase** ([supabase/supabase](https://github.com/supabase/supabase)) | Escrita concorrente alta, vários servidores, Postgres gerenciado. Cada projeto num esquema `forja_<projeto>`; TLS (rustls) para Supabase e nuvens | ✅ |
+
+### 2.2 Recursos próprios de cada motor (sobre a mesma API)
+
+| Funcionalidade | Motor | Estado |
+|---|---|---|
+| ➕ Regras de acesso também como Row Level Security do Postgres (como o Supabase), para quem acessa o banco direto | Postgres | 📋 |
+| ➕ Tempo real a partir do log do banco (replicação lógica, como o Supabase Realtime) | Postgres | 📋 |
+| ➕ Tempo real a partir da captura de mudanças (CDC) do Turso | Turso | 📋 |
+| ➕ Campo `vector` e busca por similaridade (pgvector no Postgres, vetores nativos no Turso) | Postgres, Turso | 📋 |
+| ➕ Criptografia do arquivo em repouso | Turso | 📋 |
+| ➕ Escrita concorrente (MVCC, `BEGIN CONCURRENT`) | Turso | 📋 |
+| ➕ Usar o Auth/Storage de um projeto Supabase existente | Postgres | 📋 (avaliar) |
 
 ## 3. Coleções
 

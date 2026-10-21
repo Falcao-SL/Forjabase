@@ -22,6 +22,9 @@ keep working.
   types, access rules, filters, expand, batch requests; email/password, OTP,
   MFA and OAuth2 with 30 providers; local or S3 file storage with thumbnails;
   realtime over SSE; backups, logs, cron, rate limits.
+- **Three database engines, one API:** SQLite (default), [Turso](https://github.com/tursodatabase/turso)
+  (same file, concurrent writes) or PostgreSQL / [Supabase](https://github.com/supabase/supabase),
+  chosen per project with `--engine`. The same conformance tests run on all three.
 - **In Rust and WebAssembly:** an axum server with embedded SQLite, an admin
   dashboard in Leptos compiled to WASM, and server extensions as WASM modules
   instead of JavaScript.
@@ -45,6 +48,7 @@ git clone https://github.com/iramarfalcao/forjabase.git
 cd forjabase
 cargo run -p forja -- superuser upsert admin@example.com 'a-strong-password'
 cargo run -p forja -- serve
+# or: FORJA_PG_URL=postgres://... cargo run -p forja -- serve --engine postgres
 curl http://127.0.0.1:8090/api/health
 ```
 

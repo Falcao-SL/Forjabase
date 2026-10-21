@@ -16,7 +16,7 @@ o roteiro, em [`PLANO.md`](PLANO.md).
 
 ## 1. Instalar
 
-### A partir do código (funciona na 0.0.1)
+### A partir do código (funciona)
 
 Requisitos: Rust estável recente (`rustup`) e, para o painel, o alvo WASM.
 
@@ -46,6 +46,26 @@ forja serve --http 0.0.0.0:8090      # aceitar conexões de fora
 curl http://127.0.0.1:8090/api/health
 # {"code":200,"data":{},"message":"API is healthy."}
 ```
+
+### Escolher o motor do banco (funciona)
+
+A API é a mesma nos três; muda só onde os dados ficam.
+
+```sh
+forja serve                                  # SQLite (padrão): forja_data/default/data.db
+forja serve --engine turso                   # Turso: o mesmo arquivo, escrita concorrente
+export FORJA_PG_URL='postgres://usuario:senha@host:5432/banco'
+forja serve --engine postgres                # Postgres: tabelas no esquema forja_default
+```
+
+- **Supabase:** em *Project Settings → Database*, copie a *connection string*
+  e use-a em `FORJA_PG_URL`. A conexão usa TLS; acrescente `?sslmode=require`
+  para recusar conexão sem TLS.
+- Prefira a variável `FORJA_PG_URL` ao `--pg-url`: assim a senha não aparece
+  na lista de processos.
+- O motor vale para todos os comandos: `forja --engine postgres superuser upsert ...`.
+- `FORJA_ENGINE=postgres` faz o mesmo que `--engine postgres`.
+- Para trocar SQLite → Turso, basta mudar `--engine`: o Turso lê o arquivo do SQLite.
 
 *(planejado)* `forja serve exemplo.com` com HTTPS automático, `--origins` para
 CORS, `--dev` para logs de SQL.

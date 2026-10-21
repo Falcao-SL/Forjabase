@@ -7,7 +7,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use forja_core::auth::{self, COLECAO_SUPERUSERS, VALIDADE_SUPERUSER};
-use forja_core::store::{Banco, Consulta, Sqlite, Superusuario};
+use forja_core::store::{Banco, Consulta, Motor, Superusuario};
 use forja_core::{Collection, Erro, Field};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -17,13 +17,13 @@ use std::sync::Arc;
 /// Estado compartilhado: o banco do projeto e o segredo dos tokens.
 #[derive(Clone)]
 pub struct Estado {
-    pub banco: Arc<dyn Banco>,
+    pub banco: Banco,
     pub segredo: Arc<String>,
 }
 
 impl Estado {
-    pub fn novo(banco: Arc<dyn Banco>) -> Result<Estado, Erro> {
-        let segredo = banco.segredo()?;
+    pub async fn novo(banco: Banco) -> Result<Estado, Erro> {
+        let segredo = banco.segredo().await?;
         Ok(Estado {
             banco,
             segredo: Arc::new(segredo),
@@ -64,18 +64,6 @@ impl IntoResponse for ErroApi {
 }
 
 type Res<T> = Result<T, ErroApi>;
-
-/// Roda uma operação do banco fora das threads do runtime.
-async fn no_banco<T: Send + 'static>(
-    e: &Estado,
-    f: impl FnOnce(&dyn Banco) -> Result<T, Erro> + Send + 'static,
-) -> Res<T> {
-    let b = e.banco.clone();
-    tokio::task::spawn_blocking(move || f(b.as_ref()))
-        .await
-        .map_err(|e| ErroApi(Erro::Interno(e.to_string())))?
-        .map_err(ErroApi)
-}
 
 // ── Autenticação ─────────────────────────────────────────────────────────
 
@@ -126,8 +114,9 @@ impl FromRequestParts<Estado> for Chamador {
         if claims.colecao != COLECAO_SUPERUSERS || claims.tipo != "auth" {
             return Err(token_invalido());
         }
-        let id = claims.id.clone();
-        let su = no_banco(e, move |b| b.superuser(&id))
+        let su = e
+            .banco
+            .superuser(&claims.id)
             .await
             .map_err(|_| token_invalido())?;
         if su.token_key != claims.tk {
@@ -145,8 +134,9 @@ struct Login {
 
 async fn superuser_login(State(e): State<Estado>, Json(l): Json<Login>) -> Res<Json<Value>> {
     let falha = || ErroApi(Erro::invalido("Failed to authenticate."));
-    let identidade = l.identity.clone();
-    let su = no_banco(&e, move |b| b.superuser_por_email(&identidade))
+    let su = e
+        .banco
+        .superuser_por_email(&l.identity)
         .await
         .map_err(|_| falha())?;
     let (hash, senha) = (su.senha.clone(), l.password);
@@ -183,7 +173,7 @@ fn resposta_auth(e: &Estado, su: Superusuario) -> Res<Json<Value>> {
 
 async fn colecoes_listar(State(e): State<Estado>, quem: Chamador) -> Res<Json<Value>> {
     quem.exigir_superusuario()?;
-    let itens = no_banco(&e, |b| b.colecoes()).await?;
+    let itens = e.banco.colecoes().await?;
     let total = itens.len();
     Ok(Json(
         json!({ "page": 1, "perPage": total.max(1), "totalItems": total, "totalPages": 1, "items": itens }),
@@ -196,7 +186,7 @@ async fn colecoes_criar(
     Json(c): Json<Collection>,
 ) -> Res<Json<Collection>> {
     quem.exigir_superusuario()?;
-    Ok(Json(no_banco(&e, move |b| b.criar_colecao(c)).await?))
+    Ok(Json(e.banco.criar_colecao(c).await?))
 }
 
 async fn colecoes_ver(
@@ -205,7 +195,7 @@ async fn colecoes_ver(
     Path(nome): Path<String>,
 ) -> Res<Json<Collection>> {
     quem.exigir_superusuario()?;
-    Ok(Json(no_banco(&e, move |b| b.colecao(&nome)).await?))
+    Ok(Json(e.banco.colecao(&nome).await?))
 }
 
 async fn colecoes_apagar(
@@ -214,7 +204,7 @@ async fn colecoes_apagar(
     Path(nome): Path<String>,
 ) -> Res<StatusCode> {
     quem.exigir_superusuario()?;
-    no_banco(&e, move |b| b.apagar_colecao(&nome)).await?;
+    e.banco.apagar_colecao(&nome).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -258,7 +248,7 @@ struct ParamsLista {
 }
 
 async fn colecao_de(e: &Estado, nome: String) -> Res<Collection> {
-    no_banco(e, move |b| b.colecao(&nome)).await
+    Ok(e.banco.colecao(&nome).await?)
 }
 
 async fn registros_listar(
@@ -277,8 +267,7 @@ async fn registros_listar(
         pular_total: p.skip_total.unwrap_or(false),
         regra,
     };
-    let c2 = c.clone();
-    let mut lista = no_banco(&e, move |b| b.listar(&c2, &q)).await?;
+    let mut lista = e.banco.listar(&c, &q).await?;
     lista.items = lista
         .items
         .into_iter()
@@ -294,8 +283,7 @@ async fn registros_ver(
 ) -> Res<Json<Value>> {
     let c = colecao_de(&e, nome).await?;
     let regra = regra_para(&quem, &c.view_rule)?;
-    let c2 = c.clone();
-    let r = no_banco(&e, move |b| b.registro(&c2, &id, regra.as_deref())).await?;
+    let r = e.banco.registro(&c, &id, regra.as_deref()).await?;
     Ok(Json(esconder(&c, &quem, r)))
 }
 
@@ -307,20 +295,15 @@ async fn registros_criar(
 ) -> Res<Json<Value>> {
     let c = colecao_de(&e, nome).await?;
     let regra = regra_para(&quem, &c.create_rule)?;
-    let c2 = c.clone();
-    let r = no_banco(&e, move |b| {
-        let novo = b.criar(&c2, &dados)?;
-        // A regra de criação é conferida no registro criado; se não passar, ele sai.
-        if let Some(regra) = regra {
-            let id = novo["id"].as_str().unwrap_or_default().to_string();
-            if b.registro(&c2, &id, Some(&regra)).is_err() {
-                b.apagar(&c2, &id, None)?;
-                return Err(Erro::invalido("Failed to create record."));
-            }
+    let r = e.banco.criar(&c, &dados).await?;
+    // A regra de criação é conferida no registro criado; se não passar, ele sai.
+    if let Some(regra) = regra {
+        let id = r["id"].as_str().unwrap_or_default();
+        if e.banco.registro(&c, id, Some(&regra)).await.is_err() {
+            e.banco.apagar(&c, id, None).await?;
+            return Err(ErroApi(Erro::invalido("Failed to create record.")));
         }
-        Ok(novo)
-    })
-    .await?;
+    }
     Ok(Json(esconder(&c, &quem, r)))
 }
 
@@ -332,8 +315,7 @@ async fn registros_atualizar(
 ) -> Res<Json<Value>> {
     let c = colecao_de(&e, nome).await?;
     let regra = regra_para(&quem, &c.update_rule)?;
-    let c2 = c.clone();
-    let r = no_banco(&e, move |b| b.atualizar(&c2, &id, &dados, regra.as_deref())).await?;
+    let r = e.banco.atualizar(&c, &id, &dados, regra.as_deref()).await?;
     Ok(Json(esconder(&c, &quem, r)))
 }
 
@@ -344,7 +326,7 @@ async fn registros_apagar(
 ) -> Res<StatusCode> {
     let c = colecao_de(&e, nome).await?;
     let regra = regra_para(&quem, &c.delete_rule)?;
-    no_banco(&e, move |b| b.apagar(&c, &id, regra.as_deref())).await?;
+    e.banco.apagar(&c, &id, regra.as_deref()).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -388,12 +370,17 @@ pub fn router(e: Estado) -> Router {
         .with_state(e)
 }
 
-/// Abre o projeto padrão em `pasta/default` e atende até o processo terminar.
-pub async fn serve(addr: SocketAddr, pasta: std::path::PathBuf) -> std::io::Result<()> {
-    let banco =
-        Sqlite::abrir(&pasta.join("default")).map_err(|e| std::io::Error::other(e.to_string()))?;
-    let estado = Estado::novo(Arc::new(banco)).map_err(|e| std::io::Error::other(e.to_string()))?;
-    if estado.banco.total_superusers().unwrap_or(0) == 0 {
+/// Abre o projeto padrão no motor escolhido e atende até o processo terminar.
+pub async fn serve(
+    addr: SocketAddr,
+    pasta: std::path::PathBuf,
+    motor: Motor,
+) -> std::io::Result<()> {
+    let io = |e: Erro| std::io::Error::other(e.to_string());
+    let banco = Banco::abrir(&motor, &pasta, "default").await.map_err(io)?;
+    let nome_motor = banco.motor();
+    let estado = Estado::novo(banco).await.map_err(io)?;
+    if estado.banco.total_superusers().await.unwrap_or(0) == 0 {
         eprintln!(
             "Nenhum superusuário ainda. Crie um com:\n  forja superuser upsert <email> <senha> --dir {}",
             pasta.display()
@@ -401,7 +388,7 @@ pub async fn serve(addr: SocketAddr, pasta: std::path::PathBuf) -> std::io::Resu
     }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!(
-        "Forja {} em http://{addr} (dados em {})",
+        "Forja {} em http://{addr} (motor {nome_motor}, dados em {})",
         forja_core::VERSION,
         pasta.display()
     );
@@ -416,8 +403,10 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    fn estado() -> Estado {
-        Estado::novo(Arc::new(Sqlite::em_memoria().unwrap())).unwrap()
+    async fn estado() -> Estado {
+        Estado::novo(Banco::sqlite_memoria().await.unwrap())
+            .await
+            .unwrap()
     }
 
     async fn chamar(
@@ -450,6 +439,7 @@ mod tests {
     async fn login(e: &Estado) -> String {
         e.banco
             .superuser_salvar("admin@exemplo.com", "senha-forte-123")
+            .await
             .unwrap();
         let (s, v) = chamar(
             e,
@@ -467,7 +457,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_igual_ao_pocketbase() {
-        let (s, v) = chamar(&estado(), "GET", "/api/health", None, None).await;
+        let (s, v) = chamar(&estado().await, "GET", "/api/health", None, None).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(
             v,
@@ -477,9 +467,10 @@ mod tests {
 
     #[tokio::test]
     async fn login_errado_e_token_invalido() {
-        let e = estado();
+        let e = estado().await;
         e.banco
             .superuser_salvar("admin@exemplo.com", "senha-forte-123")
+            .await
             .unwrap();
         let (s, v) = chamar(
             &e,
@@ -499,7 +490,7 @@ mod tests {
 
     #[tokio::test]
     async fn trocar_senha_invalida_tokens_antigos() {
-        let e = estado();
+        let e = estado().await;
         let t = login(&e).await;
         let (s, _) = chamar(
             &e,
@@ -512,6 +503,7 @@ mod tests {
         assert_eq!(s, StatusCode::OK);
         e.banco
             .superuser_salvar("admin@exemplo.com", "nova-senha-456")
+            .await
             .unwrap();
         let (s, _) = chamar(
             &e,
@@ -526,7 +518,7 @@ mod tests {
 
     #[tokio::test]
     async fn fluxo_completo_de_colecao_e_registros() {
-        let e = estado();
+        let e = estado().await;
         let t = login(&e).await;
         let col = json!({
             "name": "posts",

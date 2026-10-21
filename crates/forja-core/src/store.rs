@@ -1,19 +1,18 @@
-//! Armazenamento. `Banco` é a interface; `Sqlite` é a implementação desta
-//! versão. O PostgreSQL entra depois como outra implementação, escolhida por
-//! projeto (PLANO §4), sem mudar o servidor.
+//! Armazenamento. `Banco` tem toda a lógica (coleções, registros, regras,
+//! validação, superusuários) escrita uma vez; o motor por baixo é um
+//! `Executor`: SQLite (padrão), Turso ou PostgreSQL/Supabase, por projeto.
 //!
 //! Cada coleção base vira uma tabela com o nome dela: `id`, uma coluna por
 //! campo, `created` e `updated`. As coleções ficam descritas em `_collections`.
 
 use crate::erro::{Erro, Resultado};
 use crate::filtro::{self, Dialeto, Literal};
+use crate::motor::{Executor, Linha};
+use crate::valor::Valor;
 use crate::{Collection, CollectionType, Field, FieldType, agora, auth, id};
-use rusqlite::types::Value as Sv;
-use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
-use std::path::Path;
-use std::sync::Mutex;
+use std::sync::Arc;
 
 /// Pedido de listagem, com os parâmetros da API do PocketBase.
 #[derive(Debug, Clone)]
@@ -66,98 +65,162 @@ pub struct Superusuario {
     pub token_key: String,
 }
 
-/// O que o servidor precisa de um banco.
-pub trait Banco: Send + Sync {
-    fn dialeto(&self) -> Dialeto;
-    /// Segredo dos tokens deste projeto (gerado na primeira vez).
-    fn segredo(&self) -> Resultado<String>;
-
-    fn colecoes(&self) -> Resultado<Vec<Collection>>;
-    fn colecao(&self, id_ou_nome: &str) -> Resultado<Collection>;
-    fn criar_colecao(&self, c: Collection) -> Resultado<Collection>;
-    fn apagar_colecao(&self, id_ou_nome: &str) -> Resultado<()>;
-
-    fn listar(&self, c: &Collection, q: &Consulta) -> Resultado<Lista>;
-    fn registro(&self, c: &Collection, id: &str, regra: Option<&str>) -> Resultado<Value>;
-    fn criar(&self, c: &Collection, dados: &Map<String, Value>) -> Resultado<Value>;
-    fn atualizar(
-        &self,
-        c: &Collection,
-        id: &str,
-        dados: &Map<String, Value>,
-        regra: Option<&str>,
-    ) -> Resultado<Value>;
-    fn apagar(&self, c: &Collection, id: &str, regra: Option<&str>) -> Resultado<()>;
-
-    fn superuser_salvar(&self, email: &str, senha: &str) -> Resultado<Superusuario>;
-    fn superuser_por_email(&self, email: &str) -> Resultado<Superusuario>;
-    fn superuser(&self, id: &str) -> Resultado<Superusuario>;
-    fn total_superusers(&self) -> Resultado<i64>;
+/// O banco de um projeto.
+#[derive(Clone)]
+pub struct Banco {
+    ex: Arc<dyn Executor>,
 }
 
-// ── SQLite ───────────────────────────────────────────────────────────────
+// ── Abrir ────────────────────────────────────────────────────────────────
 
-pub struct Sqlite {
-    conn: Mutex<Connection>,
+/// Qual motor um projeto usa. A API e o comportamento são os mesmos nos três.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Motor {
+    /// rusqlite, um arquivo por projeto. O padrão.
+    Sqlite,
+    /// Turso: o mesmo arquivo, com escrita concorrente.
+    Turso,
+    /// PostgreSQL ou Supabase; cada projeto num esquema `forja_<projeto>`.
+    Postgres { url: String },
 }
 
-const ESQUEMA: &str = "
-CREATE TABLE IF NOT EXISTS _params (
-    id    TEXT PRIMARY KEY NOT NULL,
-    value TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS _collections (
-    id         TEXT PRIMARY KEY NOT NULL,
-    name       TEXT UNIQUE NOT NULL COLLATE NOCASE,
-    type       TEXT NOT NULL,
-    system     BOOLEAN NOT NULL DEFAULT FALSE,
-    fields     JSON NOT NULL DEFAULT '[]',
-    listRule   TEXT,
-    viewRule   TEXT,
-    createRule TEXT,
-    updateRule TEXT,
-    deleteRule TEXT,
-    indexes    JSON NOT NULL DEFAULT '[]',
-    created    TEXT NOT NULL,
-    updated    TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS _superusers (
-    id       TEXT PRIMARY KEY NOT NULL,
-    email    TEXT UNIQUE NOT NULL COLLATE NOCASE,
-    password TEXT NOT NULL,
-    tokenKey TEXT NOT NULL,
-    created  TEXT NOT NULL,
-    updated  TEXT NOT NULL
-);
-";
-
-impl Sqlite {
-    /// Abre (ou cria) o banco de um projeto em `pasta/data.db`.
-    pub fn abrir(pasta: &Path) -> Resultado<Sqlite> {
-        std::fs::create_dir_all(pasta)
-            .map_err(|e| Erro::Interno(format!("pasta de dados: {e}")))?;
-        Sqlite::iniciar(Connection::open(pasta.join("data.db"))?)
+impl Banco {
+    /// Abre o projeto `projeto` (dados em `pasta/<projeto>` nos motores de arquivo).
+    pub async fn abrir(motor: &Motor, pasta: &std::path::Path, projeto: &str) -> Resultado<Banco> {
+        if !nome_valido(projeto) {
+            return Err(Erro::invalido("Invalid project name."));
+        }
+        #[allow(unreachable_patterns)]
+        match motor {
+            #[cfg(feature = "sqlite")]
+            Motor::Sqlite => Banco::sqlite(&pasta.join(projeto)).await,
+            #[cfg(feature = "turso")]
+            Motor::Turso => Banco::turso(&pasta.join(projeto)).await,
+            #[cfg(feature = "postgres")]
+            Motor::Postgres { url } => Banco::postgres(url, &format!("forja_{projeto}")).await,
+            // Sem o motor no `{:?}`: a URL do Postgres traz a senha.
+            _ => Err(Erro::invalido(
+                "This engine is not compiled into this build.",
+            )),
+        }
+    }
+    /// Sobre um executor já aberto; cria as tabelas de sistema se faltarem.
+    pub async fn novo(ex: Arc<dyn Executor>) -> Resultado<Banco> {
+        let b = Banco { ex };
+        b.ex.lote(
+            esquema(b.dialeto())
+                .into_iter()
+                .map(|s| (s, vec![]))
+                .collect(),
+        )
+        .await?;
+        Ok(b)
     }
 
-    /// Banco em memória, para testes.
-    pub fn em_memoria() -> Resultado<Sqlite> {
-        Sqlite::iniciar(Connection::open_in_memory()?)
+    /// SQLite em `pasta/data.db`.
+    #[cfg(feature = "sqlite")]
+    pub async fn sqlite(pasta: &std::path::Path) -> Resultado<Banco> {
+        criar_pasta(pasta)?;
+        Banco::novo(Arc::new(crate::motor::sqlite::Sqlite::abrir(
+            &pasta.join("data.db"),
+        )?))
+        .await
     }
 
-    fn iniciar(conn: Connection) -> Resultado<Sqlite> {
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 10000; PRAGMA synchronous = NORMAL;",
-        )?;
-        conn.execute_batch(ESQUEMA)?;
-        Ok(Sqlite {
-            conn: Mutex::new(conn),
-        })
+    #[cfg(feature = "sqlite")]
+    pub async fn sqlite_memoria() -> Resultado<Banco> {
+        Banco::novo(Arc::new(crate::motor::sqlite::Sqlite::em_memoria()?)).await
     }
 
-    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    /// Turso em `pasta/data.db` (o mesmo formato de arquivo do SQLite).
+    #[cfg(feature = "turso")]
+    pub async fn turso(pasta: &std::path::Path) -> Resultado<Banco> {
+        criar_pasta(pasta)?;
+        let arquivo = pasta.join("data.db");
+        let caminho = arquivo
+            .to_str()
+            .ok_or_else(|| Erro::invalido("Invalid data path."))?;
+        Banco::novo(Arc::new(crate::motor::turso::Turso::abrir(caminho).await?)).await
+    }
+
+    #[cfg(feature = "turso")]
+    pub async fn turso_memoria() -> Resultado<Banco> {
+        Banco::novo(Arc::new(
+            crate::motor::turso::Turso::abrir(":memory:").await?,
+        ))
+        .await
+    }
+
+    /// PostgreSQL (inclusive Supabase), com as tabelas no esquema `esquema`.
+    #[cfg(feature = "postgres")]
+    pub async fn postgres(url: &str, esquema: &str) -> Resultado<Banco> {
+        Banco::novo(Arc::new(
+            crate::motor::postgres::Postgres::conectar(url, esquema).await?,
+        ))
+        .await
+    }
+
+    pub fn dialeto(&self) -> Dialeto {
+        self.ex.dialeto()
+    }
+
+    /// `sqlite`, `turso` ou `postgres`.
+    pub fn motor(&self) -> &'static str {
+        self.ex.nome()
     }
 }
+
+#[cfg(any(feature = "sqlite", feature = "turso"))]
+fn criar_pasta(pasta: &std::path::Path) -> Resultado<()> {
+    std::fs::create_dir_all(pasta).map_err(|e| Erro::Interno(format!("pasta de dados: {e}")))
+}
+
+fn esquema(d: Dialeto) -> Vec<String> {
+    // SQLite e Turso comparam nome e e-mail sem diferenciar maiúsculas pela
+    // coluna; o Postgres, por um índice em lower().
+    let nocase = if d == Dialeto::Sqlite {
+        " COLLATE NOCASE"
+    } else {
+        ""
+    };
+    let mut v = vec![
+        "CREATE TABLE IF NOT EXISTS \"_params\" (\"id\" TEXT PRIMARY KEY NOT NULL, \"value\" TEXT NOT NULL)".to_string(),
+        format!(
+            "CREATE TABLE IF NOT EXISTS \"_collections\" (
+                \"id\" TEXT PRIMARY KEY NOT NULL,
+                \"name\" TEXT UNIQUE NOT NULL{nocase},
+                \"type\" TEXT NOT NULL,
+                \"system\" BOOLEAN NOT NULL DEFAULT FALSE,
+                \"fields\" TEXT NOT NULL DEFAULT '[]',
+                \"listRule\" TEXT,
+                \"viewRule\" TEXT,
+                \"createRule\" TEXT,
+                \"updateRule\" TEXT,
+                \"deleteRule\" TEXT,
+                \"indexes\" TEXT NOT NULL DEFAULT '[]',
+                \"created\" TEXT NOT NULL,
+                \"updated\" TEXT NOT NULL
+            )"
+        ),
+        format!(
+            "CREATE TABLE IF NOT EXISTS \"_superusers\" (
+                \"id\" TEXT PRIMARY KEY NOT NULL,
+                \"email\" TEXT UNIQUE NOT NULL{nocase},
+                \"password\" TEXT NOT NULL,
+                \"tokenKey\" TEXT NOT NULL,
+                \"created\" TEXT NOT NULL,
+                \"updated\" TEXT NOT NULL
+            )"
+        ),
+    ];
+    if d == Dialeto::Postgres {
+        v.push("CREATE UNIQUE INDEX IF NOT EXISTS \"_collections_name_ci\" ON \"_collections\" (lower(\"name\"))".into());
+        v.push("CREATE UNIQUE INDEX IF NOT EXISTS \"_superusers_email_ci\" ON \"_superusers\" (lower(\"email\"))".into());
+    }
+    v
+}
+
+// ── Validação e conversão ────────────────────────────────────────────────
 
 fn nome_valido(n: &str) -> bool {
     let mut cs = n.chars();
@@ -175,22 +238,23 @@ const RESERVADOS: [&str; 6] = [
     "expand",
 ];
 
-fn tipo_sql(f: &Field) -> &'static str {
-    match f.kind {
-        FieldType::Number => "NUMERIC NOT NULL DEFAULT 0",
-        FieldType::Bool => "BOOLEAN NOT NULL DEFAULT FALSE",
-        FieldType::Json => "JSON DEFAULT NULL",
-        FieldType::Select if f.multiplo() => "JSON NOT NULL DEFAULT '[]'",
+fn tipo_sql(f: &Field, d: Dialeto) -> &'static str {
+    match (f.kind, d) {
+        (FieldType::Number, Dialeto::Sqlite) => "NUMERIC NOT NULL DEFAULT 0",
+        (FieldType::Number, Dialeto::Postgres) => "DOUBLE PRECISION NOT NULL DEFAULT 0",
+        (FieldType::Bool, _) => "BOOLEAN NOT NULL DEFAULT FALSE",
+        (FieldType::Json, _) => "TEXT DEFAULT NULL",
+        (FieldType::Select, _) if f.multiplo() => "TEXT NOT NULL DEFAULT '[]'",
         _ => "TEXT NOT NULL DEFAULT ''",
     }
 }
 
-fn literal_sql(l: Literal) -> Sv {
+fn literal_valor(l: Literal) -> Valor {
     match l {
-        Literal::Texto(t) => Sv::Text(t),
-        Literal::Numero(n) => Sv::Real(n),
-        Literal::Bool(b) => Sv::Integer(b as i64),
-        Literal::Nulo => Sv::Null,
+        Literal::Texto(t) => Valor::Texto(t),
+        Literal::Numero(n) => Valor::Real(n),
+        Literal::Bool(b) => Valor::Bool(b),
+        Literal::Nulo => Valor::Nulo,
     }
 }
 
@@ -198,13 +262,20 @@ fn erro_campo(erros: &mut Map<String, Value>, nome: &str, codigo: &str, msg: Str
     erros.insert(nome.into(), json!({ "code": codigo, "message": msg }));
 }
 
+fn invalido(mensagem: &str, erros: Map<String, Value>) -> Erro {
+    Erro::Invalido {
+        mensagem: mensagem.into(),
+        campos: erros,
+    }
+}
+
 /// Valida e converte o valor de um campo. `None` = campo ausente (usa o vazio).
-fn valor_do_campo(f: &Field, v: Option<&Value>, erros: &mut Map<String, Value>) -> Sv {
+fn valor_do_campo(f: &Field, v: Option<&Value>, erros: &mut Map<String, Value>) -> Valor {
     let n = f.name.as_str();
     let obrigatorio = |erros: &mut Map<String, Value>| {
         erro_campo(erros, n, "validation_required", "Cannot be blank.".into())
     };
-    let invalido = |erros: &mut Map<String, Value>| {
+    let ruim = |erros: &mut Map<String, Value>| {
         erro_campo(
             erros,
             n,
@@ -224,15 +295,15 @@ fn valor_do_campo(f: &Field, v: Option<&Value>, erros: &mut Map<String, Value>) 
                 Some(Value::Number(x)) => x.to_string(),
                 Some(Value::Bool(b)) => b.to_string(),
                 _ => {
-                    invalido(erros);
-                    return Sv::Text(String::new());
+                    ruim(erros);
+                    return Valor::Texto(String::new());
                 }
             };
             if t.is_empty() {
                 if f.required {
                     obrigatorio(erros);
                 }
-                return Sv::Text(t);
+                return Valor::Texto(t);
             }
             let tam = t.chars().count() as f64;
             match f.kind {
@@ -298,7 +369,7 @@ fn valor_do_campo(f: &Field, v: Option<&Value>, erros: &mut Map<String, Value>) 
                 }
                 _ => {}
             }
-            Sv::Text(t)
+            Valor::Texto(t)
         }
         FieldType::Number => {
             let x = match v {
@@ -308,13 +379,13 @@ fn valor_do_campo(f: &Field, v: Option<&Value>, erros: &mut Map<String, Value>) 
                 Some(Value::String(s)) => match s.trim().parse::<f64>() {
                     Ok(x) => x,
                     Err(_) => {
-                        invalido(erros);
-                        return Sv::Real(0.0);
+                        ruim(erros);
+                        return Valor::Real(0.0);
                     }
                 },
                 _ => {
-                    invalido(erros);
-                    return Sv::Real(0.0);
+                    ruim(erros);
+                    return Valor::Real(0.0);
                 }
             };
             if x == 0.0 && f.required {
@@ -348,7 +419,7 @@ fn valor_do_campo(f: &Field, v: Option<&Value>, erros: &mut Map<String, Value>) 
                     "Decimal numbers are not allowed.".into(),
                 );
             }
-            Sv::Real(x)
+            Valor::Real(x)
         }
         FieldType::Bool => {
             let b = match v {
@@ -357,14 +428,14 @@ fn valor_do_campo(f: &Field, v: Option<&Value>, erros: &mut Map<String, Value>) 
                 Some(Value::Number(x)) => x.as_f64() != Some(0.0),
                 Some(Value::String(s)) => matches!(s.as_str(), "true" | "1"),
                 _ => {
-                    invalido(erros);
+                    ruim(erros);
                     false
                 }
             };
             if !b && f.required {
                 obrigatorio(erros);
             }
-            Sv::Integer(b as i64)
+            Valor::Bool(b)
         }
         FieldType::Select => {
             let permitidos: Vec<String> = f
@@ -387,18 +458,18 @@ fn valor_do_campo(f: &Field, v: Option<&Value>, erros: &mut Map<String, Value>) 
                         match x.as_str() {
                             Some(s) if !out.iter().any(|o| o == s) => out.push(s.into()),
                             Some(_) => {}
-                            None => invalido(erros),
+                            None => ruim(erros),
                         }
                     }
                     out
                 }
                 _ => {
-                    invalido(erros);
+                    ruim(erros);
                     vec![]
                 }
             };
             if escolhidos.iter().any(|s| !permitidos.contains(s)) {
-                invalido(erros);
+                ruim(erros);
             }
             let max = f.opcao_f64("maxSelect").unwrap_or(1.0).max(1.0) as usize;
             if escolhidos.len() > max {
@@ -413,9 +484,9 @@ fn valor_do_campo(f: &Field, v: Option<&Value>, erros: &mut Map<String, Value>) 
                 obrigatorio(erros);
             }
             if f.multiplo() {
-                Sv::Text(serde_json::to_string(&escolhidos).unwrap_or_else(|_| "[]".into()))
+                Valor::Texto(serde_json::to_string(&escolhidos).unwrap_or_else(|_| "[]".into()))
             } else {
-                Sv::Text(escolhidos.into_iter().next().unwrap_or_default())
+                Valor::Texto(escolhidos.into_iter().next().unwrap_or_default())
             }
         }
         FieldType::Json => {
@@ -431,32 +502,46 @@ fn valor_do_campo(f: &Field, v: Option<&Value>, erros: &mut Map<String, Value>) 
                 obrigatorio(erros);
             }
             if valor.is_null() {
-                Sv::Null
+                Valor::Nulo
             } else {
-                Sv::Text(valor.to_string())
+                Valor::Texto(valor.to_string())
             }
         }
         // Tipos ainda não suportados não chegam aqui: a coleção é recusada antes.
-        _ => Sv::Null,
+        _ => Valor::Nulo,
     }
 }
 
-/// Valor do banco para o JSON da resposta.
-fn para_json(f: &Field, v: Sv) -> Value {
+fn numero_json(x: f64) -> Value {
+    if x.fract() == 0.0 && x.abs() < 9.0e15 {
+        json!(x as i64)
+    } else {
+        json!(x)
+    }
+}
+
+/// Valor do banco para o JSON da resposta, igual em todos os motores.
+fn para_json(f: &Field, v: Valor) -> Value {
     match (f.kind, v) {
-        (FieldType::Number, Sv::Integer(i)) => json!(i),
-        (FieldType::Number, Sv::Real(x)) if x.fract() == 0.0 && x.abs() < 9.0e15 => json!(x as i64),
-        (FieldType::Number, Sv::Real(x)) => json!(x),
-        (FieldType::Bool, Sv::Integer(i)) => json!(i != 0),
-        (FieldType::Json, Sv::Text(t)) => serde_json::from_str(&t).unwrap_or(Value::Null),
-        (FieldType::Select, Sv::Text(t)) if f.multiplo() => {
+        (_, Valor::Nulo) if f.kind == FieldType::Select && f.multiplo() => json!([]),
+        (FieldType::Json, Valor::Nulo) => Value::Null,
+        (FieldType::Number, Valor::Nulo) => json!(0),
+        (FieldType::Bool, Valor::Nulo) => json!(false),
+        (_, Valor::Nulo) => json!(""),
+        (FieldType::Number, Valor::Int(i)) => json!(i),
+        (FieldType::Number, Valor::Real(x)) => numero_json(x),
+        (FieldType::Number, Valor::Texto(t)) => {
+            t.parse::<f64>().map(numero_json).unwrap_or(json!(0))
+        }
+        (FieldType::Bool, v) => json!(v.bool()),
+        (FieldType::Json, Valor::Texto(t)) => serde_json::from_str(&t).unwrap_or(Value::Null),
+        (FieldType::Select, Valor::Texto(t)) if f.multiplo() => {
             serde_json::from_str(&t).unwrap_or(json!([]))
         }
-        (_, Sv::Text(t)) => json!(t),
-        (_, Sv::Integer(i)) => json!(i),
-        (_, Sv::Real(x)) => json!(x),
-        (_, Sv::Null) => Value::Null,
-        (_, Sv::Blob(_)) => Value::Null,
+        (_, Valor::Texto(t)) => json!(t),
+        (_, Valor::Int(i)) => json!(i),
+        (_, Valor::Real(x)) => numero_json(x),
+        (_, Valor::Bool(b)) => json!(b),
     }
 }
 
@@ -468,81 +553,90 @@ fn colunas(c: &Collection) -> String {
     cols.join(", ")
 }
 
-fn linha_para_registro(c: &Collection, r: &rusqlite::Row) -> rusqlite::Result<Value> {
+fn linha_para_registro(c: &Collection, l: Linha) -> Value {
+    let mut it = l.into_iter();
     let mut m = Map::new();
     m.insert("collectionId".into(), json!(c.id));
     m.insert("collectionName".into(), json!(c.name));
-    m.insert("id".into(), json!(r.get::<_, String>(0)?));
-    for (i, f) in c.fields.iter().enumerate() {
-        m.insert(f.name.clone(), para_json(f, r.get::<_, Sv>(i + 1)?));
+    m.insert(
+        "id".into(),
+        json!(it.next().unwrap_or(Valor::Nulo).texto_ou_vazio()),
+    );
+    for f in &c.fields {
+        m.insert(
+            f.name.clone(),
+            para_json(f, it.next().unwrap_or(Valor::Nulo)),
+        );
     }
-    let n = c.fields.len();
-    m.insert("created".into(), json!(r.get::<_, String>(n + 1)?));
-    m.insert("updated".into(), json!(r.get::<_, String>(n + 2)?));
-    Ok(Value::Object(m))
+    m.insert(
+        "created".into(),
+        json!(it.next().unwrap_or(Valor::Nulo).texto_ou_vazio()),
+    );
+    m.insert(
+        "updated".into(),
+        json!(it.next().unwrap_or(Valor::Nulo).texto_ou_vazio()),
+    );
+    Value::Object(m)
 }
 
-/// Regra de acesso + filtro do usuário em um `WHERE`, com os parâmetros.
-fn onde(
-    c: &Collection,
-    regra: Option<&str>,
-    filtro_usuario: Option<&str>,
-) -> Resultado<(String, Vec<Sv>)> {
-    let valido = |n: &str| c.coluna_valida(n);
-    let mut partes = vec![];
-    let mut params = vec![];
-    for f in [regra, filtro_usuario]
-        .into_iter()
-        .flatten()
-        .filter(|f| !f.trim().is_empty())
-    {
-        let sql = filtro::para_sql(f, &valido, Dialeto::Sqlite)?;
-        partes.push(sql.texto);
-        params.extend(sql.params.into_iter().map(literal_sql));
-    }
-    let texto = if partes.is_empty() {
-        String::new()
-    } else {
-        format!(" WHERE {}", partes.join(" AND "))
+const COLS_COLECAO: &str = "\"id\", \"name\", \"type\", \"system\", \"fields\", \"listRule\", \"viewRule\", \"createRule\", \"updateRule\", \"deleteRule\", \"indexes\", \"created\", \"updated\"";
+
+fn ler_colecao(l: Linha) -> Collection {
+    let mut it = l.into_iter();
+    let mut prox = || it.next().unwrap_or(Valor::Nulo);
+    let id = prox().texto_ou_vazio();
+    let name = prox().texto_ou_vazio();
+    let tipo = prox().texto_ou_vazio();
+    let system = prox().bool();
+    let campos = prox().texto_ou_vazio();
+    let regra = |v: Valor| match v {
+        Valor::Texto(t) => Some(t),
+        _ => None,
     };
-    Ok((texto, params))
-}
-
-fn ler_colecao(r: &rusqlite::Row) -> rusqlite::Result<Collection> {
-    let tipo: String = r.get("type")?;
-    let campos: String = r.get("fields")?;
-    let indices: String = r.get("indexes")?;
-    Ok(Collection {
-        id: r.get("id")?,
-        name: r.get("name")?,
+    let (list_rule, view_rule, create_rule, update_rule, delete_rule) = (
+        regra(prox()),
+        regra(prox()),
+        regra(prox()),
+        regra(prox()),
+        regra(prox()),
+    );
+    let indices = prox().texto_ou_vazio();
+    Collection {
+        id,
+        name,
         kind: serde_json::from_value(json!(tipo)).unwrap_or_default(),
-        system: r.get("system")?,
+        system,
         fields: serde_json::from_str(&campos).unwrap_or_default(),
-        list_rule: r.get("listRule")?,
-        view_rule: r.get("viewRule")?,
-        create_rule: r.get("createRule")?,
-        update_rule: r.get("updateRule")?,
-        delete_rule: r.get("deleteRule")?,
+        list_rule,
+        view_rule,
+        create_rule,
+        update_rule,
+        delete_rule,
         indexes: serde_json::from_str(&indices).unwrap_or_default(),
-        created: r.get("created")?,
-        updated: r.get("updated")?,
-    })
+        created: prox().texto_ou_vazio(),
+        updated: prox().texto_ou_vazio(),
+    }
 }
 
-fn ler_superuser(r: &rusqlite::Row) -> rusqlite::Result<Superusuario> {
-    Ok(Superusuario {
+const COLS_SUPERUSER: &str =
+    "\"id\", \"email\", \"password\", \"tokenKey\", \"created\", \"updated\"";
+
+fn ler_superuser(l: Linha) -> Superusuario {
+    let t: Vec<String> = l.into_iter().map(|v| v.texto_ou_vazio()).collect();
+    let g = |i: usize| t.get(i).cloned().unwrap_or_default();
+    Superusuario {
         collection_id: auth::COLECAO_SUPERUSERS.into(),
         collection_name: "_superusers".into(),
-        id: r.get("id")?,
-        email: r.get("email")?,
-        senha: r.get("password")?,
-        token_key: r.get("tokenKey")?,
-        created: r.get("created")?,
-        updated: r.get("updated")?,
-    })
+        id: g(0),
+        email: g(1),
+        senha: g(2),
+        token_key: g(3),
+        created: g(4),
+        updated: g(5),
+    }
 }
 
-fn validar_colecao(c: &Collection) -> Resultado<()> {
+fn validar_colecao(c: &Collection, d: Dialeto) -> Resultado<()> {
     let mut erros = Map::new();
     if !nome_valido(&c.name)
         || c.name.starts_with('_')
@@ -584,17 +678,15 @@ fn validar_colecao(c: &Collection) -> Resultado<()> {
         }
         vistos.push(f.name.clone());
         if !f.kind.suportado() {
+            let tipo = serde_json::to_value(f.kind)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default();
             erro_campo(
                 &mut erros,
                 &format!("fields.{i}.type"),
                 "validation_not_supported",
-                format!(
-                    "Field type '{}' is not supported in this version.",
-                    serde_json::to_value(f.kind)
-                        .unwrap_or_default()
-                        .as_str()
-                        .unwrap_or("")
-                ),
+                format!("Field type '{tipo}' is not supported in this version."),
             );
         }
     }
@@ -608,7 +700,7 @@ fn validar_colecao(c: &Collection) -> Resultado<()> {
             ("deleteRule", &c.delete_rule),
         ] {
             if let Some(r) = regra.as_deref().filter(|r| !r.trim().is_empty())
-                && let Err(e) = filtro::para_sql(r, &|n| c.coluna_valida(n), Dialeto::Sqlite)
+                && let Err(e) = filtro::para_sql(r, &|n| c.coluna_valida(n), d)
             {
                 erro_campo(&mut erros, nome, "validation_invalid_rule", e.to_string());
             }
@@ -617,66 +709,111 @@ fn validar_colecao(c: &Collection) -> Resultado<()> {
     if erros.is_empty() {
         Ok(())
     } else {
-        Err(Erro::Invalido {
-            mensagem: "Failed to create collection.".into(),
-            campos: erros,
-        })
+        Err(invalido("Failed to create collection.", erros))
     }
 }
 
-impl Banco for Sqlite {
-    fn dialeto(&self) -> Dialeto {
-        Dialeto::Sqlite
+fn nao_encontrado() -> Erro {
+    Erro::NaoEncontrado("The requested resource wasn't found.".into())
+}
+
+// ── Operações ────────────────────────────────────────────────────────────
+
+impl Banco {
+    /// Regra de acesso + filtro do usuário em um `WHERE`, com os parâmetros.
+    fn onde(
+        &self,
+        c: &Collection,
+        regra: Option<&str>,
+        filtro_usuario: Option<&str>,
+    ) -> Resultado<(String, Vec<Valor>)> {
+        let valido = |n: &str| c.coluna_valida(n);
+        let mut partes = vec![];
+        let mut params = vec![];
+        for f in [regra, filtro_usuario]
+            .into_iter()
+            .flatten()
+            .filter(|f| !f.trim().is_empty())
+        {
+            let sql = filtro::para_sql(f, &valido, self.dialeto())?;
+            partes.push(sql.texto);
+            params.extend(sql.params.into_iter().map(literal_valor));
+        }
+        let texto = if partes.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", partes.join(" AND "))
+        };
+        Ok((texto, params))
     }
 
-    fn segredo(&self) -> Resultado<String> {
-        let conn = self.conn();
-        if let Some(s) = conn
-            .query_row(
-                "SELECT value FROM _params WHERE id = 'jwtSecret'",
-                [],
-                |r| r.get::<_, String>(0),
+    async fn contar(&self, sql: &str, params: Vec<Valor>) -> Resultado<i64> {
+        Ok(self
+            .ex
+            .consultar(sql, params)
+            .await?
+            .first()
+            .and_then(|l| l.first())
+            .map(Valor::int)
+            .unwrap_or(0))
+    }
+
+    /// Segredo dos tokens deste projeto (gerado na primeira vez).
+    pub async fn segredo(&self) -> Resultado<String> {
+        let l = self
+            .ex
+            .consultar(
+                "SELECT \"value\" FROM \"_params\" WHERE \"id\" = 'jwtSecret'",
+                vec![],
             )
-            .optional()?
-        {
-            return Ok(s);
+            .await?;
+        if let Some(v) = l.first().and_then(|l| l.first()).and_then(|v| v.texto()) {
+            return Ok(v.to_string());
         }
         let s = id::aleatorio(50);
-        conn.execute(
-            "INSERT INTO _params (id, value) VALUES ('jwtSecret', ?1)",
-            params![s],
-        )?;
+        self.ex
+            .executar(
+                "INSERT INTO \"_params\" (\"id\", \"value\") VALUES ('jwtSecret', ?)",
+                vec![s.clone().into()],
+            )
+            .await?;
         Ok(s)
     }
 
-    fn colecoes(&self) -> Resultado<Vec<Collection>> {
-        let conn = self.conn();
-        let mut st = conn.prepare("SELECT * FROM _collections ORDER BY created, rowid")?;
-        let v = st
-            .query_map([], ler_colecao)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(v)
+    pub async fn colecoes(&self) -> Resultado<Vec<Collection>> {
+        let l = self
+            .ex
+            .consultar(
+                &format!(
+                    "SELECT {COLS_COLECAO} FROM \"_collections\" ORDER BY \"created\", \"id\""
+                ),
+                vec![],
+            )
+            .await?;
+        Ok(l.into_iter().map(ler_colecao).collect())
     }
 
-    fn colecao(&self, id_ou_nome: &str) -> Resultado<Collection> {
-        self.conn()
-            .query_row(
-                "SELECT * FROM _collections WHERE id = ?1 OR name = ?1 COLLATE NOCASE",
-                params![id_ou_nome],
-                ler_colecao,
+    pub async fn colecao(&self, id_ou_nome: &str) -> Resultado<Collection> {
+        let l = self
+            .ex
+            .consultar(
+                &format!("SELECT {COLS_COLECAO} FROM \"_collections\" WHERE \"id\" = ? OR lower(\"name\") = lower(?)"),
+                vec![id_ou_nome.into(), id_ou_nome.into()],
             )
-            .optional()?
+            .await?;
+        l.into_iter()
+            .next()
+            .map(ler_colecao)
             .ok_or_else(|| Erro::NaoEncontrado("Missing collection context.".into()))
     }
 
-    fn criar_colecao(&self, mut c: Collection) -> Resultado<Collection> {
-        validar_colecao(&c)?;
+    pub async fn criar_colecao(&self, mut c: Collection) -> Resultado<Collection> {
+        let d = self.dialeto();
+        validar_colecao(&c, d)?;
         let agora = agora();
-        c.id = if c.id.is_empty() {
-            format!("pbc_{}", id::novo())
-        } else {
-            c.id
-        };
+        if c.id.is_empty() {
+            c.id = format!("pbc_{}", id::novo());
+        }
         c.system = false;
         c.created = agora.clone();
         c.updated = agora;
@@ -689,14 +826,13 @@ impl Banco for Sqlite {
                 f.id = format!("{tipo}{}", id::aleatorio(10));
             }
         }
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        let existe: bool = tx.query_row(
-            "SELECT EXISTS (SELECT 1 FROM _collections WHERE name = ?1 COLLATE NOCASE OR id = ?2)",
-            params![c.name, c.id],
-            |r| r.get(0),
-        )?;
-        if existe {
+        let existe = self
+            .contar(
+                "SELECT COUNT(*) FROM \"_collections\" WHERE lower(\"name\") = lower(?) OR \"id\" = ?",
+                vec![c.name.clone().into(), c.id.clone().into()],
+            )
+            .await?;
+        let duplicado = || {
             let mut erros = Map::new();
             erro_campo(
                 &mut erros,
@@ -704,82 +840,99 @@ impl Banco for Sqlite {
                 "validation_collection_name_exists",
                 "Collection name must be unique (case insensitive).".into(),
             );
-            return Err(Erro::Invalido {
-                mensagem: "Failed to create collection.".into(),
-                campos: erros,
-            });
+            invalido("Failed to create collection.", erros)
+        };
+        if existe > 0 {
+            return Err(duplicado());
         }
         let mut colunas_sql = vec!["\"id\" TEXT PRIMARY KEY NOT NULL".to_string()];
         colunas_sql.extend(
             c.fields
                 .iter()
-                .map(|f| format!("\"{}\" {}", f.name, tipo_sql(f))),
+                .map(|f| format!("\"{}\" {}", f.name, tipo_sql(f, d))),
         );
         colunas_sql.push("\"created\" TEXT NOT NULL DEFAULT ''".into());
         colunas_sql.push("\"updated\" TEXT NOT NULL DEFAULT ''".into());
-        tx.execute_batch(&format!(
-            "CREATE TABLE \"{}\" ({});",
-            c.name,
-            colunas_sql.join(", ")
-        ))?;
-        tx.execute(
-            "INSERT INTO _collections (id, name, type, system, fields, listRule, viewRule, createRule, updateRule, deleteRule, indexes, created, updated)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            params![
-                c.id,
-                c.name,
-                "base",
-                c.system,
-                serde_json::to_string(&c.fields).unwrap_or_else(|_| "[]".into()),
-                c.list_rule,
-                c.view_rule,
-                c.create_rule,
-                c.update_rule,
-                c.delete_rule,
-                serde_json::to_string(&c.indexes).unwrap_or_else(|_| "[]".into()),
-                c.created,
-                c.updated,
+        let insert = (
+            format!(
+                "INSERT INTO \"_collections\" ({COLS_COLECAO}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            ),
+            vec![
+                c.id.clone().into(),
+                c.name.clone().into(),
+                "base".into(),
+                Valor::Bool(c.system),
+                serde_json::to_string(&c.fields)
+                    .unwrap_or_else(|_| "[]".into())
+                    .into(),
+                c.list_rule.clone().into(),
+                c.view_rule.clone().into(),
+                c.create_rule.clone().into(),
+                c.update_rule.clone().into(),
+                c.delete_rule.clone().into(),
+                serde_json::to_string(&c.indexes)
+                    .unwrap_or_else(|_| "[]".into())
+                    .into(),
+                c.created.clone().into(),
+                c.updated.clone().into(),
             ],
-        )?;
-        tx.commit()?;
+        );
+        self.ex
+            .lote(vec![
+                (
+                    format!("CREATE TABLE \"{}\" ({})", c.name, colunas_sql.join(", ")),
+                    vec![],
+                ),
+                insert,
+            ])
+            .await
+            .map_err(|e| {
+                if matches!(e, Erro::Duplicado(_)) {
+                    duplicado()
+                } else {
+                    e
+                }
+            })?;
         Ok(c)
     }
 
-    fn apagar_colecao(&self, id_ou_nome: &str) -> Resultado<()> {
-        let c = self.colecao(id_ou_nome)?;
+    pub async fn apagar_colecao(&self, id_ou_nome: &str) -> Resultado<()> {
+        let c = self.colecao(id_ou_nome).await?;
         if c.system {
             return Err(Erro::invalido("System collections can't be deleted."));
         }
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        tx.execute_batch(&format!("DROP TABLE IF EXISTS \"{}\";", c.name))?;
-        tx.execute("DELETE FROM _collections WHERE id = ?1", params![c.id])?;
-        tx.commit()?;
-        Ok(())
+        self.ex
+            .lote(vec![
+                (format!("DROP TABLE IF EXISTS \"{}\"", c.name), vec![]),
+                (
+                    "DELETE FROM \"_collections\" WHERE \"id\" = ?".into(),
+                    vec![c.id.clone().into()],
+                ),
+            ])
+            .await
     }
 
-    fn listar(&self, c: &Collection, q: &Consulta) -> Resultado<Lista> {
+    pub async fn listar(&self, c: &Collection, q: &Consulta) -> Resultado<Lista> {
         let por_pagina = q.por_pagina.clamp(1, 1000);
         let pagina = q.pagina.max(1);
-        let (onde_sql, params) = onde(c, q.regra.as_deref(), q.filtro.as_deref())?;
+        let (onde_sql, params) = self.onde(c, q.regra.as_deref(), q.filtro.as_deref())?;
+        // "id" desempata valores iguais: a mesma consulta devolve sempre a mesma
+        // ordem, e a paginação não repete nem pula registros.
         let ordem = match q.ordem.as_deref().filter(|s| !s.trim().is_empty()) {
-            // `rowid` desempata valores iguais: a mesma consulta devolve sempre a
-            // mesma ordem, e a paginação não repete nem pula registros.
             Some(s) => format!(
-                " ORDER BY {}, rowid",
-                filtro::ordem(s, &|n| c.coluna_valida(n), Dialeto::Sqlite)?
+                " ORDER BY {}, \"id\"",
+                filtro::ordem(s, &|n| c.coluna_valida(n), self.dialeto())?
             ),
-            None => " ORDER BY rowid".into(),
+            None => " ORDER BY \"created\", \"id\"".into(),
         };
-        let conn = self.conn();
-        let total: i64 = if q.pular_total {
+        let total = if q.pular_total {
             -1
         } else {
-            conn.query_row(
+            self.contar(
                 &format!("SELECT COUNT(*) FROM \"{}\"{onde_sql}", c.name),
-                params_from_iter(params.iter()),
-                |r| r.get(0),
-            )?
+                params.clone(),
+            )
+            .await?
         };
         let sql = format!(
             "SELECT {} FROM \"{}\"{onde_sql}{ordem} LIMIT {por_pagina} OFFSET {}",
@@ -787,12 +940,13 @@ impl Banco for Sqlite {
             c.name,
             (pagina as i64 - 1) * por_pagina as i64
         );
-        let mut st = conn.prepare(&sql)?;
-        let items = st
-            .query_map(params_from_iter(params.iter()), |r| {
-                linha_para_registro(c, r)
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let items = self
+            .ex
+            .consultar(&sql, params)
+            .await?
+            .into_iter()
+            .map(|l| linha_para_registro(c, l))
+            .collect();
         let paginas = if total < 0 {
             -1
         } else {
@@ -807,25 +961,33 @@ impl Banco for Sqlite {
         })
     }
 
-    fn registro(&self, c: &Collection, id: &str, regra: Option<&str>) -> Resultado<Value> {
-        let (onde_sql, mut params) = onde(c, regra, None)?;
+    pub async fn registro(
+        &self,
+        c: &Collection,
+        id: &str,
+        regra: Option<&str>,
+    ) -> Resultado<Value> {
+        let (onde_sql, mut params) = self.onde(c, regra, None)?;
         let filtro_id = if onde_sql.is_empty() {
             " WHERE \"id\" = ?".to_string()
         } else {
             format!("{onde_sql} AND \"id\" = ?")
         };
-        params.push(Sv::Text(id.into()));
-        let conn = self.conn();
-        conn.query_row(
-            &format!("SELECT {} FROM \"{}\"{filtro_id}", colunas(c), c.name),
-            params_from_iter(params.iter()),
-            |r| linha_para_registro(c, r),
-        )
-        .optional()?
-        .ok_or_else(|| Erro::NaoEncontrado("The requested resource wasn't found.".into()))
+        params.push(id.into());
+        let l = self
+            .ex
+            .consultar(
+                &format!("SELECT {} FROM \"{}\"{filtro_id}", colunas(c), c.name),
+                params,
+            )
+            .await?;
+        l.into_iter()
+            .next()
+            .map(|l| linha_para_registro(c, l))
+            .ok_or_else(nao_encontrado)
     }
 
-    fn criar(&self, c: &Collection, dados: &Map<String, Value>) -> Resultado<Value> {
+    pub async fn criar(&self, c: &Collection, dados: &Map<String, Value>) -> Resultado<Value> {
         let mut erros = Map::new();
         let novo_id = match dados
             .get("id")
@@ -844,61 +1006,53 @@ impl Banco for Sqlite {
             }
             None => id::novo(),
         };
-        let valores: Vec<Sv> = c
+        let valores: Vec<Valor> = c
             .fields
             .iter()
             .map(|f| valor_do_campo(f, dados.get(&f.name), &mut erros))
             .collect();
         if !erros.is_empty() {
-            return Err(Erro::Invalido {
-                mensagem: "Failed to create record.".into(),
-                campos: erros,
-            });
+            return Err(invalido("Failed to create record.", erros));
         }
         let agora = agora();
-        let mut todos = vec![Sv::Text(novo_id.clone())];
+        let mut todos = vec![Valor::Texto(novo_id.clone())];
         todos.extend(valores);
-        todos.push(Sv::Text(agora.clone()));
-        todos.push(Sv::Text(agora));
+        todos.push(agora.clone().into());
+        todos.push(agora.into());
         let marcadores = vec!["?"; todos.len()].join(", ");
-        {
-            let conn = self.conn();
-            let r = conn.execute(
+        let r = self
+            .ex
+            .executar(
                 &format!(
                     "INSERT INTO \"{}\" ({}) VALUES ({marcadores})",
                     c.name,
                     colunas(c)
                 ),
-                params_from_iter(todos.iter()),
+                todos,
+            )
+            .await;
+        if let Err(Erro::Duplicado(_)) = r {
+            let mut erros = Map::new();
+            erro_campo(
+                &mut erros,
+                "id",
+                "validation_invalid_id",
+                "The id is invalid or already exists.".into(),
             );
-            if let Err(rusqlite::Error::SqliteFailure(e, _)) = &r
-                && e.code == rusqlite::ErrorCode::ConstraintViolation
-            {
-                let mut erros = Map::new();
-                erro_campo(
-                    &mut erros,
-                    "id",
-                    "validation_invalid_id",
-                    "The id is invalid or already exists.".into(),
-                );
-                return Err(Erro::Invalido {
-                    mensagem: "Failed to create record.".into(),
-                    campos: erros,
-                });
-            }
-            r?;
+            return Err(invalido("Failed to create record.", erros));
         }
-        self.registro(c, &novo_id, None)
+        r?;
+        self.registro(c, &novo_id, None).await
     }
 
-    fn atualizar(
+    pub async fn atualizar(
         &self,
         c: &Collection,
         id: &str,
         dados: &Map<String, Value>,
         regra: Option<&str>,
     ) -> Resultado<Value> {
-        let atual = self.registro(c, id, regra)?;
+        let atual = self.registro(c, id, regra).await?;
         let mut erros = Map::new();
         let mut sets = vec![];
         let mut valores = vec![];
@@ -906,44 +1060,45 @@ impl Banco for Sqlite {
             // Só os campos enviados mudam; os outros são revalidados como estão
             // para manter "obrigatório" coerente.
             let v = dados.get(&f.name).or_else(|| atual.get(&f.name));
-            let sv = valor_do_campo(f, v, &mut erros);
+            let valor = valor_do_campo(f, v, &mut erros);
             if dados.contains_key(&f.name) {
                 sets.push(format!("\"{}\" = ?", f.name));
-                valores.push(sv);
+                valores.push(valor);
             }
         }
         if !erros.is_empty() {
-            return Err(Erro::Invalido {
-                mensagem: "Failed to update record.".into(),
-                campos: erros,
-            });
+            return Err(invalido("Failed to update record.", erros));
         }
         sets.push("\"updated\" = ?".into());
-        valores.push(Sv::Text(agora()));
-        valores.push(Sv::Text(id.into()));
-        self.conn().execute(
-            &format!(
-                "UPDATE \"{}\" SET {} WHERE \"id\" = ?",
-                c.name,
-                sets.join(", ")
-            ),
-            params_from_iter(valores.iter()),
-        )?;
-        self.registro(c, id, None)
+        valores.push(agora().into());
+        valores.push(id.into());
+        self.ex
+            .executar(
+                &format!(
+                    "UPDATE \"{}\" SET {} WHERE \"id\" = ?",
+                    c.name,
+                    sets.join(", ")
+                ),
+                valores,
+            )
+            .await?;
+        self.registro(c, id, None).await
     }
 
-    fn apagar(&self, c: &Collection, id: &str, regra: Option<&str>) -> Resultado<()> {
-        self.registro(c, id, regra)?;
-        self.conn().execute(
-            &format!("DELETE FROM \"{}\" WHERE \"id\" = ?1", c.name),
-            params![id],
-        )?;
+    pub async fn apagar(&self, c: &Collection, id: &str, regra: Option<&str>) -> Resultado<()> {
+        self.registro(c, id, regra).await?;
+        self.ex
+            .executar(
+                &format!("DELETE FROM \"{}\" WHERE \"id\" = ?", c.name),
+                vec![id.into()],
+            )
+            .await?;
         Ok(())
     }
 
-    fn superuser_salvar(&self, email: &str, senha: &str) -> Resultado<Superusuario> {
+    pub async fn superuser_salvar(&self, email: &str, senha: &str) -> Resultado<Superusuario> {
         let mut erros = Map::new();
-        let email = email.trim();
+        let email = email.trim().to_string();
         let ok_email = email
             .split_once('@')
             .is_some_and(|(a, d)| !a.is_empty() && d.contains('.'));
@@ -964,74 +1119,88 @@ impl Banco for Sqlite {
             );
         }
         if !erros.is_empty() {
-            return Err(Erro::Invalido {
-                mensagem: "Failed to save superuser.".into(),
-                campos: erros,
-            });
+            return Err(invalido("Failed to save superuser.", erros));
         }
-        let hash = auth::hash_senha(senha)?;
+        // O Argon2 é caro de propósito: fora das threads do runtime.
+        let senha = senha.to_string();
+        let hash = tokio::task::spawn_blocking(move || auth::hash_senha(&senha))
+            .await
+            .map_err(|e| Erro::Interno(e.to_string()))??;
         let chave = id::aleatorio(50);
         let agora = agora();
-        let conn = self.conn();
-        let existente: Option<String> = conn
-            .query_row(
-                "SELECT id FROM _superusers WHERE email = ?1 COLLATE NOCASE",
-                params![email],
-                |r| r.get(0),
+        let existente = self
+            .ex
+            .consultar(
+                "SELECT \"id\" FROM \"_superusers\" WHERE lower(\"email\") = lower(?)",
+                vec![email.clone().into()],
             )
-            .optional()?;
+            .await?
+            .into_iter()
+            .next()
+            .map(|l| l.into_iter().next().unwrap_or(Valor::Nulo).texto_ou_vazio());
         let id_su = match existente {
             Some(i) => {
-                conn.execute(
-                    "UPDATE _superusers SET password = ?1, tokenKey = ?2, updated = ?3 WHERE id = ?4",
-                    params![hash, chave, agora, i],
-                )?;
+                self.ex
+                    .executar(
+                        "UPDATE \"_superusers\" SET \"password\" = ?, \"tokenKey\" = ?, \"updated\" = ? WHERE \"id\" = ?",
+                        vec![hash.into(), chave.into(), agora.into(), i.clone().into()],
+                    )
+                    .await?;
                 i
             }
             None => {
                 let i = id::novo();
-                conn.execute(
-                    "INSERT INTO _superusers (id, email, password, tokenKey, created, updated) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-                    params![i, email, hash, chave, agora],
-                )?;
+                self.ex
+                    .executar(
+                        &format!("INSERT INTO \"_superusers\" ({COLS_SUPERUSER}) VALUES (?, ?, ?, ?, ?, ?)"),
+                        vec![i.clone().into(), email.into(), hash.into(), chave.into(), agora.clone().into(), agora.into()],
+                    )
+                    .await?;
                 i
             }
         };
-        drop(conn);
-        self.superuser(&id_su)
+        self.superuser(&id_su).await
     }
 
-    fn superuser_por_email(&self, email: &str) -> Resultado<Superusuario> {
-        self.conn()
-            .query_row(
-                "SELECT * FROM _superusers WHERE email = ?1 COLLATE NOCASE",
-                params![email.trim()],
-                ler_superuser,
+    pub async fn superuser_por_email(&self, email: &str) -> Resultado<Superusuario> {
+        self.ex
+            .consultar(
+                &format!(
+                    "SELECT {COLS_SUPERUSER} FROM \"_superusers\" WHERE lower(\"email\") = lower(?)"
+                ),
+                vec![email.trim().into()],
             )
-            .optional()?
+            .await?
+            .into_iter()
+            .next()
+            .map(ler_superuser)
             .ok_or_else(|| Erro::NaoEncontrado("Superuser not found.".into()))
     }
 
-    fn superuser(&self, id: &str) -> Resultado<Superusuario> {
-        self.conn()
-            .query_row(
-                "SELECT * FROM _superusers WHERE id = ?1",
-                params![id],
-                ler_superuser,
+    pub async fn superuser(&self, id: &str) -> Resultado<Superusuario> {
+        self.ex
+            .consultar(
+                &format!("SELECT {COLS_SUPERUSER} FROM \"_superusers\" WHERE \"id\" = ?"),
+                vec![id.into()],
             )
-            .optional()?
+            .await?
+            .into_iter()
+            .next()
+            .map(ler_superuser)
             .ok_or_else(|| Erro::NaoEncontrado("Superuser not found.".into()))
     }
 
-    fn total_superusers(&self) -> Resultado<i64> {
-        Ok(self
-            .conn()
-            .query_row("SELECT COUNT(*) FROM _superusers", [], |r| r.get(0))?)
+    pub async fn total_superusers(&self) -> Resultado<i64> {
+        self.contar("SELECT COUNT(*) FROM \"_superusers\"", vec![])
+            .await
     }
 }
 
-#[cfg(test)]
-mod tests {
+// ── Conformidade: os mesmos testes em todos os motores ───────────────────
+
+/// Bateria que todo motor precisa passar. Usada pelos testes de cada motor
+/// (e disponível para quem escrever um motor novo).
+pub mod conformidade {
     use super::*;
 
     fn produtos() -> Collection {
@@ -1055,37 +1224,41 @@ mod tests {
         v.as_object().unwrap().clone()
     }
 
-    #[test]
-    fn colecao_cria_tabela_e_valida() {
-        let b = Sqlite::em_memoria().unwrap();
-        let c = b.criar_colecao(produtos()).unwrap();
+    pub async fn tudo(b: &Banco) {
+        colecoes(b).await;
+        registros(b).await;
+        validacao(b).await;
+        superusuarios(b).await;
+    }
+
+    pub async fn colecoes(b: &Banco) {
+        let c = b.criar_colecao(produtos()).await.unwrap();
         assert!(c.id.starts_with("pbc_") && c.fields.iter().all(|f| !f.id.is_empty()));
-        assert_eq!(b.colecao("PRODUTOS").unwrap().id, c.id);
-        assert_eq!(b.colecoes().unwrap().len(), 1);
-        // Nome repetido, nome inválido, campo reservado, tipo ainda não suportado, regra inválida.
-        assert!(b.criar_colecao(produtos()).is_err());
+        assert_eq!(b.colecao("PRODUTOS").await.unwrap().id, c.id);
+        assert_eq!(b.colecao(&c.id).await.unwrap().fields.len(), 6);
+        assert_eq!(b.colecoes().await.unwrap().len(), 1);
+        assert!(b.criar_colecao(produtos()).await.is_err(), "nome repetido");
         let mut ruim = produtos();
         ruim.name = "x; DROP TABLE y".into();
-        assert!(b.criar_colecao(ruim).is_err());
+        assert!(b.criar_colecao(ruim).await.is_err());
         let ruim: Collection =
             serde_json::from_value(json!({"name":"a","fields":[{"name":"id","type":"text"}]}))
                 .unwrap();
-        assert!(b.criar_colecao(ruim).is_err());
+        assert!(b.criar_colecao(ruim).await.is_err());
         let ruim: Collection =
             serde_json::from_value(json!({"name":"b","fields":[{"name":"f","type":"file"}]}))
                 .unwrap();
-        assert!(b.criar_colecao(ruim).is_err());
+        assert!(b.criar_colecao(ruim).await.is_err());
         let ruim: Collection =
             serde_json::from_value(json!({"name":"c","listRule":"senha = 1"})).unwrap();
-        assert!(b.criar_colecao(ruim).is_err());
-        b.apagar_colecao("produtos").unwrap();
-        assert!(b.colecao("produtos").is_err());
+        assert!(b.criar_colecao(ruim).await.is_err());
+        b.apagar_colecao("produtos").await.unwrap();
+        assert!(b.colecao("produtos").await.is_err());
+        assert!(b.colecoes().await.unwrap().is_empty());
     }
 
-    #[test]
-    fn registros_crud_filtro_ordem_e_paginas() {
-        let b = Sqlite::em_memoria().unwrap();
-        let c = b.criar_colecao(produtos()).unwrap();
+    pub async fn registros(b: &Banco) {
+        let c = b.criar_colecao(produtos()).await.unwrap();
         for (nome, preco, ativo) in [
             ("Café", 32.0, true),
             ("Chá", 18.5, true),
@@ -1095,6 +1268,7 @@ mod tests {
                 &c,
                 &obj(json!({"nome": nome, "preco": preco, "ativo": ativo, "tags": ["novo"]})),
             )
+            .await
             .unwrap();
         }
         let r = b
@@ -1102,10 +1276,13 @@ mod tests {
                 &c,
                 &obj(json!({"nome": "Pão", "preco": "7", "extra": {"a": 1}})),
             )
+            .await
             .unwrap();
         assert_eq!(r["preco"], json!(7));
         assert_eq!(r["extra"], json!({"a": 1}));
         assert_eq!(r["tags"], json!([]));
+        assert_eq!(r["ativo"], json!(false));
+        assert_eq!(r["site"], json!(""));
         assert_eq!(r["collectionName"], json!("produtos"));
         assert!(id::valido(r["id"].as_str().unwrap()));
 
@@ -1114,10 +1291,34 @@ mod tests {
             ordem: Some("-preco".into()),
             ..Default::default()
         };
-        let l = b.listar(&c, &q).unwrap();
+        let l = b.listar(&c, &q).await.unwrap();
         assert_eq!(l.total_items, 2);
         assert_eq!(l.items[0]["nome"], json!("Café"));
         assert_eq!(l.items[1]["preco"], json!(18.5));
+        assert_eq!(l.items[0]["tags"], json!(["novo"]));
+
+        let contem = b
+            .listar(
+                &c,
+                &Consulta {
+                    filtro: Some("nome ~ 'caf'".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(contem.total_items, 1, "~ sem diferenciar maiúsculas");
+        let vazio = b
+            .listar(
+                &c,
+                &Consulta {
+                    filtro: Some("site = null".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(vazio.total_items, 4);
 
         let p = b
             .listar(
@@ -1128,6 +1329,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         assert_eq!((p.total_items, p.total_pages, p.items.len()), (4, 2, 1));
         let s = b
@@ -1138,33 +1340,47 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         assert_eq!((s.total_items, s.total_pages), (-1, -1));
 
         let pid = r["id"].as_str().unwrap();
         let u = b
             .atualizar(&c, pid, &obj(json!({"preco": 9})), None)
+            .await
             .unwrap();
         assert_eq!(
             (u["preco"].clone(), u["nome"].clone()),
             (json!(9), json!("Pão"))
         );
-        // A regra de visualização esconde o registro inativo.
-        assert!(b.registro(&c, pid, Some("ativo = true")).is_err());
-        assert!(b.registro(&c, pid, None).is_ok());
-        b.apagar(&c, pid, None).unwrap();
-        assert!(b.registro(&c, pid, None).is_err());
+        assert!(
+            b.registro(&c, pid, Some("ativo = true")).await.is_err(),
+            "regra esconde"
+        );
+        assert!(b.registro(&c, pid, None).await.is_ok());
+        b.apagar(&c, pid, None).await.unwrap();
+        assert!(b.registro(&c, pid, None).await.is_err());
+        // id escolhido e repetido
+        let fixo = "abcdefghijklmno";
+        b.criar(&c, &obj(json!({"id": fixo, "nome": "fixo"})))
+            .await
+            .unwrap();
+        assert!(
+            b.criar(&c, &obj(json!({"id": fixo, "nome": "de novo"})))
+                .await
+                .is_err()
+        );
+        b.apagar_colecao("produtos").await.unwrap();
     }
 
-    #[test]
-    fn validacao_com_codigos_do_pocketbase() {
-        let b = Sqlite::em_memoria().unwrap();
-        let c = b.criar_colecao(produtos()).unwrap();
+    pub async fn validacao(b: &Banco) {
+        let c = b.criar_colecao(produtos()).await.unwrap();
         let e = b
             .criar(&c, &obj(json!({"preco": -1, "site": "ftp://x", "tags": ["outro", "novo", "promo"], "id": "CURTO"})))
+            .await
             .unwrap_err();
         let Erro::Invalido { campos, .. } = e else {
-            panic!()
+            panic!("{e:?}")
         };
         assert_eq!(campos["nome"]["code"], json!("validation_required"));
         assert_eq!(
@@ -1174,8 +1390,7 @@ mod tests {
         assert_eq!(campos["site"]["code"], json!("validation_is_url"));
         assert!(campos.contains_key("tags"));
         assert_eq!(campos["id"]["code"], json!("validation_invalid_id"));
-        // Atualizar tirando um obrigatório também falha.
-        let r = b.criar(&c, &obj(json!({"nome": "ok"}))).unwrap();
+        let r = b.criar(&c, &obj(json!({"nome": "ok"}))).await.unwrap();
         assert!(
             b.atualizar(
                 &c,
@@ -1183,41 +1398,120 @@ mod tests {
                 &obj(json!({"nome": ""})),
                 None
             )
+            .await
             .is_err()
+        );
+        b.apagar_colecao("produtos").await.unwrap();
+    }
+
+    pub async fn superusuarios(b: &Banco) {
+        assert_eq!(b.total_superusers().await.unwrap(), 0);
+        assert!(b.superuser_salvar("ana@x.com", "curta").await.is_err());
+        let s = b
+            .superuser_salvar("ana@x.com", "senha-forte-123")
+            .await
+            .unwrap();
+        assert!(auth::conferir_senha(&s.senha, "senha-forte-123"));
+        let s2 = b
+            .superuser_salvar("ANA@x.com", "outra-senha-456")
+            .await
+            .unwrap();
+        assert_eq!(s2.id, s.id);
+        assert_ne!(s2.token_key, s.token_key);
+        assert_eq!(b.total_superusers().await.unwrap(), 1);
+        assert_eq!(b.superuser_por_email("Ana@X.com").await.unwrap().id, s.id);
+        let seg = b.segredo().await.unwrap();
+        assert_eq!(seg.len(), 50);
+        assert_eq!(b.segredo().await.unwrap(), seg);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformidade_sqlite() {
+        let b = Banco::sqlite_memoria().await.unwrap();
+        assert_eq!(b.motor(), "sqlite");
+        conformidade::tudo(&b).await;
+    }
+
+    #[cfg(feature = "turso")]
+    #[tokio::test]
+    async fn conformidade_turso() {
+        let b = Banco::turso_memoria().await.unwrap();
+        assert_eq!(b.motor(), "turso");
+        conformidade::tudo(&b).await;
+    }
+
+    /// Roda só com `FORJA_TEST_PG=postgres://…` (no CI, um Postgres de serviço).
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn conformidade_postgres() {
+        let Ok(url) = std::env::var("FORJA_TEST_PG") else {
+            eprintln!("FORJA_TEST_PG ausente: conformidade do Postgres pulada");
+            return;
+        };
+        let esquema = format!("teste_{}", id::novo());
+        let b = Banco::postgres(&url, &esquema).await.unwrap();
+        assert_eq!(b.motor(), "postgres");
+        conformidade::tudo(&b).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn dados_ficam_no_disco_sqlite() {
+        let d = tempfile::tempdir().unwrap();
+        {
+            let b = Banco::sqlite(d.path()).await.unwrap();
+            let c = b
+                .criar_colecao(
+                    serde_json::from_value(
+                        json!({"name":"notas","fields":[{"name":"t","type":"text"}]}),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            b.criar(&c, json!({"t": "persistente"}).as_object().unwrap())
+                .await
+                .unwrap();
+        }
+        let b = Banco::sqlite(d.path()).await.unwrap();
+        let c = b.colecao("notas").await.unwrap();
+        assert_eq!(
+            b.listar(&c, &Consulta::default()).await.unwrap().items[0]["t"],
+            json!("persistente")
         );
     }
 
-    #[test]
-    fn superusuarios_e_segredo() {
-        let b = Sqlite::em_memoria().unwrap();
-        assert_eq!(b.total_superusers().unwrap(), 0);
-        assert!(b.superuser_salvar("ana@x.com", "curta").is_err());
-        let s = b.superuser_salvar("ana@x.com", "senha-forte-123").unwrap();
-        assert!(auth::conferir_senha(&s.senha, "senha-forte-123"));
-        let chave = s.token_key.clone();
-        // Salvar de novo troca a senha e a chave, e mantém o id.
-        let s2 = b.superuser_salvar("ANA@x.com", "outra-senha-456").unwrap();
-        assert_eq!(s2.id, s.id);
-        assert_ne!(s2.token_key, chave);
-        assert_eq!(b.total_superusers().unwrap(), 1);
-        let seg = b.segredo().unwrap();
-        assert_eq!(seg.len(), 50);
-        assert_eq!(b.segredo().unwrap(), seg);
-    }
-
-    #[test]
-    fn dados_ficam_no_disco() {
+    /// O Turso abre o arquivo que o SQLite gravou: trocar de motor não perde dados.
+    #[cfg(all(feature = "sqlite", feature = "turso"))]
+    #[tokio::test]
+    async fn turso_le_o_arquivo_do_sqlite() {
         let d = tempfile::tempdir().unwrap();
         {
-            let b = Sqlite::abrir(d.path()).unwrap();
-            let c = b.criar_colecao(produtos()).unwrap();
-            b.criar(&c, &obj(json!({"nome": "persistente"}))).unwrap();
+            let b = Banco::sqlite(d.path()).await.unwrap();
+            let c = b
+                .criar_colecao(
+                    serde_json::from_value(
+                        json!({"name":"notas","fields":[{"name":"t","type":"text"}]}),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            b.criar(&c, json!({"t": "veio do sqlite"}).as_object().unwrap())
+                .await
+                .unwrap();
         }
-        let b = Sqlite::abrir(d.path()).unwrap();
-        let c = b.colecao("produtos").unwrap();
+        let b = Banco::turso(d.path()).await.unwrap();
+        let c = b.colecao("notas").await.unwrap();
         assert_eq!(
-            b.listar(&c, &Consulta::default()).unwrap().items[0]["nome"],
-            json!("persistente")
+            b.listar(&c, &Consulta::default()).await.unwrap().items[0]["t"],
+            json!("veio do sqlite")
         );
     }
 }

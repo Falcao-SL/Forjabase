@@ -1,5 +1,5 @@
 //! Filtros e ordenação na sintaxe do PocketBase, convertidos em SQL com
-//! parâmetros. O texto do usuário nunca entra no SQL: nomes de campo são
+//! parâmetros (marcador `?`). O texto do usuário nunca entra no SQL: nomes de campo são
 //! conferidos contra a coleção e todo valor vira parâmetro.
 //!
 //! Suportado nesta versão: `=`, `!=`, `>`, `>=`, `<`, `<=`, `~` (contém),
@@ -286,12 +286,11 @@ struct Escritor<'a> {
 }
 
 impl Escritor<'_> {
+    /// Sempre `?`: o executor do Postgres numera (`$1`, `$2`…) ao enviar, o que
+    /// deixa juntar este SQL com outros pedaços sem renumerar.
     fn marcador(&mut self, l: Literal) -> String {
         self.params.push(l);
-        match self.dialeto {
-            Dialeto::Sqlite => "?".into(),
-            Dialeto::Postgres => format!("${}", self.params.len()),
-        }
+        "?".into()
     }
 
     fn operando(&mut self, o: &Operando) -> Resultado<String> {
@@ -315,7 +314,11 @@ impl Escritor<'_> {
         if matches!(op, Op::Igual | Op::Diferente) && (nulo(esq) || nulo(dir)) {
             let outro = if nulo(esq) { dir } else { esq };
             let col = self.operando(outro)?;
-            let vazio = format!("({col} IS NULL OR {col} = '')");
+            // No Postgres a coluna pode ser numérica: compara como texto.
+            let vazio = match self.dialeto {
+                Dialeto::Sqlite => format!("({col} IS NULL OR {col} = '')"),
+                Dialeto::Postgres => format!("({col} IS NULL OR {col}::text = '')"),
+            };
             return Ok(if op == Op::Igual {
                 vazio
             } else {
@@ -463,12 +466,11 @@ mod tests {
     }
 
     #[test]
-    fn postgres_usa_marcadores_numerados_e_ilike() {
+    fn postgres_usa_ilike_e_compara_vazio_como_texto() {
         let s = para_sql("preco > 1 && nome ~ 'a'", &campos, Dialeto::Postgres).unwrap();
-        assert_eq!(
-            s.texto,
-            "(\"preco\" > $1 AND \"nome\" ILIKE $2 ESCAPE '\\')"
-        );
+        assert_eq!(s.texto, "(\"preco\" > ? AND \"nome\" ILIKE ? ESCAPE '\\')");
+        let s = para_sql("preco = null", &campos, Dialeto::Postgres).unwrap();
+        assert_eq!(s.texto, "(\"preco\" IS NULL OR \"preco\"::text = '')");
     }
 
     #[test]

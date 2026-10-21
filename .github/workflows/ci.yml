@@ -22,3 +22,24 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo build -p forja-admin --target wasm32-unknown-unknown
+
+  # A mesma bateria de conformidade, agora contra um Postgres de verdade.
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: forja
+          POSTGRES_PASSWORD: forja
+          POSTGRES_DB: forja
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U forja" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      FORJA_TEST_PG: postgres://forja:forja@localhost:5432/forja
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p forja-core conformidade_postgres -- --nocapture
