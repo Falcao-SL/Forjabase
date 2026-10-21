@@ -8,5 +8,12 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+argon2 = "0.6.0"
+jsonwebtoken = { version = "11.1.0", default-features = false, features = ["rust_crypto"] }
+rand = "0.10.3"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+
+[dev-dependencies]
+tempfile = "3.27.0"

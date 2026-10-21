@@ -38,6 +38,7 @@ Versão atual: **0.0.1**. O Forja só vira **1.0.0** quando estiver estável
 | Índices (simples e únicos) definidos por coleção | 📋 |
 | Endpoint de SQL para superusuários (`/api/sql`) | 📋 |
 | Compatibilidade do arquivo com o PocketBase (abrir um `pb_data` existente) | 📋 (meta, ver PLANO §4) |
+| ➕ PostgreSQL como banco opcional por projeto (mesma API; SQLite continua o padrão) | 📋 |
 
 ## 3. Coleções
 

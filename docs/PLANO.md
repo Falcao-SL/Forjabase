@@ -28,8 +28,9 @@ forjabase/
   sdks/            núcleo forja-sdk em Rust e as camadas por linguagem (futuro)
 ```
 
-- **Banco:** SQLite embutido (rusqlite, `bundled`), modo WAL. Um diretório por
-  projeto.
+- **Banco:** SQLite embutido (rusqlite, `bundled`), modo WAL, um diretório por
+  projeto; PostgreSQL opcional por projeto depois da 0.5 (decisão 7), pelo
+  mesmo trait `Banco`.
 - **Painel:** compilado com `trunk` para `wasm32-unknown-unknown` e embutido
   com `include_dir`/`rust-embed` em `/_/`.
 - **Extensões:** módulos WASM (component model, wasmtime) com uma interface
@@ -58,6 +59,7 @@ forjabase/
 | 4 | Extensões: só WASM, ou também JavaScript | Só WASM no começo, coerente com "Rust e WebAssembly"; JS seria um módulo WASM com um motor JS dentro, se houver demanda |
 | 5 | Nome dos pacotes nos registros (crates.io, npm, PyPI, NuGet, Maven, pub.dev) | `forja` / `forja-sdk` / `@forjabase/sdk`; reservar cedo |
 | 6 | MCP remoto ligado por padrão? | Não: desligado até o superusuário criar o primeiro token de MCP; o local (`forja mcp`) só funciona com acesso ao diretório de dados |
+| 7 | Só SQLite ou também PostgreSQL | Os dois: **SQLite padrão** (um arquivo, nada para manter) e **PostgreSQL opcional por projeto**, para escrita concorrente alta, vários servidores no mesmo banco ou Postgres gerenciado. Desde a 0.0.2 o armazenamento fica atrás do trait `Banco` e os filtros viram SQL por dialeto (`?`/`LIKE` no SQLite, `$1`/`ILIKE` no Postgres); a implementação Postgres entra depois da 0.5 |
 
 ## 5. Fases e versões
 
