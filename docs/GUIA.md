@@ -5,12 +5,14 @@ Como usar cada parte do Forja. Cada seção diz se já funciona na versão atual
 contribuir. A lista completa está em [`FUNCIONALIDADES.md`](FUNCIONALIDADES.md);
 o roteiro, em [`PLANO.md`](PLANO.md).
 
-> **O que funciona na 0.0.2:** `forja serve`, `forja superuser upsert`,
-> `/api/health`, login de superusuário, coleções do tipo base (listar, criar,
-> ver, apagar), registros (listar com filtro, ordenação e paginação; criar,
-> ver, atualizar, apagar) com regras de acesso, e a casca do painel em
-> WebAssembly. O cliente Python do PocketBase já funciona contra o Forja. O
-> resto deste guia está marcado *(planejado)* e pode mudar até a 1.0.0.
+> **O que funciona na 0.0.3:** `forja serve`, `forja superuser upsert`,
+> `/api/health`, login de superusuário, coleções dos tipos base e auth (criar,
+> listar, ver, apagar), registros (listar com filtro, ordenação e paginação;
+> criar, ver, atualizar, apagar) com regras de acesso, autenticação de usuários
+> com verificação de e-mail, redefinição de senha e troca de e-mail, e o painel
+> administrativo em `/_/` (HTML no servidor + htmx). O cliente Python do
+> PocketBase já funciona contra o Forja. O resto deste guia está marcado
+> *(planejado)* e pode mudar até a 1.0.0.
 
 ---
 
@@ -18,13 +20,14 @@ o roteiro, em [`PLANO.md`](PLANO.md).
 
 ### A partir do código (funciona)
 
-Requisitos: Rust estável recente (`rustup`) e, para o painel, o alvo WASM.
+Requisitos: Rust estável recente (`rustup`). Não há etapa de build de
+front-end: o painel vai junto com o binário.
 
 ```sh
 git clone https://github.com/iramarfalcao/forjabase.git
 cd forjabase
 cargo build --release -p forja
-./target/release/forja --version     # forja 0.0.2
+./target/release/forja --version     # forja 0.0.3
 ```
 
 ### Executável pronto *(planejado)*
@@ -62,20 +65,27 @@ mas são **experimentais e sem suporte** ([ARQUITETURA](ARQUITETURA.md), decisã
 *(planejado)* `forja serve exemplo.com` com HTTPS automático, `--origins` para
 CORS, `--dev` para logs de SQL.
 
-## 3. Primeiro acesso e painel
+## 3. Primeiro acesso e painel (funciona)
 
 Hoje o superusuário é criado pela CLI (`forja superuser upsert`, acima); o
 `serve` avisa se ainda não houver nenhum. *(planejado)* Na primeira execução,
-o Forja abre no navegador um link de uso único para criar o superusuário, e o
-painel fica em `http://127.0.0.1:8090/_/`.
+o Forja abre no navegador um link de uso único para criar o superusuário.
 
-Para compilar o painel hoje (só a casca):
+Com o servidor no ar, abra `http://127.0.0.1:8090/_/` e entre com o e-mail e a
+senha do superusuário. O painel é HTML gerado no servidor com htmx: a lista de
+coleções, o filtro da tabela (com `hx-get` a cada tecla), a paginação e o
+apagar com confirmação trocam só o fragmento `#tabela`, sem recarregar a
+página. O formulário de criação e edição é um `POST` comum e volta para a
+lista — funciona até com JavaScript desligado.
 
-```sh
-rustup target add wasm32-unknown-unknown
-cargo install trunk
-cd crates/forja-admin && trunk serve      # http://127.0.0.1:8080
-```
+A sessão é um cookie `forja_painel`, `httpOnly` e `SameSite=Strict`, com um
+JWT de superusuário válido por 24 h. Sair (`/_/logout`) apaga o cookie. A API
+continua aceitando `Authorization: <token>` como antes; o cookie vale só para
+as rotas `/_/`. Em HTTP local o cookie não leva `Secure`; quando o servidor
+tiver TLS (0.9), ele passa a ser obrigatório.
+
+O que ainda não existe no painel: editor de coleções e campos, configurações,
+backups, logs e cron. Por enquanto, isso é CLI ou API.
 
 ## 4. Projetos *(planejado)*
 
@@ -319,7 +329,6 @@ Cada módulo roda isolado, com limite de memória e de tempo.
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings
 cargo test
-cargo build -p forja-admin --target wasm32-unknown-unknown
 ```
 
 Estrutura do código em [`PLANO.md`](PLANO.md) §2. Mudanças de comportamento

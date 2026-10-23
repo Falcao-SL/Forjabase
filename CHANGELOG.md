@@ -19,6 +19,12 @@
   e-mail por `PATCH` (só pelo fluxo com token) e o e-mail só aparece para o dono,
   para superusuários, ou quando `emailVisibility` está ligado.
 - Trocar a senha rotaciona a `tokenKey` e invalida os tokens já emitidos.
+- Painel administrativo em `/_/` reescrito: HTML gerado no servidor (`maud`)
+  com htmx embutido, no lugar da SPA Leptos/WASM. Login de superusuário por
+  cookie `httpOnly` + `SameSite=Strict`, lista de coleções, tabela com filtro e
+  paginação via htmx, formulário de criação e edição com erros por campo, e
+  exclusão com confirmação. Sem etapa de build de front-end; o WASM fica para
+  as extensões.
 
 ## 0.0.3 — 2026-10-21
 

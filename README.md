@@ -13,7 +13,8 @@ keep working.
 > login, base and auth collections, records with filters, sorting, pagination and
 > access rules, email/password auth with verification, password reset and email
 > change, all on SQLite and in PocketBase's API format (PocketBase's Python
-> client already works against it). The admin dashboard is still a shell.
+> client already works against it). The admin panel at `/_/` already logs in and
+> lists, creates, edits and deletes records; the collection editor comes next.
 > Forja reaches **1.0.0 only when it is stable** (criteria in
 > [`docs/PLANO.md`](docs/PLANO.md) §6).
 
@@ -27,9 +28,9 @@ keep working.
   nothing to install, easy to back up, easy to move. PostgreSQL and
   [Turso](https://github.com/tursodatabase/turso) remain compiled behind feature
   flags but are **not supported** (see [`docs/ARQUITETURA.md`](docs/ARQUITETURA.md)).
-- **In Rust and WebAssembly:** an axum server with embedded SQLite, an admin
-  dashboard in Leptos compiled to WASM, and server extensions as WASM modules
-  instead of JavaScript.
+- **In Rust, with WebAssembly where it helps:** an axum server with embedded
+  SQLite, an admin panel in server-rendered HTML with htmx (no build step), and
+  server extensions as WASM modules instead of JavaScript.
 - **Many projects in one instance**, each isolated, each at its own base URL
   (`https://host/p/<project>`).
 - **A secure MCP server** for AI agents: read-only by default, scoped tokens,
@@ -61,7 +62,7 @@ curl http://127.0.0.1:8090/api/health
 crates/forja          the executable and CLI
 crates/forja-core     data model (collections, fields, rules), no HTTP
 crates/forja-server   HTTP API (axum), PocketBase-compatible routes
-crates/forja-admin    admin dashboard, Leptos → WebAssembly
+crates/forja-admin    admin panel: server-rendered HTML (maud) + htmx
 docs/                 features, plan, usage guide, status (Portuguese)
 ```
 

@@ -1,6 +1,8 @@
 //! Servidor HTTP do Forja (axum). As rotas, os corpos e os erros seguem o
 //! formato da API do PocketBase, para os SDKs existentes funcionarem.
 
+mod painel;
+
 use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::{StatusCode, request::Parts};
 use axum::response::{IntoResponse, Response};
@@ -878,6 +880,7 @@ pub fn router(e: Estado) -> Router {
             "/api/collections/{colecao}/impersonate/{id}",
             post(personificar),
         )
+        .merge(painel::rotas())
         .with_state(e)
 }
 
@@ -1580,5 +1583,340 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::FORBIDDEN);
+    }
+
+    // ── Painel ───────────────────────────────────────────────────────────
+
+    fn form(campos: &[(&str, &str)]) -> String {
+        campos
+            .iter()
+            .map(|(k, v)| format!("{}={}", urlenc(k), urlenc(v)))
+            .collect::<Vec<_>>()
+            .join("&")
+    }
+
+    fn urlenc(s: &str) -> String {
+        let mut out = String::new();
+        for b in s.bytes() {
+            match b {
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    out.push(b as char)
+                }
+                b' ' => out.push('+'),
+                _ => out.push_str(&format!("%{b:02X}")),
+            }
+        }
+        out
+    }
+
+    async fn pedir(
+        e: &Estado,
+        metodo: &str,
+        uri: &str,
+        cabecalhos: &[(&str, &str)],
+        corpo: &str,
+    ) -> (StatusCode, axum::http::HeaderMap, String) {
+        let mut req = Request::builder().method(metodo).uri(uri);
+        for (k, v) in cabecalhos {
+            req = req.header(*k, *v);
+        }
+        let req = req.body(Body::from(corpo.to_string())).unwrap();
+        let resp = router(e.clone()).oneshot(req).await.unwrap();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            headers,
+            String::from_utf8_lossy(&bytes).into_owned(),
+        )
+    }
+
+    async fn form_post(
+        e: &Estado,
+        uri: &str,
+        cookie: Option<&str>,
+        campos: &[(&str, &str)],
+    ) -> (StatusCode, axum::http::HeaderMap, String) {
+        let corpo = form(campos);
+        let cab: Vec<(&str, &str)> = match cookie {
+            Some(c) => vec![
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("cookie", c),
+            ],
+            None => vec![("content-type", "application/x-www-form-urlencoded")],
+        };
+        pedir(e, "POST", uri, &cab, &corpo).await
+    }
+
+    /// Entra no painel e devolve o `Cookie` pronto para as próximas chamadas.
+    async fn entrar_no_painel(e: &Estado) -> String {
+        let (s, h, corpo) = form_post(
+            e,
+            "/_/login",
+            None,
+            &[
+                ("identity", "admin@exemplo.com"),
+                ("password", "senha-forte-123"),
+            ],
+        )
+        .await;
+        assert_eq!(s, StatusCode::SEE_OTHER, "{corpo}");
+        let set = h["set-cookie"].to_str().unwrap();
+        assert!(set.starts_with("forja_painel="), "{set}");
+        assert!(set.contains("HttpOnly") && set.contains("SameSite=Strict"));
+        set.split(';').next().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn painel_exige_login() {
+        let e = estado().await;
+        login(&e).await;
+
+        // Sem cookie, tudo manda para o login.
+        for uri in [
+            "/_/",
+            "/_/collections/qualquer",
+            "/_/collections/qualquer/new",
+            "/_/collections/qualquer/tabela",
+        ] {
+            let (s, h, _) = pedir(&e, "GET", uri, &[], "").await;
+            assert_eq!(s, StatusCode::SEE_OTHER, "{uri}");
+            assert_eq!(h["location"], "/_/login", "{uri}");
+        }
+
+        // Cookie inválido também.
+        let (s, h, _) = pedir(&e, "GET", "/_/", &[("cookie", "forja_painel=lixo")], "").await;
+        assert_eq!(s, StatusCode::SEE_OTHER);
+        assert_eq!(h["location"], "/_/login");
+
+        // A tela de login abre e a senha errada não entra.
+        let (s, _, corpo) = pedir(&e, "GET", "/_/login", &[], "").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(corpo.contains("Entrar no painel"), "{corpo}");
+        let (s, h, corpo) = form_post(
+            &e,
+            "/_/login",
+            None,
+            &[("identity", "admin@exemplo.com"), ("password", "errada")],
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(corpo.contains("E-mail ou senha inválidos."));
+        assert!(h.get("set-cookie").is_none());
+
+        // O htmx vem embutido no binário.
+        let (s, h, corpo) = pedir(&e, "GET", "/_/htmx.min.js", &[], "").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(h["content-type"].to_str().unwrap().contains("javascript"));
+        assert!(corpo.starts_with("var htmx"));
+
+        // Depois de entrar, o painel abre.
+        let cookie = entrar_no_painel(&e).await;
+        let (s, _, corpo) = pedir(&e, "GET", "/_/", &[("cookie", cookie.as_str())], "").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(corpo.contains("Coleções"), "{corpo}");
+    }
+
+    #[tokio::test]
+    async fn painel_lista_e_edita_registros() {
+        let e = estado().await;
+        let admin = login(&e).await;
+        let (s, v) = chamar(
+            &e,
+            "POST",
+            "/api/collections",
+            Some(&admin),
+            Some(json!({
+                "name": "produtos",
+                "type": "base",
+                "fields": [
+                    { "name": "nome", "type": "text", "required": true },
+                    { "name": "preco", "type": "number" },
+                    { "name": "ativo", "type": "bool" }
+                ]
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let cookie = entrar_no_painel(&e).await;
+
+        // A coleção aparece na home e o formulário tem os campos.
+        let (_, _, corpo) = pedir(&e, "GET", "/_/", &[("cookie", cookie.as_str())], "").await;
+        assert!(corpo.contains("produtos"), "{corpo}");
+        let (s, _, corpo) = pedir(
+            &e,
+            "GET",
+            "/_/collections/produtos/new",
+            &[("cookie", cookie.as_str())],
+            "",
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(corpo.contains("name=\"nome\""), "{corpo}");
+        assert!(corpo.contains("name=\"ativo\""));
+
+        // Campo obrigatório em branco: o formulário volta com o erro inline.
+        let (s, _, corpo) = form_post(
+            &e,
+            "/_/collections/produtos",
+            Some(&cookie),
+            &[("ativo", "true")],
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(corpo.contains("Cannot be blank."), "{corpo}");
+
+        // Cria pelo formulário.
+        let (s, h, _) = form_post(
+            &e,
+            "/_/collections/produtos",
+            Some(&cookie),
+            &[("nome", "Caneca"), ("preco", "19.5"), ("ativo", "true")],
+        )
+        .await;
+        assert_eq!(s, StatusCode::SEE_OTHER);
+        assert_eq!(h["location"], "/_/collections/produtos");
+
+        let (_, _, corpo) = pedir(
+            &e,
+            "GET",
+            "/_/collections/produtos",
+            &[("cookie", cookie.as_str())],
+            "",
+        )
+        .await;
+        assert!(corpo.contains("Caneca"), "{corpo}");
+        assert!(corpo.contains("19.5"));
+        assert!(corpo.contains("Sim"));
+
+        // O fragmento do htmx traz só a tabela, com o id do alvo.
+        let (s, _, corpo) = pedir(
+            &e,
+            "GET",
+            "/_/collections/produtos/tabela",
+            &[("cookie", cookie.as_str())],
+            "",
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(
+            corpo.trim_start().starts_with("<div id=\"tabela\">"),
+            "{corpo}"
+        );
+        assert!(!corpo.contains("<html"));
+
+        // Filtra.
+        let (_, _, corpo) = pedir(
+            &e,
+            "GET",
+            "/_/collections/produtos/tabela?filter=nome%20~%20%27Nada%27",
+            &[("cookie", cookie.as_str())],
+            "",
+        )
+        .await;
+        assert!(corpo.contains("Nenhum registro encontrado."), "{corpo}");
+
+        // Descobre o id e edita.
+        let (_, v) = chamar(
+            &e,
+            "GET",
+            "/api/collections/produtos/records",
+            Some(&admin),
+            None,
+        )
+        .await;
+        let id = v["items"][0]["id"].as_str().unwrap().to_string();
+        let (s, _, corpo) = pedir(
+            &e,
+            "GET",
+            &format!("/_/collections/produtos/records/{id}"),
+            &[("cookie", cookie.as_str())],
+            "",
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(corpo.contains("value=\"Caneca\""), "{corpo}");
+
+        let (s, _, _) = form_post(
+            &e,
+            &format!("/_/collections/produtos/records/{id}"),
+            Some(&cookie),
+            &[
+                ("nome", "Caneca grande"),
+                ("preco", "20"),
+                ("ativo", "false"),
+            ],
+        )
+        .await;
+        assert_eq!(s, StatusCode::SEE_OTHER);
+        let (_, _, corpo) = pedir(
+            &e,
+            "GET",
+            "/_/collections/produtos",
+            &[("cookie", cookie.as_str())],
+            "",
+        )
+        .await;
+        assert!(corpo.contains("Caneca grande"), "{corpo}");
+
+        // Apagar pelo htmx devolve a tabela atualizada.
+        let (s, _, corpo) = pedir(
+            &e,
+            "POST",
+            &format!("/_/collections/produtos/records/{id}/delete"),
+            &[("cookie", &cookie), ("hx-request", "true")],
+            "",
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(corpo.contains("Nenhum registro encontrado."), "{corpo}");
+        assert!(!corpo.contains("Caneca grande"));
+
+        // Sem htmx, apagar redireciona.
+        let (s, _, _) = form_post(
+            &e,
+            "/_/collections/produtos",
+            Some(&cookie),
+            &[("nome", "Xícara"), ("ativo", "true")],
+        )
+        .await;
+        assert_eq!(s, StatusCode::SEE_OTHER);
+        let (_, v) = chamar(
+            &e,
+            "GET",
+            "/api/collections/produtos/records",
+            Some(&admin),
+            None,
+        )
+        .await;
+        let id = v["items"][0]["id"].as_str().unwrap().to_string();
+        let (s, h, _) = form_post(
+            &e,
+            &format!("/_/collections/produtos/records/{id}/delete"),
+            Some(&cookie),
+            &[],
+        )
+        .await;
+        assert_eq!(s, StatusCode::SEE_OTHER);
+        assert_eq!(h["location"], "/_/collections/produtos");
+    }
+
+    #[tokio::test]
+    async fn painel_sai_e_nao_vaza_campos_de_sistema() {
+        let e = estado().await;
+        login(&e).await;
+        let cookie = entrar_no_painel(&e).await;
+
+        // A lista e o formulário não mostram tokenKey.
+        let (_, _, corpo) = pedir(&e, "GET", "/_/", &[("cookie", cookie.as_str())], "").await;
+        assert!(!corpo.contains("tokenKey"), "{corpo}");
+
+        // Sair apaga o cookie.
+        let (s, h, _) = form_post(&e, "/_/logout", Some(&cookie), &[]).await;
+        assert_eq!(s, StatusCode::SEE_OTHER);
+        assert_eq!(h["location"], "/_/login");
+        let set = h["set-cookie"].to_str().unwrap();
+        assert!(set.contains("Max-Age=0"), "{set}");
     }
 }

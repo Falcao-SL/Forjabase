@@ -3,13 +3,15 @@
 ## 1. O que é
 
 Um backend em um único executável — banco SQLite, autenticação, arquivos,
-tempo real e painel administrativo — reescrito em **Rust e WebAssembly** a
-partir do PocketBase (Gani Georgiev, MIT). Código aberto, licença MIT.
+tempo real e painel administrativo — reescrito em **Rust, com WebAssembly onde
+ele ajuda**, a partir do PocketBase (Gani Georgiev, MIT). Código aberto, licença
+MIT.
 
 O que muda em relação ao PocketBase:
 
-1. **Rust** no servidor (axum + SQLite embutido) e **WebAssembly** no painel
-   (Leptos) e nas extensões (wasmtime), no lugar de Go, Svelte e JavaScript.
+1. **Rust** no servidor (axum + SQLite embutido), **HTML no servidor + htmx** no
+   painel e **WebAssembly** nas extensões (wasmtime), no lugar de Go, Svelte e
+   JavaScript.
 2. **Vários projetos** numa só instância, isolados (FUNCIONALIDADES §10).
 3. **SDKs para 9 linguagens** a partir de um núcleo único em Rust (§12).
 4. **MCP** seguro para agentes de IA e **CLI de administração** completa (§13 e §14).
@@ -23,7 +25,7 @@ forjabase/
   crates/
     forja-core     modelo (coleções, campos, regras), filtros, validação — sem HTTP
     forja-server   axum: rotas no formato da API do PocketBase, tempo real (SSE)
-    forja-admin    painel em Leptos → wasm32, embutido no executável
+    forja-admin    painel: HTML no servidor (maud) + htmx, embutido no executável
     forja          o executável: CLI (serve, superuser, migrate, update)
   sdks/            núcleo forja-sdk em Rust e as camadas por linguagem (futuro)
 ```
@@ -34,8 +36,9 @@ forjabase/
   **Turso** (Rust, mesmo arquivo) e **PostgreSQL/Supabase** (tokio-postgres +
   deadpool, rustls, um esquema por projeto). O SQL sai sempre com `?`; o
   executor do Postgres troca por `$n`. Decisões 7 e 8.
-- **Painel:** compilado com `trunk` para `wasm32-unknown-unknown` e embutido
-  com `include_dir`/`rust-embed` em `/_/`.
+- **Painel:** HTML gerado no servidor com `maud` e htmx embutido via
+  `include_bytes!`, servido em `/_/` pelo mesmo processo e estado da API. Sem
+  `trunk` e sem `wasm32` no painel; o WASM fica para as extensões.
 - **Extensões:** módulos WASM (component model, wasmtime) com uma interface
   WIT para hooks, rotas e cron; limites de memória e tempo por módulo.
 - **SDKs:** `forja-sdk` (Rust) → wasm-bindgen (JS/TS), UniFFI (Kotlin, Swift,
@@ -76,7 +79,7 @@ Versões **0.x** até estar estável; a 1.0.0 só depois dos critérios do §6.
 | 0.1 | **Autenticação**: coleções `auth`, senha, verificação, redefinição, troca de e-mail, personificação, macros `@request.auth.*`, envio de e-mail — ✅ feito (SMTP fica na 0.5) |
 | 0.2 | **Relações e views**: campo `relation`, cascata, `expand`, relações reversas, coleções `view`, macro `@collection.*` |
 | 0.3 | **Arquivos, lote e tempo real**: campo `file`, local/S3, miniaturas, arquivos protegidos, `/api/batch`, SSE |
-| 0.4 | **Painel administrativo utilizável** |
+| 0.4 | **Painel administrativo utilizável** — 🔨 primeiro corte: login, lista de coleções, navegador e CRUD de registros |
 | 0.5 | **Operação**: configurações, logs, cron, limite de requisições, backups com restauração, encerramento gracioso |
 | 0.6 | **OAuth2, OTP e MFA** |
 | 0.7 | **Vários projetos** e importação de um `pb_data` |

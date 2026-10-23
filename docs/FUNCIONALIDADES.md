@@ -197,13 +197,21 @@ com uma mensagem clara. "✅" quer dizer validado e guardado.
 | **Cron**: listar e executar tarefas agendadas pelo painel | 📋 |
 | `/api/health` | ✅ |
 
-## 9. Painel administrativo (Rust → WebAssembly)
+## 9. Painel administrativo (HTML no servidor + htmx)
+
+O painel é HTML gerado no servidor com maud e htmx embutido no binário. Não há
+build de front-end nem SPA: o navegador pede páginas e fragmentos ao mesmo
+processo que serve a API, e a sessão é um cookie `httpOnly` com um JWT de
+superusuário. WASM fica reservado para as extensões (§11).
 
 | Funcionalidade | Estado |
 |---|---|
-| Painel embutido no executável, em Rust compilado para WebAssembly (Leptos) | 🔨 (casca) |
+| Painel embutido no executável, sem etapa de build própria | ✅ |
+| Login de superusuário por cookie `httpOnly` + `SameSite=Strict` | ✅ |
+| Lista de coleções | ✅ |
+| Navegador de registros com filtro e paginação (htmx) | ✅ |
+| Criar, editar e apagar registros pelo formulário, com erros por campo | ✅ |
 | Editor de coleções, campos, regras e índices | 📋 |
-| Navegador de registros com filtro, ordenação e edição | 📋 |
 | Telas de configurações, backups, logs e cron | 📋 |
 | Visualização de logs com gráfico | 📋 |
 | Extensões de interface do painel | 📋 |
@@ -311,10 +319,10 @@ remoto (com token).
 
 | Funcionalidade | Estado |
 |---|---|
-| Testes de unidade e de API em todo crate | ✅ (23 testes) |
+| Testes de unidade e de API em todo crate | ✅ (32 testes) |
 | Cliente Python do PocketBase (`pocketbase` 0.16) funciona contra o Forja: login, CRUD, filtro e ordenação | ✅ (conferido à mão em 2026-10-21) |
 | Suíte de compatibilidade: as mesmas chamadas contra PocketBase e Forja, respostas iguais | 📋 |
-| CI no GitHub Actions (formatação, lint, testes, build do painel em WASM) | 🔨 |
+| CI no GitHub Actions (formatação, lint e testes nos três SOs) | ✅ |
 | Executáveis para macOS, Linux e Windows (x86_64 e arm64) no GitHub Releases | 📋 |
 | Imagem Docker | 📋 |
 | Site de documentação | 📋 |

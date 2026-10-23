@@ -22,7 +22,7 @@ e o Forja ainda não tem.
 | 7 | Extensões | **WASM** (wasmtime) com ABI JSON. JS, se vier, é adaptador sobre a mesma ABI. |
 | 8 | Vários projetos | Um **arquivo SQLite por projeto** + banco de controle. |
 | 9 | SDKs | **OpenAPI gerado** a partir dos handlers; até a 0.9 o SDK do PocketBase é o cliente de teste. |
-| 10 | Painel | **SPA Leptos (CSR)** embutida no binário, falando a mesma API. |
+| 10 | Painel | **HTML gerado no servidor** (maud) + **htmx** embutido no binário, pelo mesmo processo e estado da API. Sem build de front-end. |
 | 11 | Backups | Snapshot pela **API de backup online** + S3 + manifesto. Litestream é integração externa. |
 | 12 | Escala | **Nó único.** Escala vertical, não horizontal. |
 | 13 | Postgres e Turso | Ficam atrás de feature flag, **sem suporte** e sem CI. |
@@ -70,7 +70,7 @@ produto, não detalhe de implementação.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  painel (Leptos/WASM)   CLI `forja`   SDKs gerados   MCP    │
+│  painel (HTML+htmx)   CLI `forja`   SDKs gerados   MCP    │
 └──────────────────────────────┬──────────────────────────────┘
                                │ HTTP/JSON + SSE
 ┌──────────────────────────────▼──────────────────────────────┐

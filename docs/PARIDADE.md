@@ -36,7 +36,7 @@ Três consequências:
 | Arquivos + miniaturas | ✅ | ✅ (buckets) | 📋 | 0.3 |
 | Lote (`/api/batch`) | ✅ | ⛔ | 📋 | 0.3 |
 | Tempo real | ✅ (SSE) | ✅ (WebSocket) | 📋 | 0.3 |
-| Painel administrativo | ✅ | ✅ | 📋 (casca) | 0.4 |
+| Painel administrativo | ✅ | ✅ | 🔨 (login e CRUD de registros; editor de coleções na 0.4) | 0.4 |
 | Logs, cron, rate limit, settings | ✅ | ✅ (parcial) | 📋 | 0.5 |
 | Backups + S3 | ✅ | ✅ (Cloud) | 📋 | 0.5 |
 | OAuth2, OTP, MFA | ✅ | ✅ | 📋 | 0.6 |
