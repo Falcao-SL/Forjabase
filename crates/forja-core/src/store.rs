@@ -10,7 +10,7 @@ use crate::filtro::{self, Contexto, Dialeto, Literal};
 use crate::motor::{Executor, Linha};
 use crate::valor::Valor;
 use crate::{Collection, CollectionType, Field, FieldType, agora, auth, id};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
 
@@ -66,6 +66,42 @@ pub struct Superusuario {
     pub senha: String,
     #[serde(skip)]
     pub token_key: String,
+}
+
+/// Configurações do projeto, com os mesmos nomes do PocketBase.
+///
+/// Ficam em `_params` (linha `settings`), como no PocketBase, e não carregam
+/// segredos: SMTP e S3 chegam nas ondas seguintes, quando existirem.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Configuracoes {
+    #[serde(default = "Configuracoes::app_name_padrao")]
+    pub app_name: String,
+    #[serde(default = "Configuracoes::app_url_padrao")]
+    pub app_url: String,
+    /// E-mails que podem concluir o onboarding do primeiro superusuário.
+    /// Vazio = qualquer e-mail (o segredo de instalação continua obrigatório).
+    #[serde(default)]
+    pub installer_emails: Vec<String>,
+}
+
+impl Configuracoes {
+    fn app_name_padrao() -> String {
+        "Acme".into()
+    }
+    fn app_url_padrao() -> String {
+        "http://localhost:8090".into()
+    }
+}
+
+impl Default for Configuracoes {
+    fn default() -> Configuracoes {
+        Configuracoes {
+            app_name: Configuracoes::app_name_padrao(),
+            app_url: Configuracoes::app_url_padrao(),
+            installer_emails: Vec::new(),
+        }
+    }
 }
 
 /// Credenciais de um usuário de coleção `auth`. A senha é o hash, nunca o texto.
@@ -895,6 +931,52 @@ impl Banco {
         Ok(s)
     }
 
+    /// Lê um parâmetro de `_params` (usado por segredos e configurações).
+    pub async fn parametro(&self, chave: &str) -> Resultado<Option<String>> {
+        Ok(self
+            .ex
+            .consultar(
+                "SELECT \"value\" FROM \"_params\" WHERE \"id\" = ?",
+                vec![chave.into()],
+            )
+            .await?
+            .into_iter()
+            .next()
+            .and_then(|l| l.into_iter().next())
+            .and_then(|v| v.texto().map(str::to_string)))
+    }
+
+    /// Grava (ou substitui) um parâmetro de `_params`.
+    pub async fn salvar_parametro(&self, chave: &str, valor: &str) -> Resultado<()> {
+        let existe = self.parametro(chave).await?.is_some();
+        let sql = if existe {
+            "UPDATE \"_params\" SET \"value\" = ? WHERE \"id\" = ?"
+        } else {
+            "INSERT INTO \"_params\" (\"value\", \"id\") VALUES (?, ?)"
+        };
+        self.ex
+            .executar(sql, vec![valor.into(), chave.into()])
+            .await?;
+        Ok(())
+    }
+
+    /// As configurações do projeto. Nunca falha por dado ausente ou corrompido:
+    /// cai no padrão, como o PocketBase faz na primeira subida.
+    pub async fn configuracoes(&self) -> Configuracoes {
+        self.parametro("settings")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|t| serde_json::from_str::<Configuracoes>(&t).ok())
+            .unwrap_or_default()
+    }
+
+    pub async fn salvar_configuracoes(&self, c: &Configuracoes) -> Resultado<Configuracoes> {
+        let json = serde_json::to_string(c).map_err(|e| Erro::Interno(format!("settings: {e}")))?;
+        self.salvar_parametro("settings", &json).await?;
+        Ok(c.clone())
+    }
+
     pub async fn colecoes(&self) -> Resultado<Vec<Collection>> {
         let l = self
             .ex
@@ -1528,6 +1610,131 @@ impl Banco {
     pub async fn total_superusers(&self) -> Resultado<i64> {
         self.contar("SELECT COUNT(*) FROM \"_superusers\"", vec![])
             .await
+    }
+
+    /// Todos os superusuários, ordenados por e-mail.
+    pub async fn superuser_listar(&self) -> Resultado<Vec<Superusuario>> {
+        Ok(self
+            .ex
+            .consultar(
+                &format!("SELECT {COLS_SUPERUSER} FROM \"_superusers\" ORDER BY lower(\"email\")"),
+                vec![],
+            )
+            .await?
+            .into_iter()
+            .map(ler_superuser)
+            .collect())
+    }
+
+    /// Cria um superusuário. Diferente de [`Banco::superuser_salvar`], falha se
+    /// o e-mail já existir: é o que o CLI `superuser create` e o onboarding usam.
+    pub async fn superuser_criar(&self, email: &str, senha: &str) -> Resultado<Superusuario> {
+        let (email, hash) = self.superuser_normalizar(email, senha).await?;
+        if self.superuser_por_email(&email).await.is_ok() {
+            let mut erros = Map::new();
+            erro_campo(
+                &mut erros,
+                "email",
+                "validation_not_unique",
+                "A superuser with this email already exists.".into(),
+            );
+            return Err(invalido("Failed to create superuser.", erros));
+        }
+        let id_su = id::novo();
+        let chave = id::aleatorio(50);
+        let agora = agora();
+        self.ex
+            .executar(
+                &format!("INSERT INTO \"_superusers\" ({COLS_SUPERUSER}) VALUES (?, ?, ?, ?, ?, ?)"),
+                vec![
+                    id_su.clone().into(),
+                    email.into(),
+                    hash.into(),
+                    chave.into(),
+                    agora.clone().into(),
+                    agora.into(),
+                ],
+            )
+            .await?;
+        self.superuser(&id_su).await
+    }
+
+    /// Troca a senha do superusuário. Troca também a `tokenKey`, então os tokens
+    /// antigos param de valer, como no PocketBase.
+    pub async fn superuser_definir_senha(
+        &self,
+        email: &str,
+        senha: &str,
+    ) -> Resultado<Superusuario> {
+        let (email, hash) = self.superuser_normalizar(email, senha).await?;
+        let su = self.superuser_por_email(&email).await?;
+        self.ex
+            .executar(
+                "UPDATE \"_superusers\" SET \"password\" = ?, \"tokenKey\" = ?, \"updated\" = ? WHERE \"id\" = ?",
+                vec![
+                    hash.into(),
+                    id::aleatorio(50).into(),
+                    agora().into(),
+                    su.id.clone().into(),
+                ],
+            )
+            .await?;
+        self.superuser(&su.id).await
+    }
+
+    /// Apaga um superusuário. Recusa apagar o último (o onboarding voltaria a
+    /// aceitar qualquer um com o segredo de instalação).
+    pub async fn superuser_apagar(&self, email: &str) -> Resultado<Superusuario> {
+        let su = self.superuser_por_email(email).await?;
+        if self.total_superusers().await? <= 1 {
+            return Err(Erro::invalido(
+                "The last superuser can't be deleted. Create another one first.",
+            ));
+        }
+        self.ex
+            .executar(
+                "DELETE FROM \"_superusers\" WHERE \"id\" = ?",
+                vec![su.id.clone().into()],
+            )
+            .await?;
+        Ok(su)
+    }
+
+    /// Valida e-mail e senha e devolve `(email_normalizado, hash)`.
+    async fn superuser_normalizar(
+        &self,
+        email: &str,
+        senha: &str,
+    ) -> Resultado<(String, String)> {
+        let mut erros = Map::new();
+        let email = email.trim().to_lowercase();
+        let ok_email = email
+            .split_once('@')
+            .is_some_and(|(a, d)| !a.is_empty() && d.contains('.'));
+        if !ok_email {
+            erro_campo(
+                &mut erros,
+                "email",
+                "validation_is_email",
+                "Must be a valid email address.".into(),
+            );
+        }
+        if senha.chars().count() < 10 {
+            erro_campo(
+                &mut erros,
+                "password",
+                "validation_min_text_constraint",
+                "Must be at least 10 character(s).".into(),
+            );
+        }
+        if !erros.is_empty() {
+            return Err(invalido("Failed to save superuser.", erros));
+        }
+        let senha = senha.to_string();
+        let hash = tokio::task::spawn_blocking(move || auth::hash_senha(&senha))
+            .await
+            .map_err(|e| Erro::Interno(e.to_string()))??;
+        Ok((email, hash))
     }
 }
 

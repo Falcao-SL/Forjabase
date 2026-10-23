@@ -21,12 +21,52 @@ use serde_json::{Map, Value, json};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+/// Onboarding do primeiro superusuário.
+///
+/// Enquanto o projeto não tiver nenhum superusuário, o painel redireciona para
+/// `/_/install`, que exige este segredo. Assim, subir numa nuvem não deixa o
+/// servidor aberto para qualquer um criar o usuário mestre: só quem enxerga o
+/// console (ou recebeu o segredo) conclui a instalação.
+#[derive(Debug, Clone)]
+pub struct Instalador {
+    /// Segredo de uso único, exigido na tela de instalação.
+    pub token: String,
+    /// E-mails autorizados a concluir o onboarding. Vazio = qualquer e-mail.
+    pub emails: Vec<String>,
+}
+
+impl Instalador {
+    /// Lê `FORJA_INSTALLER_TOKEN`/`FORJA_INSTALLER_EMAILS`; sem eles, gera um
+    /// segredo aleatório (impresso no console na subida).
+    pub fn do_ambiente() -> Instalador {
+        let token = std::env::var("FORJA_INSTALLER_TOKEN")
+            .ok()
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| forja_core::id::aleatorio(40));
+        let emails = std::env::var("FORJA_INSTALLER_EMAILS")
+            .ok()
+            .map(|t| {
+                t.split(',')
+                    .map(|e| e.trim().to_lowercase())
+                    .filter(|e| !e.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Instalador { token, emails }
+    }
+
+    pub fn email_autorizado(&self, email: &str) -> bool {
+        self.emails.is_empty() || self.emails.iter().any(|e| e == &email.to_lowercase())
+    }
+}
+
 /// Estado compartilhado: o banco do projeto, o segredo dos tokens e o correio.
 #[derive(Clone)]
 pub struct Estado {
     pub banco: Banco,
     pub segredo: Arc<String>,
     pub correio: Arc<dyn Correio>,
+    pub instalador: Arc<Instalador>,
 }
 
 impl Estado {
@@ -36,11 +76,20 @@ impl Estado {
 
     /// Com um correio próprio (nos testes, o `Memoria`).
     pub async fn com_correio(banco: Banco, correio: Arc<dyn Correio>) -> Result<Estado, Erro> {
+        Estado::com_instalador(banco, correio, Instalador::do_ambiente()).await
+    }
+
+    pub async fn com_instalador(
+        banco: Banco,
+        correio: Arc<dyn Correio>,
+        instalador: Instalador,
+    ) -> Result<Estado, Erro> {
         let segredo = banco.segredo().await?;
         Ok(Estado {
             banco,
             segredo: Arc::new(segredo),
             correio,
+            instalador: Arc::new(instalador),
         })
     }
 }

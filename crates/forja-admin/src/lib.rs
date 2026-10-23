@@ -75,6 +75,59 @@ td.direita, th.direita { text-align:right; white-space:nowrap; }
 .cartao button { width:100%; margin-top:6px; }
 "#;
 
+/// Tela de onboarding do primeiro superusuário (o "usuário mestre").
+///
+/// Aparece quando o projeto ainda não tem nenhum superusuário. Exige o segredo
+/// de instalação, que sai no console na subida do servidor.
+pub fn pagina_install(erro: Option<&str>, token: &str, emails: &[String]) -> Markup {
+    html! {
+        (DOCTYPE)
+        html lang="pt-BR" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width, initial-scale=1";
+                title { "Instalação · Forja" }
+                style { (PreEscaped(CSS)) }
+            }
+            body {
+                div .cartao {
+                    h1 { "Criar o usuário mestre" }
+                    p .ajuda {
+                        "Este projeto ainda não tem superusuário. Defina o e-mail e a senha "
+                        "do usuário mestre para concluir a instalação."
+                    }
+                    @if let Some(m) = erro {
+                        div .global { (m) }
+                    }
+                    form method="post" action="/_/install" {
+                        input type="hidden" name="token" value=(token);
+                        div .campo {
+                            label for="email" { "E-mail" }
+                            input type="email" id="email" name="email"
+                                  autocomplete="username" required autofocus;
+                            @if !emails.is_empty() {
+                                p .dica { "Permitidos: " (emails.join(", ")) }
+                            }
+                        }
+                        div .campo {
+                            label for="password" { "Senha" }
+                            input type="password" id="password" name="password"
+                                  autocomplete="new-password" minlength="10" required;
+                            p .dica { "Pelo menos 10 caracteres." }
+                        }
+                        div .campo {
+                            label for="passwordConfirm" { "Repita a senha" }
+                            input type="password" id="passwordConfirm" name="passwordConfirm"
+                                  autocomplete="new-password" minlength="10" required;
+                        }
+                        button .botao.solido type="submit" { "Criar e entrar" }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Página completa com o cabeçalho do painel.
 pub fn pagina(titulo: &str, conteudo: Markup) -> Markup {
     html! {
