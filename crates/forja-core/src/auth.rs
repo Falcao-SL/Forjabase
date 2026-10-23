@@ -14,6 +14,17 @@ pub const COLECAO_SUPERUSERS: &str = "pbc_superusers";
 /// Validade do token de superusuário: 1 dia (o padrão do PocketBase).
 pub const VALIDADE_SUPERUSER: u64 = 86_400;
 
+/// Validade do token de usuário de coleção `auth`: 14 dias.
+pub const VALIDADE_AUTH: u64 = 1_209_600;
+
+/// Validade dos tokens de e-mail (verificação, redefinição, troca): 3 dias.
+pub const VALIDADE_EMAIL: u64 = 259_200;
+
+pub const TIPO_AUTH: &str = "auth";
+pub const TIPO_VERIFICACAO: &str = "verification";
+pub const TIPO_REDEFINICAO: &str = "passwordReset";
+pub const TIPO_TROCA_EMAIL: &str = "emailChange";
+
 pub fn hash_senha(senha: &str) -> Resultado<String> {
     Argon2::default()
         .hash_password(senha.as_bytes())
@@ -41,6 +52,9 @@ pub struct Claims {
     pub refreshable: bool,
     /// `tokenKey` do usuário no momento da emissão.
     pub tk: String,
+    /// E-mail novo, nos tokens de troca de e-mail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
     pub exp: u64,
 }
 
@@ -58,12 +72,26 @@ pub fn emitir(
     token_key: &str,
     validade: u64,
 ) -> Resultado<String> {
+    emitir_tipo(segredo, id, colecao, token_key, TIPO_AUTH, validade, None)
+}
+
+/// Token de qualquer tipo (`auth`, `verification`, `passwordReset`, `emailChange`).
+pub fn emitir_tipo(
+    segredo: &str,
+    id: &str,
+    colecao: &str,
+    token_key: &str,
+    tipo: &str,
+    validade: u64,
+    email: Option<String>,
+) -> Resultado<String> {
     let claims = Claims {
         id: id.into(),
-        tipo: "auth".into(),
+        tipo: tipo.into(),
         colecao: colecao.into(),
-        refreshable: true,
+        refreshable: tipo == TIPO_AUTH,
         tk: token_key.into(),
+        email,
         exp: agora_s() + validade,
     };
     encode(

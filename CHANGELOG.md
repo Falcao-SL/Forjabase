@@ -1,5 +1,25 @@
 # Changelog
 
+## Não lançado
+
+- Coleções **auth** de verdade: toda coleção do tipo `auth` ganha os cinco campos
+  de sistema do PocketBase (`email`, `emailVisibility`, `verified`, `password`,
+  `tokenKey`), e-mail único sem diferenciar maiúsculas e senha guardada em
+  Argon2id — o hash e a `tokenKey` nunca voltam numa resposta nem entram em
+  filtro ou ordenação.
+- Login, renovação e ciclo de vida da conta em `/api/collections/{colecao}`:
+  `auth-with-password`, `auth-refresh`, `request-verification` /
+  `confirm-verification`, `request-password-reset` / `confirm-password-reset`,
+  `request-email-change` / `confirm-email-change` e `impersonate`.
+- Regras de acesso com `@request.auth.*`, resolvidas para parâmetros de SQL (nunca
+  interpoladas). Sem usuário autenticado, a macro vale vazio, como no PocketBase.
+- Envio de e-mail atrás do trait `correio::Correio`: `Console` (stderr, o padrão) e
+  `Memoria` (testes). SMTP fica para a onda de operações.
+- Campos de sistema protegidos: usuário comum não marca `verified`, não troca o
+  e-mail por `PATCH` (só pelo fluxo com token) e o e-mail só aparece para o dono,
+  para superusuários, ou quando `emailVisibility` está ligado.
+- Trocar a senha rotaciona a `tokenKey` e invalida os tokens já emitidos.
+
 ## 0.0.3 — 2026-10-21
 
 - Três motores de banco com a mesma API, escolhidos com `--engine` (ou `FORJA_ENGINE`):

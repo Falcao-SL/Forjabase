@@ -27,6 +27,8 @@ pub enum Expr {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Operando {
     Campo(String),
+    /// `@request.auth.*` e companhia: resolvida para um parâmetro.
+    Macro(String),
     Valor(Literal),
 }
 
@@ -238,6 +240,7 @@ impl Analisador {
         let t = self.t.get(self.i).cloned();
         self.i += 1;
         match t {
+            Some(Token::Ident(n)) if n.starts_with('@') => Ok(Operando::Macro(n)),
             Some(Token::Ident(n)) => Ok(Operando::Campo(n)),
             Some(Token::Lit(l)) => Ok(Operando::Valor(l)),
             _ => Err(Erro::invalido(
@@ -279,10 +282,38 @@ fn coluna(nome: &str, valido: &dyn Fn(&str) -> bool) -> Resultado<String> {
     Ok(format!("\"{nome}\""))
 }
 
+/// Valores que as macros de um filtro podem ler. Sem contexto, a macro vale
+/// vazio — é o caso dos visitantes, como no PocketBase.
+#[derive(Debug, Clone, Default)]
+pub struct Contexto {
+    /// Registro autenticado, já sem `password` e `tokenKey`.
+    pub auth: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl Contexto {
+    fn resolver(&self, nome: &str) -> Resultado<Literal> {
+        let Some(campo) = nome.strip_prefix("@request.auth.") else {
+            return Err(Erro::invalido(format!(
+                "Invalid filter: macro '{nome}' is not supported yet"
+            )));
+        };
+        let Some(auth) = self.auth.as_ref() else {
+            return Ok(Literal::Texto(String::new()));
+        };
+        Ok(match auth.get(campo) {
+            Some(serde_json::Value::String(s)) => Literal::Texto(s.clone()),
+            Some(serde_json::Value::Bool(b)) => Literal::Bool(*b),
+            Some(serde_json::Value::Number(n)) => Literal::Numero(n.as_f64().unwrap_or(0.0)),
+            _ => Literal::Texto(String::new()),
+        })
+    }
+}
+
 struct Escritor<'a> {
     dialeto: Dialeto,
     params: Vec<Literal>,
     valido: &'a dyn Fn(&str) -> bool,
+    ctx: &'a Contexto,
 }
 
 impl Escritor<'_> {
@@ -296,6 +327,10 @@ impl Escritor<'_> {
     fn operando(&mut self, o: &Operando) -> Resultado<String> {
         match o {
             Operando::Campo(n) => coluna(n, self.valido),
+            Operando::Macro(n) => {
+                let l = self.ctx.resolver(n)?;
+                Ok(self.marcador(l))
+            }
             Operando::Valor(l) => Ok(self.marcador(l.clone())),
         }
     }
@@ -367,11 +402,22 @@ impl Escritor<'_> {
 
 /// Converte um filtro em SQL. `valido` diz quais nomes de campo existem.
 pub fn para_sql(filtro: &str, valido: &dyn Fn(&str) -> bool, dialeto: Dialeto) -> Resultado<Sql> {
+    para_sql_com(filtro, valido, dialeto, &Contexto::default())
+}
+
+/// Como `para_sql`, resolvendo as macros contra o contexto da requisição.
+pub fn para_sql_com(
+    filtro: &str,
+    valido: &dyn Fn(&str) -> bool,
+    dialeto: Dialeto,
+    ctx: &Contexto,
+) -> Resultado<Sql> {
     let e = analisar(filtro)?;
     let mut w = Escritor {
         dialeto,
         params: vec![],
         valido,
+        ctx,
     };
     let texto = w.expr(&e)?;
     Ok(Sql {
@@ -478,12 +524,41 @@ mod tests {
         assert!(para_sql("senha = 'x'", &campos, Dialeto::Sqlite).is_err());
         assert!(para_sql("nome = 'x'; DROP TABLE t", &campos, Dialeto::Sqlite).is_err());
         assert!(para_sql("nome = 'x' OR 1=1", &campos, Dialeto::Sqlite).is_err());
-        assert!(para_sql("@request.auth.id != ''", &campos, Dialeto::Sqlite).is_err());
+        assert!(para_sql("@request.body.id = 'x'", &campos, Dialeto::Sqlite).is_err());
         assert!(para_sql("nome = 'sem fim", &campos, Dialeto::Sqlite).is_err());
         assert!(para_sql("(nome = 'x'", &campos, Dialeto::Sqlite).is_err());
         // Um valor com aspas e SQL dentro é só um parâmetro.
         let s = sql("nome = \"x' OR '1'='1\"");
         assert_eq!(s.params, vec![Literal::Texto("x' OR '1'='1".into())]);
+    }
+
+    #[test]
+    fn macros_do_pedido() {
+        // Visitante: a macro vira vazio e nunca entra no SQL como texto.
+        let s = sql("@request.auth.id != ''");
+        assert_eq!(s.texto, "? != ?");
+        assert_eq!(
+            s.params,
+            vec![Literal::Texto(String::new()), Literal::Texto(String::new())]
+        );
+
+        let registro = serde_json::json!({"id": "abc123", "owner": "u1", "verified": true});
+        let mapa = registro.as_object().unwrap();
+        let ctx = Contexto {
+            auth: Some(mapa.clone()),
+        };
+        let s = para_sql_com("@request.auth.id = nome", &campos, Dialeto::Sqlite, &ctx).unwrap();
+        assert_eq!(s.texto, "? = \"nome\"");
+        assert_eq!(s.params, vec![Literal::Texto("abc123".into())]);
+
+        let s = para_sql_com(
+            "@request.auth.verified = true",
+            &campos,
+            Dialeto::Sqlite,
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(s.params[0], Literal::Bool(true));
     }
 
     #[test]

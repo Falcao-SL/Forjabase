@@ -9,10 +9,11 @@ Forja is a reimplementation inspired by [PocketBase](https://pocketbase.io)
 (© Gani Georgiev, MIT). Its REST API follows PocketBase's, so existing clients
 keep working.
 
-> **Status: 0.0.2, early development.** Working today: `forja serve`, superuser
-> login, base collections, records with filters, sorting, pagination and
-> access rules, all on SQLite and in PocketBase's API format (PocketBase's
-> Python client already works against it). The admin dashboard is still a shell.
+> **Status: 0.0.3, early development.** Working today: `forja serve`, superuser
+> login, base and auth collections, records with filters, sorting, pagination and
+> access rules, email/password auth with verification, password reset and email
+> change, all on SQLite and in PocketBase's API format (PocketBase's Python
+> client already works against it). The admin dashboard is still a shell.
 > Forja reaches **1.0.0 only when it is stable** (criteria in
 > [`docs/PLANO.md`](docs/PLANO.md) §6).
 
@@ -22,9 +23,10 @@ keep working.
   types, access rules, filters, expand, batch requests; email/password, OTP,
   MFA and OAuth2 with 30 providers; local or S3 file storage with thumbnails;
   realtime over SSE; backups, logs, cron, rate limits.
-- **Three database engines, one API:** SQLite (default), [Turso](https://github.com/tursodatabase/turso)
-  (same file, concurrent writes) or PostgreSQL / [Supabase](https://github.com/supabase/supabase),
-  chosen per project with `--engine`. The same conformance tests run on all three.
+- **One database, one file:** SQLite in WAL mode, one `data.db` per project —
+  nothing to install, easy to back up, easy to move. PostgreSQL and
+  [Turso](https://github.com/tursodatabase/turso) remain compiled behind feature
+  flags but are **not supported** (see [`docs/ARQUITETURA.md`](docs/ARQUITETURA.md)).
 - **In Rust and WebAssembly:** an axum server with embedded SQLite, an admin
   dashboard in Leptos compiled to WASM, and server extensions as WASM modules
   instead of JavaScript.
@@ -40,6 +42,8 @@ keep working.
 The complete list, with what is done and what is planned:
 [`docs/FUNCIONALIDADES.md`](docs/FUNCIONALIDADES.md) (Portuguese).
 How to use each part: [`docs/GUIA.md`](docs/GUIA.md).
+How we approach parity with PocketBase and Appwrite:
+[`docs/PARIDADE.md`](docs/PARIDADE.md).
 
 ## Quick start
 
@@ -48,7 +52,6 @@ git clone https://github.com/iramarfalcao/forjabase.git
 cd forjabase
 cargo run -p forja -- superuser upsert admin@example.com 'a-strong-password'
 cargo run -p forja -- serve
-# or: FORJA_PG_URL=postgres://... cargo run -p forja -- serve --engine postgres
 curl http://127.0.0.1:8090/api/health
 ```
 

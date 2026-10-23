@@ -62,8 +62,8 @@ forjabase/
 | 4 | Extensões: só WASM, ou também JavaScript | Só WASM no começo, coerente com "Rust e WebAssembly"; JS seria um módulo WASM com um motor JS dentro, se houver demanda |
 | 5 | Nome dos pacotes nos registros (crates.io, npm, PyPI, NuGet, Maven, pub.dev) | `forja` / `forja-sdk` / `@forjabase/sdk`; reservar cedo |
 | 6 | MCP remoto ligado por padrão? | Não: desligado até o superusuário criar o primeiro token de MCP; o local (`forja mcp`) só funciona com acesso ao diretório de dados |
-| 7 | Só SQLite ou também PostgreSQL | Os dois: **SQLite padrão** (um arquivo, nada para manter) e **PostgreSQL opcional por projeto**, para escrita concorrente alta, vários servidores no mesmo banco ou Postgres gerenciado. Desde a 0.0.2 o armazenamento fica atrás do trait `Banco` e os filtros viram SQL por dialeto (`?`/`LIKE` no SQLite, `$1`/`ILIKE` no Postgres); desde a 0.0.3 o Postgres funciona e passa a mesma bateria de conformidade. Um projeto Supabase é um Postgres: basta a URL dele |
-| 8 | Turso | **Terceiro motor**, mesmo dialeto do SQLite: abre o arquivo que o rusqlite gravou, então trocar de motor não exige migração. Fica opcional enquanto o Turso for beta; vira candidato a padrão quando estabilizar. Recursos dele (CDC, vetores, criptografia, MVCC) entram como extras sobre a mesma API |
+| 7 | Só SQLite ou também PostgreSQL | Os dois: **SQLite padrão** (um arquivo, nada para manter) e **PostgreSQL opcional por projeto**, para escrita concorrente alta, vários servidores no mesmo banco ou Postgres gerenciado. Desde a 0.0.2 o armazenamento fica atrás do trait `Banco` e os filtros viram SQL por dialeto (`?`/`LIKE` no SQLite, `$1`/`ILIKE` no Postgres); desde a 0.0.3 o Postgres funciona e passa a mesma bateria de conformidade. Um projeto Supabase é um Postgres: basta a URL dele. ⚠️ **Superada** pela decisão 1 de [ARQUITETURA](ARQUITETURA.md): SQLite é o único motor suportado; Postgres fica atrás de feature flag, sem suporte |
+| 8 | Turso | **Terceiro motor**, mesmo dialeto do SQLite: abre o arquivo que o rusqlite gravou, então trocar de motor não exige migração. Fica opcional enquanto o Turso for beta; vira candidato a padrão quando estabilizar. Recursos dele (CDC, vetores, criptografia, MVCC) entram como extras sobre a mesma API. ⚠️ **Superada** pela decisão 13 de [ARQUITETURA](ARQUITETURA.md): Turso permanece no código atrás de feature flag, sem suporte nem CI |
 | 9 | Até onde ir no "Supabase" | A API continua a do PocketBase em todos os motores. Do Supabase vêm ideias para o motor Postgres: regras também como RLS, tempo real pela replicação lógica, pgvector. Não reimplementar PostgREST nem GoTrue: a API do Forja já cobre esses papéis |
 
 ## 5. Fases e versões
@@ -72,17 +72,19 @@ Versões **0.x** até estar estável; a 1.0.0 só depois dos critérios do §6.
 
 | Versão | Entrega |
 |---|---|
-| **0.0.1** | Workspace, CLI `serve`, `/api/health`, tipos do modelo, casca do painel em WASM, CI, documentação |
-| 0.1 | SQLite, coleções base com CRUD de registros, filtros e ordenação, superusuário |
-| 0.2 | Autenticação (senha, verificação, redefinição, troca de e-mail), regras de acesso |
-| 0.3 | Arquivos (local e S3, miniaturas), tempo real (SSE), lote |
-| 0.4 | Painel administrativo utilizável |
-| 0.5 | Vários projetos |
-| 0.6 | OAuth2, OTP, MFA, personificação, alertas |
-| 0.7 | Backups, logs, cron, configurações, limite de requisições; CLI de administração |
-| 0.8 | Extensões em WASM (hooks, rotas, cron, migrações); MCP local e remoto com tokens de escopo |
-| 0.9 | SDKs: Rust e JS/TS primeiro; depois Kotlin, Swift, Dart; depois Python, Java, C#, Go |
+| **0.0.x** | Entregue: workspace, CLI `serve`, `/api/health`, coleções base com CRUD e filtros, regras de acesso, superusuário; SQLite (Postgres e Turso atrás de feature flag) |
+| 0.1 | **Autenticação**: coleções `auth`, senha, verificação, redefinição, troca de e-mail, personificação, macros `@request.auth.*`, envio de e-mail — ✅ feito (SMTP fica na 0.5) |
+| 0.2 | **Relações e views**: campo `relation`, cascata, `expand`, relações reversas, coleções `view`, macro `@collection.*` |
+| 0.3 | **Arquivos, lote e tempo real**: campo `file`, local/S3, miniaturas, arquivos protegidos, `/api/batch`, SSE |
+| 0.4 | **Painel administrativo utilizável** |
+| 0.5 | **Operação**: configurações, logs, cron, limite de requisições, backups com restauração, encerramento gracioso |
+| 0.6 | **OAuth2, OTP e MFA** |
+| 0.7 | **Vários projetos** e importação de um `pb_data` |
+| 0.8 | **Extensões em WASM** (hooks, rotas, cron, migrações) e **MCP** com tokens de escopo |
+| 0.9 | **SDKs gerados** a partir do OpenAPI, conformidade contra o PocketBase, TLS e builds multiplataforma |
 | 1.0.0 | Estável (§6) |
+
+Portão de saída e tamanho de cada onda: [ARQUITETURA](ARQUITETURA.md) §4.
 
 ## 6. Quando vira 1.0.0
 

@@ -9,16 +9,17 @@ use std::path::PathBuf;
 #[command(
     name = "forja",
     version,
-    about = "Backend em um arquivo: SQLite, Turso ou Postgres, autenticação, arquivos e tempo real. Em Rust."
+    about = "Backend em um arquivo: SQLite, autenticação, arquivos e tempo real. Em Rust."
 )]
 struct Cli {
     /// Pasta de dados (cada projeto fica numa subpasta; hoje só `default`).
     #[arg(long, global = true, default_value = "forja_data")]
     dir: PathBuf,
-    /// Motor do banco. Os três dão a mesma API.
+    /// Motor do banco. Só `sqlite` tem suporte; os outros dois são
+    /// experimentais e precisam de `--features turso` / `--features postgres`.
     #[arg(long, global = true, value_enum, default_value_t = QualMotor::Sqlite, env = "FORJA_ENGINE")]
     engine: QualMotor,
-    /// URL do Postgres/Supabase (`postgres://usuario:senha@host:5432/banco`).
+    /// URL do Postgres/Supabase (experimental; exige `--features postgres`).
     /// Prefira a variável de ambiente: assim a senha não aparece no `ps`.
     #[arg(long, global = true, env = "FORJA_PG_URL", hide_env_values = true)]
     pg_url: Option<String>,

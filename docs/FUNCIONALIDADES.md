@@ -5,7 +5,7 @@ Lista de tudo o que o Forja vai ter. A base é o PocketBase (o fork
 item dele está aqui, com o equivalente no Forja. Depois vêm o que o Forja
 acrescenta (vários projetos, extensões em WebAssembly) e os SDKs.
 
-**Legenda:** ✅ feito · 🔨 em construção · 📋 planejado · ➕ só no Forja
+**Legenda:** ✅ feito · 🔨 em construção · 📋 planejado · ➕ só no Forja · ⚠️ experimental, sem suporte
 
 Versão atual: **0.0.2**. O Forja só vira **1.0.0** quando estiver estável
 (critérios em [`PLANO.md`](PLANO.md) §6).
@@ -33,26 +33,30 @@ Versão atual: **0.0.2**. O Forja só vira **1.0.0** quando estiver estável
 
 ## 2. Banco de dados
 
+> **Decisão de arquitetura:** SQLite é o único motor suportado. Turso e
+> PostgreSQL continuam compilando atrás de feature flag, mas não têm suporte,
+> CI nem promessa de compatibilidade — ver [ARQUITETURA](ARQUITETURA.md).
+
 | Funcionalidade | Estado |
 |---|---|
 | SQLite em modo WAL, um arquivo por projeto (`forja_data/<projeto>/data.db`) | ✅ |
-| ➕ Três motores com a mesma API, escolhidos por projeto (`--engine sqlite\|turso\|postgres`) | ✅ |
-| ➕ Bateria de conformidade: os mesmos testes passam nos três motores (o CI roda o Postgres) | ✅ |
+| ➕ Três motores com a mesma API, escolhidos por projeto (`--engine sqlite\|turso\|postgres`) | ✅ (só SQLite suportado) |
+| ➕ Bateria de conformidade: os mesmos testes passam nos três motores (o CI roda o Postgres) | ✅ (histórico; o CI hoje roda só SQLite) |
 | Banco separado para logs (`auxiliary.db`) | 📋 |
 | Consultas preparadas e transações | ✅ |
 | Pool de conexões | 📋 |
 | Índices (simples e únicos) definidos por coleção | 📋 |
 | Endpoint de SQL para superusuários (`/api/sql`) | 📋 |
 | Compatibilidade do arquivo com o PocketBase (abrir um `pb_data` existente) | 📋 (meta, ver PLANO §4) |
-| ➕ PostgreSQL como banco opcional por projeto (mesma API; SQLite continua o padrão) | ✅ |
+| ➕ PostgreSQL como banco opcional por projeto (mesma API) | ⚠️ (sem suporte) |
 
 ### 2.1 Motores
 
 | Motor | Para quê | Estado |
 |---|---|---|
-| **SQLite** (rusqlite) | Padrão. Um arquivo, nada para manter | ✅ |
-| **Turso** ([tursodatabase/turso](https://github.com/tursodatabase/turso), Rust) | Mesmo arquivo do SQLite, com escrita concorrente; troca de motor sem migrar dados | ✅ |
-| **PostgreSQL / Supabase** ([supabase/supabase](https://github.com/supabase/supabase)) | Escrita concorrente alta, vários servidores, Postgres gerenciado. Cada projeto num esquema `forja_<projeto>`; TLS (rustls) para Supabase e nuvens | ✅ |
+| **SQLite** (rusqlite) | O motor. Um arquivo, nada para manter | ✅ |
+| **Turso** ([tursodatabase/turso](https://github.com/tursodatabase/turso), Rust) | Experimental, sem suporte: o mesmo arquivo do SQLite, útil para testar escrita concorrente | ⚠️ |
+| **PostgreSQL / Supabase** ([supabase/supabase](https://github.com/supabase/supabase)) | Experimental, sem suporte: existia para escrita concorrente alta e Postgres gerenciado | ⚠️ |
 
 ### 2.2 Recursos próprios de cada motor (sobre a mesma API)
 
@@ -71,7 +75,8 @@ Versão atual: **0.0.2**. O Forja só vira **1.0.0** quando estiver estável
 | Funcionalidade | Estado |
 |---|---|
 | Tipo **base** | ✅ |
-| Tipos **auth** e **view** (view = consulta SQL somente leitura) | ✅ (modelo) · 📋 (comportamento) |
+| Tipo **auth** (campos de sistema, e-mail único sem diferenciar maiúsculas e senha em Argon2id) | ✅ |
+| Tipo **view** (consulta SQL somente leitura) | ✅ (modelo) · 📋 (comportamento) |
 | Listar, criar, ver e apagar coleções (`/api/collections`) | ✅ |
 | Atualizar coleção (`PATCH`, com mudança de campos) | 📋 |
 | Importar coleções em lote (`PUT /api/collections/import`) | 📋 |
@@ -97,7 +102,7 @@ Versão atual: **0.0.2**. O Forja só vira **1.0.0** quando estiver estável
 | `file` | um ou vários arquivos, com tipos MIME, tamanho e miniaturas | ✅ (tipo) |
 | `relation` | um ou vários registros de outra coleção, com exclusão em cascata | ✅ (tipo) |
 | `json` | qualquer JSON, com tamanho máximo | ✅ |
-| `password` | senha com hash (bcrypt), nunca devolvida | ✅ (tipo) |
+| `password` | senha com hash (Argon2id), nunca devolvida nem filtrável | ✅ |
 | `geoPoint` | latitude e longitude | ✅ (tipo) |
 
 "✅ (tipo)" quer dizer que o tipo existe no modelo e serializa com o mesmo nome
@@ -111,7 +116,8 @@ com uma mensagem clara. "✅" quer dizer validado e guardado.
 | Regras por operação: listar, ver, criar, atualizar, apagar, com filtros sobre os campos do registro | ✅ |
 | Regras de auth: login (`authRule`) e gerenciar outros usuários (`manageRule`) | 📋 |
 | Regra nula = só superusuário; `""` = público | ✅ |
-| Regras com `@request.auth.*`, `@request.body.*`, `@request.query.*`, `@request.headers.*`, `@request.context` e `@collection.*` | 📋 |
+| Regras com `@request.auth.*` | ✅ |
+| Regras com `@request.body.*`, `@request.query.*`, `@request.headers.*`, `@request.context` e `@collection.*` | 📋 |
 
 ## 4. Registros (CRUD) e consulta
 
@@ -139,21 +145,21 @@ com uma mensagem clara. "✅" quer dizer validado e guardado.
 | Funcionalidade | Estado |
 |---|---|
 | Superusuário com e-mail e senha (`_superusers/auth-with-password`), senha em Argon2id | ✅ |
-| Usuários de coleções auth com e-mail (ou outro campo de identidade) e senha | 📋 |
+| Usuários de coleções auth com e-mail (ou outro campo de identidade) e senha | ✅ |
 | **OTP** por e-mail (código de uso único) | 📋 |
 | **MFA** (dois métodos diferentes em sequência) | 📋 |
 | **OAuth2** com os provedores do PocketBase: Apple, Bitbucket, Box, Discord, Facebook, Gitea, Gitee, GitHub, GitLab, Google, Instagram, Kakao, Lark, Linear, LiveChat, mailcow, Microsoft, monday.com, Notion, OpenID Connect (até 3 genéricos), Patreon, Planning Center, Spotify, Strava, Trakt, Twitch, Twitter/X, VK, WakaTime, Yandex | 📋 |
 | Fluxo OAuth2 de redirecionamento (`/api/oauth2-redirect`) e PKCE | 📋 |
-| Renovar token (`auth-refresh`) | ✅ (superusuário) |
-| Verificação de e-mail (pedir e confirmar) | 📋 |
-| Redefinir senha (pedir e confirmar) | 📋 |
-| Trocar e-mail (pedir e confirmar) | 📋 |
-| Personificação: superusuário gera token de outro usuário (`impersonate`) | 📋 |
+| Renovar token (`auth-refresh`) | ✅ (superusuário e usuário de coleção auth) |
+| Verificação de e-mail (pedir e confirmar) | ✅ |
+| Redefinir senha (pedir e confirmar) | ✅ |
+| Trocar e-mail (pedir e confirmar) | ✅ |
+| Personificação: superusuário gera token de outro usuário (`impersonate`) | ✅ |
 | Alerta de login de novo dispositivo (`authAlert`) | 📋 |
 | Métodos de login disponíveis por coleção (`auth-methods`) | 📋 |
 | Token JWT de autenticação, invalidado ao trocar a senha | ✅ |
-| Tokens de verificação, senha, e-mail e arquivo | 📋 |
-| Modelos de e-mail editáveis (verificação, senha, troca de e-mail, OTP, alerta) | 📋 |
+| Tokens de verificação, senha, e-mail e arquivo | ✅ (verificação, senha e e-mail) |
+| Modelos de e-mail editáveis (verificação, senha, troca de e-mail, OTP, alerta) | 📋 (texto fixo; envio no console) |
 | Gerador do segredo do Sign in with Apple | 📋 |
 
 ## 6. Arquivos

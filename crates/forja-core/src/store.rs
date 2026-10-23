@@ -6,7 +6,7 @@
 //! campo, `created` e `updated`. As coleções ficam descritas em `_collections`.
 
 use crate::erro::{Erro, Resultado};
-use crate::filtro::{self, Dialeto, Literal};
+use crate::filtro::{self, Contexto, Dialeto, Literal};
 use crate::motor::{Executor, Linha};
 use crate::valor::Valor;
 use crate::{Collection, CollectionType, Field, FieldType, agora, auth, id};
@@ -24,6 +24,8 @@ pub struct Consulta {
     pub pular_total: bool,
     /// Regra de acesso da coleção, somada ao filtro com AND.
     pub regra: Option<String>,
+    /// Quem está pedindo, para as macros `@request.auth.*`.
+    pub contexto: Contexto,
 }
 
 impl Default for Consulta {
@@ -35,6 +37,7 @@ impl Default for Consulta {
             por_pagina: 30,
             pular_total: false,
             regra: None,
+            contexto: Contexto::default(),
         }
     }
 }
@@ -63,6 +66,16 @@ pub struct Superusuario {
     pub senha: String,
     #[serde(skip)]
     pub token_key: String,
+}
+
+/// Credenciais de um usuário de coleção `auth`. A senha é o hash, nunca o texto.
+#[derive(Debug, Clone)]
+pub struct Credenciais {
+    pub id: String,
+    pub email: String,
+    pub senha: String,
+    pub token_key: String,
+    pub verified: bool,
 }
 
 /// O banco de um projeto.
@@ -269,6 +282,14 @@ fn invalido(mensagem: &str, erros: Map<String, Value>) -> Erro {
     }
 }
 
+/// O Argon2 é caro de propósito: roda fora das threads do runtime.
+async fn hash_senha_async(senha: String) -> Resultado<Valor> {
+    tokio::task::spawn_blocking(move || auth::hash_senha(&senha))
+        .await
+        .map_err(|e| Erro::Interno(e.to_string()))?
+        .map(Valor::Texto)
+}
+
 /// Valida e converte o valor de um campo. `None` = campo ausente (usa o vazio).
 fn valor_do_campo(f: &Field, v: Option<&Value>, erros: &mut Map<String, Value>) -> Valor {
     let n = f.name.as_str();
@@ -368,6 +389,41 @@ fn valor_do_campo(f: &Field, v: Option<&Value>, erros: &mut Map<String, Value>) 
                     }
                 }
                 _ => {}
+            }
+            Valor::Texto(t)
+        }
+        FieldType::Password => {
+            let t = match v {
+                None | Some(Value::Null) => String::new(),
+                Some(Value::String(s)) => s.clone(),
+                _ => {
+                    ruim(erros);
+                    return Valor::Texto(String::new());
+                }
+            };
+            if t.is_empty() {
+                if f.required {
+                    obrigatorio(erros);
+                }
+                return Valor::Texto(t);
+            }
+            let tam = t.chars().count() as f64;
+            let min = f.opcao_f64("min").unwrap_or(10.0);
+            if tam < min {
+                erro_campo(
+                    erros,
+                    n,
+                    "validation_min_text_constraint",
+                    format!("Must be at least {min} character(s)."),
+                );
+            }
+            if tam > 71.0 {
+                erro_campo(
+                    erros,
+                    n,
+                    "validation_max_text_constraint",
+                    "Must be less than 71 character(s).".into(),
+                );
             }
             Valor::Texto(t)
         }
@@ -563,10 +619,12 @@ fn linha_para_registro(c: &Collection, l: Linha) -> Value {
         json!(it.next().unwrap_or(Valor::Nulo).texto_ou_vazio()),
     );
     for f in &c.fields {
-        m.insert(
-            f.name.clone(),
-            para_json(f, it.next().unwrap_or(Valor::Nulo)),
-        );
+        let valor = it.next().unwrap_or(Valor::Nulo);
+        // O hash da senha e a chave dos tokens nunca saem do banco.
+        if f.kind == FieldType::Password || (f.system && f.name == "tokenKey") {
+            continue;
+        }
+        m.insert(f.name.clone(), para_json(f, valor));
     }
     m.insert(
         "created".into(),
@@ -636,6 +694,17 @@ fn ler_superuser(l: Linha) -> Superusuario {
     }
 }
 
+fn injetar_campos_auth(campos: Vec<Field>) -> Vec<Field> {
+    let mut out = FieldType::campos_auth();
+    for f in campos {
+        // Campo de sistema não é redefinido pelo cliente.
+        if !out.iter().any(|s| s.name.eq_ignore_ascii_case(&f.name)) {
+            out.push(f);
+        }
+    }
+    out
+}
+
 fn validar_colecao(c: &Collection, d: Dialeto) -> Resultado<()> {
     let mut erros = Map::new();
     if !nome_valido(&c.name)
@@ -649,12 +718,20 @@ fn validar_colecao(c: &Collection, d: Dialeto) -> Resultado<()> {
             "Invalid collection name.".into(),
         );
     }
-    if c.kind != CollectionType::Base {
+    if c.kind == CollectionType::View {
         erro_campo(
             &mut erros,
             "type",
             "validation_not_supported",
-            "Only 'base' collections are supported in this version.".into(),
+            "Only 'base' and 'auth' collections are supported in this version.".into(),
+        );
+    }
+    if c.kind == CollectionType::Auth && c.campo("email").is_none() {
+        erro_campo(
+            &mut erros,
+            "fields",
+            "validation_missing_system_field",
+            "Auth collections need an 'email' field.".into(),
         );
     }
     let mut vistos: Vec<String> = vec![];
@@ -677,6 +754,14 @@ fn validar_colecao(c: &Collection, d: Dialeto) -> Resultado<()> {
             );
         }
         vistos.push(f.name.clone());
+        if c.kind == CollectionType::Base && f.kind == FieldType::Password {
+            erro_campo(
+                &mut erros,
+                &format!("fields.{i}.type"),
+                "validation_not_supported",
+                "Password fields are only allowed in auth collections.".into(),
+            );
+        }
         if !f.kind.suportado() {
             let tipo = serde_json::to_value(f.kind)
                 .ok()
@@ -726,6 +811,7 @@ impl Banco {
         c: &Collection,
         regra: Option<&str>,
         filtro_usuario: Option<&str>,
+        ctx: &Contexto,
     ) -> Resultado<(String, Vec<Valor>)> {
         let valido = |n: &str| c.coluna_valida(n);
         let mut partes = vec![];
@@ -735,7 +821,7 @@ impl Banco {
             .flatten()
             .filter(|f| !f.trim().is_empty())
         {
-            let sql = filtro::para_sql(f, &valido, self.dialeto())?;
+            let sql = filtro::para_sql_com(f, &valido, self.dialeto(), ctx)?;
             partes.push(sql.texto);
             params.extend(sql.params.into_iter().map(literal_valor));
         }
@@ -756,6 +842,35 @@ impl Banco {
             .and_then(|l| l.first())
             .map(Valor::int)
             .unwrap_or(0))
+    }
+
+    /// O e-mail já está em uso nesta coleção? `ignorar` exclui o próprio id.
+    async fn email_em_uso(
+        &self,
+        c: &Collection,
+        email: &str,
+        ignorar: Option<&str>,
+    ) -> Resultado<bool> {
+        let (sql, mut params) = match ignorar {
+            Some(_) => (
+                format!(
+                    "SELECT COUNT(*) FROM \"{}\" WHERE lower(\"email\") = lower(?) AND \"id\" <> ?",
+                    c.name
+                ),
+                vec![Valor::from(email.trim())],
+            ),
+            None => (
+                format!(
+                    "SELECT COUNT(*) FROM \"{}\" WHERE lower(\"email\") = lower(?)",
+                    c.name
+                ),
+                vec![Valor::from(email.trim())],
+            ),
+        };
+        if let Some(i) = ignorar {
+            params.push(Valor::from(i));
+        }
+        Ok(self.contar(&sql, params).await? > 0)
     }
 
     /// Segredo dos tokens deste projeto (gerado na primeira vez).
@@ -809,6 +924,10 @@ impl Banco {
 
     pub async fn criar_colecao(&self, mut c: Collection) -> Resultado<Collection> {
         let d = self.dialeto();
+        // Toda coleção `auth` ganha os cinco campos de sistema do PocketBase.
+        if c.kind == CollectionType::Auth {
+            c.fields = injetar_campos_auth(c.fields);
+        }
         validar_colecao(&c, d)?;
         let agora = agora();
         if c.id.is_empty() {
@@ -860,7 +979,11 @@ impl Banco {
             vec![
                 c.id.clone().into(),
                 c.name.clone().into(),
-                "base".into(),
+                serde_json::to_value(c.kind)
+                    .ok()
+                    .and_then(|v| v.as_str().map(String::from))
+                    .unwrap_or_else(|| "base".into())
+                    .into(),
                 Valor::Bool(c.system),
                 serde_json::to_string(&c.fields)
                     .unwrap_or_else(|_| "[]".into())
@@ -877,22 +1000,30 @@ impl Banco {
                 c.updated.clone().into(),
             ],
         );
-        self.ex
-            .lote(vec![
-                (
-                    format!("CREATE TABLE \"{}\" ({})", c.name, colunas_sql.join(", ")),
-                    vec![],
+        let mut comandos = vec![
+            (
+                format!("CREATE TABLE \"{}\" ({})", c.name, colunas_sql.join(", ")),
+                vec![],
+            ),
+            insert,
+        ];
+        if c.kind == CollectionType::Auth {
+            // E-mail é único sem diferenciar maiúsculas, como no PocketBase.
+            comandos.push((
+                format!(
+                    "CREATE UNIQUE INDEX \"idx_{}_email\" ON \"{}\" (lower(\"email\"))",
+                    c.name, c.name
                 ),
-                insert,
-            ])
-            .await
-            .map_err(|e| {
-                if matches!(e, Erro::Duplicado(_)) {
-                    duplicado()
-                } else {
-                    e
-                }
-            })?;
+                vec![],
+            ));
+        }
+        self.ex.lote(comandos).await.map_err(|e| {
+            if matches!(e, Erro::Duplicado(_)) {
+                duplicado()
+            } else {
+                e
+            }
+        })?;
         Ok(c)
     }
 
@@ -915,7 +1046,8 @@ impl Banco {
     pub async fn listar(&self, c: &Collection, q: &Consulta) -> Resultado<Lista> {
         let por_pagina = q.por_pagina.clamp(1, 1000);
         let pagina = q.pagina.max(1);
-        let (onde_sql, params) = self.onde(c, q.regra.as_deref(), q.filtro.as_deref())?;
+        let (onde_sql, params) =
+            self.onde(c, q.regra.as_deref(), q.filtro.as_deref(), &q.contexto)?;
         // "id" desempata valores iguais: a mesma consulta devolve sempre a mesma
         // ordem, e a paginação não repete nem pula registros.
         let ordem = match q.ordem.as_deref().filter(|s| !s.trim().is_empty()) {
@@ -967,7 +1099,18 @@ impl Banco {
         id: &str,
         regra: Option<&str>,
     ) -> Resultado<Value> {
-        let (onde_sql, mut params) = self.onde(c, regra, None)?;
+        self.registro_com(c, id, regra, &Contexto::default()).await
+    }
+
+    /// Como `registro`, resolvendo as macros `@request.auth.*` da regra.
+    pub async fn registro_com(
+        &self,
+        c: &Collection,
+        id: &str,
+        regra: Option<&str>,
+        ctx: &Contexto,
+    ) -> Resultado<Value> {
+        let (onde_sql, mut params) = self.onde(c, regra, None, ctx)?;
         let filtro_id = if onde_sql.is_empty() {
             " WHERE \"id\" = ?".to_string()
         } else {
@@ -1006,13 +1149,40 @@ impl Banco {
             }
             None => id::novo(),
         };
-        let valores: Vec<Valor> = c
+        let mut valores: Vec<Valor> = c
             .fields
             .iter()
             .map(|f| valor_do_campo(f, dados.get(&f.name), &mut erros))
             .collect();
+        if c.kind == CollectionType::Auth
+            && let Some(email) = dados.get("email").and_then(Value::as_str)
+            && !email.trim().is_empty()
+            && self.email_em_uso(c, email, None).await?
+        {
+            erro_campo(
+                &mut erros,
+                "email",
+                "validation_not_unique",
+                "The email is invalid or already in use.".into(),
+            );
+        }
         if !erros.is_empty() {
             return Err(invalido("Failed to create record.", erros));
+        }
+        // Auth: a senha é guardada como hash e o registro ganha a chave dos tokens.
+        if c.kind == CollectionType::Auth {
+            for (f, v) in c.fields.iter().zip(valores.iter_mut()) {
+                if f.kind == FieldType::Password
+                    && let Valor::Texto(t) = v
+                    && !t.is_empty()
+                {
+                    let bruta = t.clone();
+                    *v = hash_senha_async(bruta).await?;
+                }
+                if f.system && f.name == "tokenKey" {
+                    *v = Valor::Texto(id::aleatorio(50));
+                }
+            }
         }
         let agora = agora();
         let mut todos = vec![Valor::Texto(novo_id.clone())];
@@ -1052,47 +1222,212 @@ impl Banco {
         dados: &Map<String, Value>,
         regra: Option<&str>,
     ) -> Resultado<Value> {
-        let atual = self.registro(c, id, regra).await?;
+        self.atualizar_com(c, id, dados, regra, &Contexto::default())
+            .await
+    }
+
+    /// Como `atualizar`, resolvendo as macros `@request.auth.*` da regra.
+    pub async fn atualizar_com(
+        &self,
+        c: &Collection,
+        id: &str,
+        dados: &Map<String, Value>,
+        regra: Option<&str>,
+        ctx: &Contexto,
+    ) -> Resultado<Value> {
+        let atual = self.registro_com(c, id, regra, ctx).await?;
         let mut erros = Map::new();
-        let mut sets = vec![];
-        let mut valores = vec![];
+        let mut sets: Vec<(String, Valor)> = vec![];
+        let mut senha_nova: Option<String> = None;
         for f in &c.fields {
+            // A senha atual é um hash e não volta na resposta: só muda quando
+            // enviada de novo, e aí vira hash antes de gravar.
+            if f.kind == FieldType::Password {
+                if let Some(v) = dados.get(&f.name) {
+                    if let Valor::Texto(t) = valor_do_campo(f, Some(v), &mut erros) {
+                        senha_nova = Some(t);
+                    }
+                    sets.push((f.name.clone(), Valor::Texto(String::new())));
+                }
+                continue;
+            }
+            if f.system && f.name == "tokenKey" {
+                continue;
+            }
             // Só os campos enviados mudam; os outros são revalidados como estão
             // para manter "obrigatório" coerente.
             let v = dados.get(&f.name).or_else(|| atual.get(&f.name));
             let valor = valor_do_campo(f, v, &mut erros);
             if dados.contains_key(&f.name) {
-                sets.push(format!("\"{}\" = ?", f.name));
-                valores.push(valor);
+                sets.push((f.name.clone(), valor));
             }
+        }
+        if c.kind == CollectionType::Auth
+            && let Some(email) = dados.get("email").and_then(Value::as_str)
+            && !email.trim().is_empty()
+            && self.email_em_uso(c, email, Some(id)).await?
+        {
+            erro_campo(
+                &mut erros,
+                "email",
+                "validation_not_unique",
+                "The email is invalid or already in use.".into(),
+            );
         }
         if !erros.is_empty() {
             return Err(invalido("Failed to update record.", erros));
         }
-        sets.push("\"updated\" = ?".into());
-        valores.push(agora().into());
+        if let Some(senha) = senha_nova {
+            let hash = hash_senha_async(senha).await?;
+            for (nome, valor) in sets.iter_mut() {
+                if c.campo(nome).is_some_and(|f| f.kind == FieldType::Password) {
+                    *valor = hash.clone();
+                }
+            }
+            // Trocar a senha invalida os tokens emitidos antes.
+            sets.push(("tokenKey".into(), Valor::Texto(id::aleatorio(50))));
+        }
+        sets.push(("updated".into(), agora().into()));
+        let atribuicoes: Vec<String> = sets
+            .iter()
+            .map(|(nome, _)| format!("\"{nome}\" = ?"))
+            .collect();
+        let mut valores: Vec<Valor> = sets.into_iter().map(|(_, v)| v).collect();
         valores.push(id.into());
         self.ex
             .executar(
                 &format!(
                     "UPDATE \"{}\" SET {} WHERE \"id\" = ?",
                     c.name,
-                    sets.join(", ")
+                    atribuicoes.join(", ")
                 ),
                 valores,
             )
             .await?;
-        self.registro(c, id, None).await
+        self.registro_com(c, id, None, ctx).await
     }
 
     pub async fn apagar(&self, c: &Collection, id: &str, regra: Option<&str>) -> Resultado<()> {
-        self.registro(c, id, regra).await?;
+        self.apagar_com(c, id, regra, &Contexto::default()).await
+    }
+
+    pub async fn apagar_com(
+        &self,
+        c: &Collection,
+        id: &str,
+        regra: Option<&str>,
+        ctx: &Contexto,
+    ) -> Resultado<()> {
+        self.registro_com(c, id, regra, ctx).await?;
         self.ex
             .executar(
                 &format!("DELETE FROM \"{}\" WHERE \"id\" = ?", c.name),
                 vec![id.into()],
             )
             .await?;
+        Ok(())
+    }
+
+    /// Credenciais de um usuário de coleção `auth`, por e-mail ou por id.
+    pub async fn auth_credenciais(
+        &self,
+        c: &Collection,
+        email: &str,
+    ) -> Resultado<Option<Credenciais>> {
+        self.credenciais(c, "lower(\"email\") = lower(?)", vec![email.trim().into()])
+            .await
+    }
+
+    pub async fn auth_credenciais_por_id(
+        &self,
+        c: &Collection,
+        id: &str,
+    ) -> Resultado<Option<Credenciais>> {
+        self.credenciais(c, "\"id\" = ?", vec![id.into()]).await
+    }
+
+    async fn credenciais(
+        &self,
+        c: &Collection,
+        condicao: &str,
+        params: Vec<Valor>,
+    ) -> Resultado<Option<Credenciais>> {
+        if c.kind != CollectionType::Auth {
+            return Err(Erro::invalido("Not an auth collection."));
+        }
+        let l = self
+            .ex
+            .consultar(
+                &format!(
+                    "SELECT \"id\", \"email\", \"password\", \"tokenKey\", \"verified\" FROM \"{}\" WHERE {condicao}",
+                    c.name
+                ),
+                params,
+            )
+            .await?;
+        Ok(l.into_iter().next().map(|l| {
+            let mut it = l.into_iter();
+            let mut prox = || it.next().unwrap_or(Valor::Nulo);
+            Credenciais {
+                id: prox().texto_ou_vazio(),
+                email: prox().texto_ou_vazio(),
+                senha: prox().texto_ou_vazio(),
+                token_key: prox().texto_ou_vazio(),
+                verified: prox().bool(),
+            }
+        }))
+    }
+
+    /// Troca a senha e a `tokenKey` (o que invalida os tokens antigos).
+    pub async fn auth_definir_senha(&self, c: &Collection, id: &str, hash: &str) -> Resultado<()> {
+        self.ex
+            .executar(
+                &format!(
+                    "UPDATE \"{}\" SET \"password\" = ?, \"tokenKey\" = ?, \"updated\" = ? WHERE \"id\" = ?",
+                    c.name
+                ),
+                vec![
+                    hash.into(),
+                    id::aleatorio(50).into(),
+                    agora().into(),
+                    id.into(),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Marca o e-mail como verificado; com `email`, troca o endereço junto.
+    pub async fn auth_verificar(
+        &self,
+        c: &Collection,
+        id: &str,
+        email: Option<&str>,
+    ) -> Resultado<()> {
+        match email {
+            Some(e) => {
+                self.ex
+                    .executar(
+                        &format!(
+                            "UPDATE \"{}\" SET \"email\" = ?, \"verified\" = ?, \"updated\" = ? WHERE \"id\" = ?",
+                            c.name
+                        ),
+                        vec![e.into(), true.into(), agora().into(), id.into()],
+                    )
+                    .await?;
+            }
+            None => {
+                self.ex
+                    .executar(
+                        &format!(
+                            "UPDATE \"{}\" SET \"verified\" = ?, \"updated\" = ? WHERE \"id\" = ?",
+                            c.name
+                        ),
+                        vec![true.into(), agora().into(), id.into()],
+                    )
+                    .await?;
+            }
+        }
         Ok(())
     }
 
@@ -1513,5 +1848,199 @@ mod tests {
             b.listar(&c, &Consulta::default()).await.unwrap().items[0]["t"],
             json!("veio do sqlite")
         );
+    }
+
+    /// Coleção `auth` mínima: só o apelido; o resto é injetado.
+    #[cfg(feature = "sqlite")]
+    fn colecao_auth() -> Collection {
+        serde_json::from_value(json!({
+            "name": "usuarios",
+            "type": "auth",
+            "fields": [{ "name": "apelido", "type": "text" }]
+        }))
+        .unwrap()
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn colecao_auth_ganha_campos_de_sistema() {
+        let b = Banco::sqlite_memoria().await.unwrap();
+        let c = b.criar_colecao(colecao_auth()).await.unwrap();
+        for nome in [
+            "email",
+            "emailVisibility",
+            "verified",
+            "password",
+            "tokenKey",
+        ] {
+            let f = c.campo(nome).unwrap_or_else(|| panic!("faltou {nome}"));
+            assert!(f.system, "{nome} devia ser de sistema");
+            assert!(!f.id.is_empty(), "{nome} devia ter id");
+        }
+        assert!(c.campo("apelido").is_some_and(|f| !f.system));
+        assert!(
+            c.campo("password")
+                .is_some_and(|f| f.kind == FieldType::Password)
+        );
+        assert!(!c.coluna_valida("password"));
+        assert!(!c.coluna_valida("tokenKey"));
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn senha_vira_hash_e_nao_volta_na_resposta() {
+        let b = Banco::sqlite_memoria().await.unwrap();
+        let c = b.criar_colecao(colecao_auth()).await.unwrap();
+        let r = b
+            .criar(
+                &c,
+                json!({ "email": "Ana@Exemplo.com", "password": "senha-bem-longa" })
+                    .as_object()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            r.get("password").is_none(),
+            "o hash não pode sair na resposta"
+        );
+        assert!(r.get("tokenKey").is_none());
+        assert_eq!(r["email"], json!("Ana@Exemplo.com"));
+
+        let cred = b
+            .auth_credenciais(&c, "ana@exemplo.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(cred.senha, "senha-bem-longa");
+        assert!(auth::conferir_senha(&cred.senha, "senha-bem-longa"));
+        assert!(!auth::conferir_senha(&cred.senha, "outra-senha"));
+
+        let erro = b
+            .criar(
+                &c,
+                json!({ "email": "ANA@exemplo.com", "password": "outra-bem-longa" })
+                    .as_object()
+                    .unwrap(),
+            )
+            .await
+            .unwrap_err();
+        match erro {
+            Erro::Invalido { campos, .. } => {
+                assert_eq!(campos["email"]["code"], json!("validation_not_unique"));
+            }
+            outro => panic!("erro inesperado: {outro:?}"),
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn trocar_senha_rotaciona_a_token_key() {
+        let b = Banco::sqlite_memoria().await.unwrap();
+        let c = b.criar_colecao(colecao_auth()).await.unwrap();
+        let r = b
+            .criar(
+                &c,
+                json!({ "email": "u@exemplo.com", "password": "senha-bem-longa" })
+                    .as_object()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let id = r["id"].as_str().unwrap().to_string();
+        let antes = b.auth_credenciais_por_id(&c, &id).await.unwrap().unwrap();
+
+        // Mudar outro campo não mexe na senha nem na chave.
+        b.atualizar(
+            &c,
+            &id,
+            json!({ "apelido": "novo" }).as_object().unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        let igual = b.auth_credenciais_por_id(&c, &id).await.unwrap().unwrap();
+        assert_eq!(antes.token_key, igual.token_key);
+        assert_eq!(antes.senha, igual.senha);
+
+        b.atualizar(
+            &c,
+            &id,
+            json!({ "password": "senha-nova-longa" })
+                .as_object()
+                .unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        let depois = b.auth_credenciais_por_id(&c, &id).await.unwrap().unwrap();
+        assert_ne!(antes.token_key, depois.token_key);
+        assert!(auth::conferir_senha(&depois.senha, "senha-nova-longa"));
+        assert!(!auth::conferir_senha(&depois.senha, "senha-bem-longa"));
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn regra_usa_a_macro_do_usuario_autenticado() {
+        let b = Banco::sqlite_memoria().await.unwrap();
+        let usuarios = b.criar_colecao(colecao_auth()).await.unwrap();
+        let u1 = b
+            .criar(
+                &usuarios,
+                json!({ "email": "u1@exemplo.com", "password": "senha-bem-longa" })
+                    .as_object()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let u2 = b
+            .criar(
+                &usuarios,
+                json!({ "email": "u2@exemplo.com", "password": "senha-bem-longa" })
+                    .as_object()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let notas: Collection = serde_json::from_value(json!({
+            "name": "notas",
+            "fields": [
+                { "name": "dono", "type": "text" },
+                { "name": "texto", "type": "text" }
+            ],
+            "listRule": "dono = @request.auth.id"
+        }))
+        .unwrap();
+        let notas = b.criar_colecao(notas).await.unwrap();
+        for (dono, texto) in [(&u1, "do u1"), (&u2, "do u2")] {
+            b.criar(
+                &notas,
+                json!({ "dono": dono["id"], "texto": texto })
+                    .as_object()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let ctx = Contexto {
+            auth: u1.as_object().cloned(),
+        };
+        let q = Consulta {
+            regra: notas.list_rule.clone(),
+            contexto: ctx,
+            ..Default::default()
+        };
+        let l = b.listar(&notas, &q).await.unwrap();
+        assert_eq!(l.total_items, 1);
+        assert_eq!(l.items[0]["texto"], json!("do u1"));
+
+        // Visitante (sem contexto): a macro vale vazio e nada aparece.
+        let q = Consulta {
+            regra: notas.list_rule.clone(),
+            ..Default::default()
+        };
+        let l = b.listar(&notas, &q).await.unwrap();
+        assert_eq!(l.total_items, 0);
     }
 }

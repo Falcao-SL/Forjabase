@@ -47,25 +47,17 @@ curl http://127.0.0.1:8090/api/health
 # {"code":200,"data":{},"message":"API is healthy."}
 ```
 
-### Escolher o motor do banco (funciona)
+### Motor do banco
 
-A API é a mesma nos três; muda só onde os dados ficam.
+SQLite é o motor suportado — um arquivo por projeto, nada para instalar.
 
 ```sh
-forja serve                                  # SQLite (padrão): forja_data/default/data.db
-forja serve --engine turso                   # Turso: o mesmo arquivo, escrita concorrente
-export FORJA_PG_URL='postgres://usuario:senha@host:5432/banco'
-forja serve --engine postgres                # Postgres: tabelas no esquema forja_default
+forja serve                                  # forja_data/default/data.db
 ```
 
-- **Supabase:** em *Project Settings → Database*, copie a *connection string*
-  e use-a em `FORJA_PG_URL`. A conexão usa TLS; acrescente `?sslmode=require`
-  para recusar conexão sem TLS.
-- Prefira a variável `FORJA_PG_URL` ao `--pg-url`: assim a senha não aparece
-  na lista de processos.
-- O motor vale para todos os comandos: `forja --engine postgres superuser upsert ...`.
-- `FORJA_ENGINE=postgres` faz o mesmo que `--engine postgres`.
-- Para trocar SQLite → Turso, basta mudar `--engine`: o Turso lê o arquivo do SQLite.
+Turso e PostgreSQL ainda compilam com `--features turso` / `--features postgres`,
+mas são **experimentais e sem suporte** ([ARQUITETURA](ARQUITETURA.md), decisão
+13): não entram no build padrão, não rodam no CI e podem quebrar entre versões.
 
 *(planejado)* `forja serve exemplo.com` com HTTPS automático, `--origins` para
 CORS, `--dev` para logs de SQL.
@@ -149,24 +141,45 @@ de validação vêm no formato do PocketBase:
 {"code":400,"message":"Failed to create record.","data":{"nome":{"code":"validation_required","message":"Cannot be blank."}}}
 ```
 
-*(planejado)* `expand`, `fields`, operadores `?=`, macros `@request`, `PATCH`
-de coleção, e a URL por projeto (`https://host/p/loja`).
+Regras e filtros já aceitam `@request.auth.*` (o registro autenticado).
+*(planejado)* `expand`, `fields`, operadores `?=`, as demais macros `@request`,
+`PATCH` de coleção, e a URL por projeto (`https://host/p/loja`).
 
 ## 6. Autenticação
 
 Superusuário: `auth-with-password` e `auth-refresh` em `_superusers` (seção 5),
-token no cabeçalho `Authorization` (puro ou com `Bearer `). Trocar a senha
-invalida os tokens antigos. *(planejado)* Usuários de coleções auth:
+token no cabeçalho `Authorization` (puro ou com `Bearer `). Usuários de coleções
+`auth` usam as mesmas rotas na própria coleção:
 
 ```sh
-curl -X POST https://host/p/loja/api/collections/users/auth-with-password \
+curl -X POST http://127.0.0.1:8090/api/collections/users/auth-with-password \
   -H "Content-Type: application/json" \
   -d '{"identity":"ana@exemplo.com","password":"..."}'
 # { "token": "...", "record": { ... } }
 ```
 
-OTP, MFA, OAuth2 (30 provedores), verificação de e-mail e redefinição de senha
-seguem as mesmas rotas do PocketBase (FUNCIONALIDADES §5).
+Criar uma coleção `auth` injeta os campos de sistema (`email`, `emailVisibility`,
+`verified`, `password`, `tokenKey`); o cadastro é o `POST` normal em `/records`
+quando a `createRule` permite. Verificação de e-mail, redefinição de senha e
+troca de e-mail enviam o link por e-mail — no desenvolvimento ele sai no stderr
+do servidor (`[email] ... confirm-verification?token=...`), sem SMTP.
+
+```text
+POST /api/collections/users/request-verification      {"email": "..."}
+POST /api/collections/users/confirm-verification      {"token": "..."}
+POST /api/collections/users/request-password-reset    {"email": "..."}
+POST /api/collections/users/confirm-password-reset    {"token": "...", "password": "...", "passwordConfirm": "..."}
+POST /api/collections/users/request-email-change      {"newEmail": "..."}   (autenticado)
+POST /api/collections/users/confirm-email-change      {"token": "...", "password": "..."}
+POST /api/collections/users/impersonate/<id>          {"duration": 3600}    (superusuário)
+```
+
+Trocar a senha (ou confirmar a troca de e-mail) rotaciona a `tokenKey` e invalida
+os tokens já emitidos. Nas regras, `@request.auth.*` vale o registro autenticado;
+para visitantes, vazio.
+
+OTP, MFA e OAuth2 (30 provedores) seguem as mesmas rotas do PocketBase
+(FUNCIONALIDADES §5).
 
 ## 7. Arquivos e tempo real *(planejado)*
 

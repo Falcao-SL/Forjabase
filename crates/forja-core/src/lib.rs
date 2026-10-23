@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 pub mod auth;
+pub mod correio;
 pub mod erro;
 pub mod filtro;
 pub mod id;
@@ -85,7 +86,23 @@ impl FieldType {
                 | FieldType::Date
                 | FieldType::Select
                 | FieldType::Json
+                | FieldType::Password
         )
+    }
+
+    /// Campos de sistema de uma coleção `auth`, na ordem em que aparecem.
+    /// O PocketBase cria os mesmos cinco em toda coleção de autenticação.
+    pub fn campos_auth() -> Vec<Field> {
+        let mut email = Field::sistema("email", FieldType::Email);
+        email.required = true;
+        let email_visibility = Field::sistema("emailVisibility", FieldType::Bool);
+        let verified = Field::sistema("verified", FieldType::Bool);
+        let mut senha = Field::sistema("password", FieldType::Password);
+        senha.required = true;
+        senha.hidden = true;
+        let mut token_key = Field::sistema("tokenKey", FieldType::Text);
+        token_key.hidden = true;
+        vec![email, email_visibility, verified, senha, token_key]
     }
 }
 
@@ -102,11 +119,28 @@ pub struct Field {
     pub required: bool,
     #[serde(default)]
     pub hidden: bool,
+    /// Campo gerenciado pelo sistema (só coleções `auth` têm): o usuário não
+    /// escolhe o nome nem o tipo.
+    #[serde(default)]
+    pub system: bool,
     #[serde(flatten)]
     pub options: Map<String, Value>,
 }
 
 impl Field {
+    /// Campo de sistema: nome, tipo e opções fixos, `system: true`.
+    pub fn sistema(name: &str, kind: FieldType) -> Field {
+        Field {
+            id: String::new(),
+            name: name.into(),
+            kind,
+            required: false,
+            hidden: false,
+            system: true,
+            options: Map::new(),
+        }
+    }
+
     pub fn opcao_f64(&self, nome: &str) -> Option<f64> {
         self.options.get(nome).and_then(Value::as_f64)
     }
@@ -160,8 +194,15 @@ impl Collection {
         self.fields.iter().find(|f| f.name == nome)
     }
 
-    /// Nomes que um filtro ou uma ordenação podem usar.
+    /// Nomes que um filtro ou uma ordenação podem usar. Senha e `tokenKey`
+    /// ficam de fora: não são consultáveis nem ordenáveis.
     pub fn coluna_valida(&self, nome: &str) -> bool {
+        if self
+            .campo(nome)
+            .is_some_and(|f| f.kind == FieldType::Password || (f.system && f.name == "tokenKey"))
+        {
+            return false;
+        }
         matches!(nome, "id" | "created" | "updated") || self.campo(nome).is_some()
     }
 }

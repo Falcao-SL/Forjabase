@@ -28,8 +28,10 @@ webpki-roots = { version = "1", optional = true }
 tempfile = "3.27.0"
 
 [features]
-# Os três motores vêm ligados; desligar um tira a dependência do executável.
-default = ["sqlite", "turso", "postgres"]
+# SQLite é o motor suportado (ARQUITETURA.md, decisão 1). Os outros dois
+# continuam compilando para não perder o trabalho, mas sem suporte:
+# `--features postgres` ou `--features turso` quando alguém for mexer neles.
+default = ["sqlite"]
 sqlite = ["dep:rusqlite"]
 turso = ["dep:turso"]
 postgres = [

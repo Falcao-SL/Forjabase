@@ -6,27 +6,39 @@ use axum::http::{StatusCode, request::Parts};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use forja_core::auth::{self, COLECAO_SUPERUSERS, VALIDADE_SUPERUSER};
-use forja_core::store::{Banco, Consulta, Motor, Superusuario};
-use forja_core::{Collection, Erro, Field};
+use forja_core::auth::{
+    self, COLECAO_SUPERUSERS, TIPO_AUTH, TIPO_REDEFINICAO, TIPO_TROCA_EMAIL, TIPO_VERIFICACAO,
+    VALIDADE_AUTH, VALIDADE_EMAIL, VALIDADE_SUPERUSER,
+};
+use forja_core::correio::{Console, Correio, Mensagem};
+use forja_core::filtro::Contexto;
+use forja_core::store::{Banco, Consulta, Credenciais, Motor, Superusuario};
+use forja_core::{Collection, CollectionType, Erro, Field};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-/// Estado compartilhado: o banco do projeto e o segredo dos tokens.
+/// Estado compartilhado: o banco do projeto, o segredo dos tokens e o correio.
 #[derive(Clone)]
 pub struct Estado {
     pub banco: Banco,
     pub segredo: Arc<String>,
+    pub correio: Arc<dyn Correio>,
 }
 
 impl Estado {
     pub async fn novo(banco: Banco) -> Result<Estado, Erro> {
+        Estado::com_correio(banco, Arc::new(Console)).await
+    }
+
+    /// Com um correio próprio (nos testes, o `Memoria`).
+    pub async fn com_correio(banco: Banco, correio: Arc<dyn Correio>) -> Result<Estado, Erro> {
         let segredo = banco.segredo().await?;
         Ok(Estado {
             banco,
             segredo: Arc::new(segredo),
+            correio,
         })
     }
 }
@@ -67,12 +79,20 @@ type Res<T> = Result<T, ErroApi>;
 
 // ── Autenticação ─────────────────────────────────────────────────────────
 
-/// Quem está chamando: nada ou um superusuário (usuários comuns vêm na 0.2).
-pub struct Chamador(pub Option<Superusuario>);
+/// Quem está chamando.
+pub enum Identidade {
+    Superusuario(Superusuario),
+    Registro {
+        colecao: Collection,
+        registro: Value,
+    },
+}
+
+pub struct Chamador(pub Option<Identidade>);
 
 impl Chamador {
     fn superusuario(&self) -> bool {
-        self.0.is_some()
+        matches!(self.0, Some(Identidade::Superusuario(_)))
     }
 
     fn exigir_superusuario(&self) -> Res<()> {
@@ -82,6 +102,24 @@ impl Chamador {
             Err(ErroApi(Erro::Proibido(
                 "Only superusers can perform this action.".into(),
             )))
+        }
+    }
+
+    /// O registro autenticado, quando é usuário de uma coleção `auth`.
+    fn registro(&self) -> Option<(&Collection, &Value)> {
+        match &self.0 {
+            Some(Identidade::Registro { colecao, registro }) => Some((colecao, registro)),
+            _ => None,
+        }
+    }
+
+    /// O que as macros `@request.auth.*` enxergam.
+    fn contexto(&self) -> Contexto {
+        match self.registro() {
+            Some((_, registro)) => Contexto {
+                auth: registro.as_object().cloned(),
+            },
+            None => Contexto::default(),
         }
     }
 }
@@ -111,18 +149,44 @@ impl FromRequestParts<Estado> for Chamador {
             return Ok(Chamador(None));
         }
         let claims = auth::validar(&e.segredo, &token).map_err(|_| token_invalido())?;
-        if claims.colecao != COLECAO_SUPERUSERS || claims.tipo != "auth" {
+        if claims.tipo != TIPO_AUTH {
             return Err(token_invalido());
         }
-        let su = e
+        if claims.colecao == COLECAO_SUPERUSERS {
+            let su = e
+                .banco
+                .superuser(&claims.id)
+                .await
+                .map_err(|_| token_invalido())?;
+            if su.token_key != claims.tk {
+                return Err(token_invalido());
+            }
+            return Ok(Chamador(Some(Identidade::Superusuario(su))));
+        }
+        // Usuário de uma coleção `auth`: o token vale enquanto a `tokenKey` bater.
+        let colecao = e
             .banco
-            .superuser(&claims.id)
+            .colecao(&claims.colecao)
             .await
             .map_err(|_| token_invalido())?;
-        if su.token_key != claims.tk {
+        if colecao.kind != CollectionType::Auth {
             return Err(token_invalido());
         }
-        Ok(Chamador(Some(su)))
+        let credenciais = e
+            .banco
+            .auth_credenciais_por_id(&colecao, &claims.id)
+            .await
+            .map_err(|_| token_invalido())?
+            .ok_or_else(token_invalido)?;
+        if credenciais.token_key != claims.tk {
+            return Err(token_invalido());
+        }
+        let registro = e
+            .banco
+            .registro(&colecao, &claims.id, None)
+            .await
+            .map_err(|_| token_invalido())?;
+        Ok(Chamador(Some(Identidade::Registro { colecao, registro })))
     }
 }
 
@@ -151,8 +215,8 @@ async fn superuser_login(State(e): State<Estado>, Json(l): Json<Login>) -> Res<J
 
 async fn superuser_refresh(State(e): State<Estado>, quem: Chamador) -> Res<Json<Value>> {
     match quem.0 {
-        Some(su) => resposta_auth(&e, su),
-        None => Err(ErroApi(Erro::NaoAutorizado(
+        Some(Identidade::Superusuario(su)) => resposta_auth(&e, su),
+        _ => Err(ErroApi(Erro::NaoAutorizado(
             "The request requires valid record authorization token.".into(),
         ))),
     }
@@ -225,13 +289,28 @@ fn regra_para(quem: &Chamador, regra: &Option<String>) -> Res<Option<String>> {
     }
 }
 
-/// Campos `hidden` só aparecem para superusuários.
+/// Campos `hidden` só aparecem para superusuários. E-mail de coleção `auth`
+/// só aparece para o próprio dono, para superusuários, ou se `emailVisibility`.
 fn esconder(c: &Collection, quem: &Chamador, mut v: Value) -> Value {
-    if !quem.superusuario()
-        && let Some(m) = v.as_object_mut()
-    {
+    if quem.superusuario() {
+        return v;
+    }
+    let dono = match (quem.registro(), v.get("id").and_then(Value::as_str)) {
+        (Some((colecao, registro)), Some(id)) => {
+            colecao.id == c.id && registro.get("id").and_then(Value::as_str) == Some(id)
+        }
+        _ => false,
+    };
+    let email_publico = v
+        .get("emailVisibility")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if let Some(m) = v.as_object_mut() {
         for f in c.fields.iter().filter(|f: &&Field| f.hidden) {
             m.remove(&f.name);
+        }
+        if c.kind == CollectionType::Auth && !dono && !email_publico {
+            m.remove("email");
         }
     }
     v
@@ -266,6 +345,7 @@ async fn registros_listar(
         por_pagina: p.per_page.unwrap_or(30),
         pular_total: p.skip_total.unwrap_or(false),
         regra,
+        contexto: quem.contexto(),
     };
     let mut lista = e.banco.listar(&c, &q).await?;
     lista.items = lista
@@ -283,7 +363,10 @@ async fn registros_ver(
 ) -> Res<Json<Value>> {
     let c = colecao_de(&e, nome).await?;
     let regra = regra_para(&quem, &c.view_rule)?;
-    let r = e.banco.registro(&c, &id, regra.as_deref()).await?;
+    let r = e
+        .banco
+        .registro_com(&c, &id, regra.as_deref(), &quem.contexto())
+        .await?;
     Ok(Json(esconder(&c, &quem, r)))
 }
 
@@ -291,15 +374,23 @@ async fn registros_criar(
     State(e): State<Estado>,
     quem: Chamador,
     Path(nome): Path<String>,
-    Json(dados): Json<Map<String, Value>>,
+    Json(mut dados): Json<Map<String, Value>>,
 ) -> Res<Json<Value>> {
     let c = colecao_de(&e, nome).await?;
+    // `verified` é de sistema: só superusuário marca e-mail como verificado.
+    if c.kind == CollectionType::Auth && !quem.superusuario() {
+        dados.remove("verified");
+    }
     let regra = regra_para(&quem, &c.create_rule)?;
     let r = e.banco.criar(&c, &dados).await?;
     // A regra de criação é conferida no registro criado; se não passar, ele sai.
     if let Some(regra) = regra {
         let id = r["id"].as_str().unwrap_or_default();
-        if e.banco.registro(&c, id, Some(&regra)).await.is_err() {
+        if e.banco
+            .registro_com(&c, id, Some(&regra), &quem.contexto())
+            .await
+            .is_err()
+        {
             e.banco.apagar(&c, id, None).await?;
             return Err(ErroApi(Erro::invalido("Failed to create record.")));
         }
@@ -311,11 +402,33 @@ async fn registros_atualizar(
     State(e): State<Estado>,
     quem: Chamador,
     Path((nome, id)): Path<(String, String)>,
-    Json(dados): Json<Map<String, Value>>,
+    Json(mut dados): Json<Map<String, Value>>,
 ) -> Res<Json<Value>> {
     let c = colecao_de(&e, nome).await?;
     let regra = regra_para(&quem, &c.update_rule)?;
-    let r = e.banco.atualizar(&c, &id, &dados, regra.as_deref()).await?;
+    // Campos de sistema de coleções `auth`.
+    if c.kind == CollectionType::Auth && !quem.superusuario() {
+        dados.remove("verified");
+        // Trocar o e-mail só pelo fluxo com token; aqui seria troca silenciosa.
+        if let Some(novo) = dados.get("email").and_then(Value::as_str) {
+            let atual = e.banco.registro(&c, &id, None).await?;
+            let atual = atual
+                .get("email")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !novo.trim().eq_ignore_ascii_case(atual) {
+                return Err(ErroApi(Erro::Proibido(
+                    "The email can be changed only by superusers or via the email change flow."
+                        .into(),
+                )));
+            }
+            dados.remove("email");
+        }
+    }
+    let r = e
+        .banco
+        .atualizar_com(&c, &id, &dados, regra.as_deref(), &quem.contexto())
+        .await?;
     Ok(Json(esconder(&c, &quem, r)))
 }
 
@@ -326,8 +439,370 @@ async fn registros_apagar(
 ) -> Res<StatusCode> {
     let c = colecao_de(&e, nome).await?;
     let regra = regra_para(&quem, &c.delete_rule)?;
-    e.banco.apagar(&c, &id, regra.as_deref()).await?;
+    e.banco
+        .apagar_com(&c, &id, regra.as_deref(), &quem.contexto())
+        .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ── Autenticação de usuários (coleções auth) ─────────────────────────────
+
+async fn colecao_auth(e: &Estado, nome: String) -> Res<Collection> {
+    let c = colecao_de(e, nome).await?;
+    if c.kind != CollectionType::Auth {
+        return Err(ErroApi(Erro::invalido("Not an auth collection.")));
+    }
+    Ok(c)
+}
+
+fn resposta_registro(
+    e: &Estado,
+    c: &Collection,
+    cred: &Credenciais,
+    registro: Value,
+) -> Res<Json<Value>> {
+    let token = auth::emitir_tipo(
+        &e.segredo,
+        &cred.id,
+        &c.id,
+        &cred.token_key,
+        TIPO_AUTH,
+        VALIDADE_AUTH,
+        None,
+    )?;
+    Ok(Json(json!({ "token": token, "record": registro })))
+}
+
+/// Link que vai no e-mail. Sem o endereço público do app nas configurações
+/// ainda, é relativo — o cliente junta com a URL base.
+fn link(colecao: &str, acao: &str, token: &str) -> String {
+    format!("/api/collections/{colecao}/{acao}?token={token}")
+}
+
+fn enviar(e: &Estado, para: &str, assunto: &str, corpo: String) {
+    e.correio.enviar(&Mensagem {
+        para: para.into(),
+        assunto: assunto.into(),
+        corpo,
+    });
+}
+
+fn email_valido(s: &str) -> bool {
+    let s = s.trim();
+    s.split_once('@').is_some_and(|(a, d)| {
+        !a.is_empty() && d.contains('.') && !d.starts_with('.') && !d.ends_with('.')
+    }) && !s.contains(char::is_whitespace)
+        && s.matches('@').count() == 1
+}
+
+fn nao_autorizado() -> ErroApi {
+    ErroApi(Erro::NaoAutorizado(
+        "The request requires valid record authorization token.".into(),
+    ))
+}
+
+async fn credenciais_de(e: &Estado, c: &Collection, id: &str) -> Res<Credenciais> {
+    e.banco
+        .auth_credenciais_por_id(c, id)
+        .await?
+        .ok_or_else(|| {
+            ErroApi(Erro::NaoEncontrado(
+                "The requested resource wasn't found.".into(),
+            ))
+        })
+}
+
+#[derive(Deserialize)]
+struct LoginAuth {
+    identity: String,
+    password: String,
+}
+
+async fn auth_com_senha(
+    State(e): State<Estado>,
+    Path(nome): Path<String>,
+    Json(l): Json<LoginAuth>,
+) -> Res<Json<Value>> {
+    let c = colecao_auth(&e, nome).await?;
+    let falha = || ErroApi(Erro::invalido("Failed to authenticate."));
+    let cred = e
+        .banco
+        .auth_credenciais(&c, &l.identity)
+        .await
+        .map_err(|_| falha())?
+        .ok_or_else(falha)?;
+    let (hash, senha) = (cred.senha.clone(), l.password);
+    let ok = tokio::task::spawn_blocking(move || auth::conferir_senha(&hash, &senha))
+        .await
+        .unwrap_or(false);
+    if !ok {
+        return Err(falha());
+    }
+    let registro = e.banco.registro(&c, &cred.id, None).await?;
+    resposta_registro(&e, &c, &cred, registro)
+}
+
+async fn auth_refresh(
+    State(e): State<Estado>,
+    quem: Chamador,
+    Path(nome): Path<String>,
+) -> Res<Json<Value>> {
+    let c = colecao_auth(&e, nome).await?;
+    let Some((colecao, registro)) = quem.registro() else {
+        return Err(nao_autorizado());
+    };
+    if colecao.id != c.id {
+        return Err(nao_autorizado());
+    }
+    let id = registro["id"].as_str().unwrap_or_default().to_string();
+    let cred = credenciais_de(&e, &c, &id).await?;
+    resposta_registro(&e, &c, &cred, registro.clone())
+}
+
+#[derive(Deserialize)]
+struct SoEmail {
+    email: String,
+}
+
+async fn pedir_verificacao(
+    State(e): State<Estado>,
+    Path(nome): Path<String>,
+    Json(p): Json<SoEmail>,
+) -> Res<StatusCode> {
+    let c = colecao_auth(&e, nome).await?;
+    if let Some(cred) = e.banco.auth_credenciais(&c, &p.email).await?
+        && !cred.verified
+    {
+        let token = auth::emitir_tipo(
+            &e.segredo,
+            &cred.id,
+            &c.id,
+            &cred.token_key,
+            TIPO_VERIFICACAO,
+            VALIDADE_EMAIL,
+            None,
+        )?;
+        enviar(
+            &e,
+            &cred.email,
+            "Verifique seu e-mail",
+            link(&c.name, "confirm-verification", &token),
+        );
+    }
+    // Sempre 204: não se revela se o e-mail existe.
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct ComToken {
+    token: String,
+}
+
+async fn confirmar_verificacao(
+    State(e): State<Estado>,
+    Path(nome): Path<String>,
+    Json(p): Json<ComToken>,
+) -> Res<StatusCode> {
+    let c = colecao_auth(&e, nome).await?;
+    let claims = auth::validar(&e.segredo, &p.token)?;
+    let cred = credenciais_de(&e, &c, &claims.id).await?;
+    if claims.tipo != TIPO_VERIFICACAO || claims.colecao != c.id || claims.tk != cred.token_key {
+        return Err(ErroApi(Erro::invalido("Invalid verification token.")));
+    }
+    e.banco.auth_verificar(&c, &cred.id, None).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn pedir_redefinicao(
+    State(e): State<Estado>,
+    Path(nome): Path<String>,
+    Json(p): Json<SoEmail>,
+) -> Res<StatusCode> {
+    let c = colecao_auth(&e, nome).await?;
+    if let Some(cred) = e.banco.auth_credenciais(&c, &p.email).await? {
+        let token = auth::emitir_tipo(
+            &e.segredo,
+            &cred.id,
+            &c.id,
+            &cred.token_key,
+            TIPO_REDEFINICAO,
+            VALIDADE_EMAIL,
+            None,
+        )?;
+        enviar(
+            &e,
+            &cred.email,
+            "Redefinição de senha",
+            link(&c.name, "confirm-password-reset", &token),
+        );
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NovaSenha {
+    token: String,
+    password: String,
+    password_confirm: Option<String>,
+}
+
+async fn confirmar_redefinicao(
+    State(e): State<Estado>,
+    Path(nome): Path<String>,
+    Json(p): Json<NovaSenha>,
+) -> Res<StatusCode> {
+    let c = colecao_auth(&e, nome).await?;
+    let claims = auth::validar(&e.segredo, &p.token)?;
+    let cred = credenciais_de(&e, &c, &claims.id).await?;
+    if claims.tipo != TIPO_REDEFINICAO || claims.colecao != c.id || claims.tk != cred.token_key {
+        return Err(ErroApi(Erro::invalido("Invalid password reset token.")));
+    }
+    if let Some(confirmacao) = &p.password_confirm
+        && confirmacao != &p.password
+    {
+        return Err(ErroApi(Erro::campo(
+            "passwordConfirm",
+            "validation_password_mismatch",
+            "Passwords do not match.",
+        )));
+    }
+    let mut dados = Map::new();
+    dados.insert("password".into(), json!(p.password));
+    // A troca de senha também rotaciona a `tokenKey` e invalida os tokens.
+    e.banco.atualizar(&c, &cred.id, &dados, None).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TrocaEmail {
+    new_email: String,
+}
+
+async fn pedir_troca_email(
+    State(e): State<Estado>,
+    quem: Chamador,
+    Path(nome): Path<String>,
+    Json(p): Json<TrocaEmail>,
+) -> Res<StatusCode> {
+    let c = colecao_auth(&e, nome).await?;
+    let Some((colecao, _)) = quem.registro() else {
+        return Err(nao_autorizado());
+    };
+    if colecao.id != c.id {
+        return Err(nao_autorizado());
+    }
+    let novo = p.new_email.trim().to_string();
+    if !email_valido(&novo) {
+        return Err(ErroApi(Erro::campo(
+            "newEmail",
+            "validation_is_email",
+            "Must be a valid email address.",
+        )));
+    }
+    let id = quem
+        .registro()
+        .map(|(_, r)| r["id"].as_str().unwrap_or_default())
+        .unwrap_or_default();
+    let cred = credenciais_de(&e, &c, id).await?;
+    if let Some(outro) = e.banco.auth_credenciais(&c, &novo).await?
+        && outro.id != cred.id
+    {
+        return Err(ErroApi(Erro::campo(
+            "newEmail",
+            "validation_not_unique",
+            "The email is invalid or already in use.",
+        )));
+    }
+    let token = auth::emitir_tipo(
+        &e.segredo,
+        &cred.id,
+        &c.id,
+        &cred.token_key,
+        TIPO_TROCA_EMAIL,
+        VALIDADE_EMAIL,
+        Some(novo.clone()),
+    )?;
+    enviar(
+        &e,
+        &novo,
+        "Confirme seu novo e-mail",
+        link(&c.name, "confirm-email-change", &token),
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct ConfirmarTrocaEmail {
+    token: String,
+    password: String,
+}
+
+async fn confirmar_troca_email(
+    State(e): State<Estado>,
+    Path(nome): Path<String>,
+    Json(p): Json<ConfirmarTrocaEmail>,
+) -> Res<StatusCode> {
+    let c = colecao_auth(&e, nome).await?;
+    let claims = auth::validar(&e.segredo, &p.token)?;
+    let cred = credenciais_de(&e, &c, &claims.id).await?;
+    if claims.tipo != TIPO_TROCA_EMAIL || claims.colecao != c.id || claims.tk != cred.token_key {
+        return Err(ErroApi(Erro::invalido("Invalid email change token.")));
+    }
+    let (hash, senha) = (cred.senha.clone(), p.password);
+    let ok = tokio::task::spawn_blocking(move || auth::conferir_senha(&hash, &senha))
+        .await
+        .unwrap_or(false);
+    if !ok {
+        return Err(ErroApi(Erro::invalido("Failed to authenticate.")));
+    }
+    let novo = claims
+        .email
+        .ok_or_else(|| ErroApi(Erro::invalido("Invalid email change token.")))?;
+    if let Some(outro) = e.banco.auth_credenciais(&c, &novo).await?
+        && outro.id != cred.id
+    {
+        return Err(ErroApi(Erro::campo(
+            "email",
+            "validation_not_unique",
+            "The email is invalid or already in use.",
+        )));
+    }
+    e.banco.auth_verificar(&c, &cred.id, Some(&novo)).await?;
+    // Rotaciona a `tokenKey` sem mudar o hash da senha.
+    e.banco
+        .auth_definir_senha(&c, &cred.id, &cred.senha)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct Personificar {
+    duration: Option<u64>,
+}
+
+async fn personificar(
+    State(e): State<Estado>,
+    quem: Chamador,
+    Path((nome, id)): Path<(String, String)>,
+    Json(p): Json<Personificar>,
+) -> Res<Json<Value>> {
+    quem.exigir_superusuario()?;
+    let c = colecao_auth(&e, nome).await?;
+    let cred = credenciais_de(&e, &c, &id).await?;
+    let validade = p.duration.unwrap_or(3_600).clamp(1, 604_800);
+    let token = auth::emitir_tipo(
+        &e.segredo,
+        &cred.id,
+        &c.id,
+        &cred.token_key,
+        TIPO_AUTH,
+        validade,
+        None,
+    )?;
+    let registro = e.banco.registro(&c, &id, None).await?;
+    Ok(Json(json!({ "token": token, "record": registro })))
 }
 
 // ── Rotas ────────────────────────────────────────────────────────────────
@@ -366,6 +841,42 @@ pub fn router(e: Estado) -> Router {
             get(registros_ver)
                 .patch(registros_atualizar)
                 .delete(registros_apagar),
+        )
+        .route(
+            "/api/collections/{colecao}/auth-with-password",
+            post(auth_com_senha),
+        )
+        .route(
+            "/api/collections/{colecao}/auth-refresh",
+            post(auth_refresh),
+        )
+        .route(
+            "/api/collections/{colecao}/request-verification",
+            post(pedir_verificacao),
+        )
+        .route(
+            "/api/collections/{colecao}/confirm-verification",
+            post(confirmar_verificacao),
+        )
+        .route(
+            "/api/collections/{colecao}/request-password-reset",
+            post(pedir_redefinicao),
+        )
+        .route(
+            "/api/collections/{colecao}/confirm-password-reset",
+            post(confirmar_redefinicao),
+        )
+        .route(
+            "/api/collections/{colecao}/request-email-change",
+            post(pedir_troca_email),
+        )
+        .route(
+            "/api/collections/{colecao}/confirm-email-change",
+            post(confirmar_troca_email),
+        )
+        .route(
+            "/api/collections/{colecao}/impersonate/{id}",
+            post(personificar),
         )
         .with_state(e)
 }
@@ -651,5 +1162,423 @@ mod tests {
         assert_eq!(s, StatusCode::NO_CONTENT);
         let (s, v) = chamar(&e, "GET", "/api/collections/posts/records", Some(&t), None).await;
         assert_eq!(s, StatusCode::NOT_FOUND, "{v}");
+    }
+
+    use forja_core::correio::Memoria;
+
+    async fn estado_com_memoria() -> (Estado, Arc<Memoria>) {
+        let memoria = Arc::new(Memoria::default());
+        let banco = Banco::sqlite_memoria().await.unwrap();
+        let e = Estado::com_correio(banco, memoria.clone()).await.unwrap();
+        (e, memoria)
+    }
+
+    fn token_do_email(memoria: &Memoria) -> String {
+        let m = memoria.ultima().expect("nenhum e-mail enviado");
+        m.corpo
+            .split("token=")
+            .nth(1)
+            .expect("link sem token")
+            .to_string()
+    }
+
+    async fn colecao_usuarios(e: &Estado, admin: &str, list_rule: Value) -> Value {
+        let (s, v) = chamar(
+            e,
+            "POST",
+            "/api/collections",
+            Some(admin),
+            Some(json!({
+                "name": "usuarios",
+                "type": "auth",
+                "fields": [{ "name": "nome", "type": "text" }],
+                "listRule": list_rule,
+                "viewRule": "",
+                "createRule": "",
+                "updateRule": "id = @request.auth.id",
+                "deleteRule": null
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        v
+    }
+
+    async fn cadastrar(e: &Estado, email: &str, senha: &str) -> Value {
+        let (s, v) = chamar(
+            e,
+            "POST",
+            "/api/collections/usuarios/records",
+            None,
+            Some(json!({ "email": email, "password": senha, "nome": "Alguém" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        v
+    }
+
+    #[tokio::test]
+    async fn fluxo_completo_de_autenticacao() {
+        let (e, memoria) = estado_com_memoria().await;
+        let admin = login(&e).await;
+        let c = colecao_usuarios(&e, &admin, json!("id = @request.auth.id")).await;
+        let sistemas: Vec<_> = c["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["system"] == json!(true))
+            .map(|f| f["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            sistemas,
+            vec![
+                "email",
+                "emailVisibility",
+                "verified",
+                "password",
+                "tokenKey"
+            ]
+        );
+
+        let ana = cadastrar(&e, "Ana@Exemplo.com", "senha-bem-longa").await;
+        assert!(ana.get("password").is_none(), "{ana}");
+        assert!(ana.get("tokenKey").is_none());
+        assert_eq!(ana["verified"], json!(false));
+        let ana_id = ana["id"].as_str().unwrap().to_string();
+        // O visitante que cadastrou não é o dono: o e-mail não volta na resposta.
+        assert!(ana.get("email").is_none(), "{ana}");
+        let (_, v) = chamar(
+            &e,
+            "GET",
+            &format!("/api/collections/usuarios/records/{ana_id}"),
+            Some(&admin),
+            None,
+        )
+        .await;
+        assert_eq!(v["email"], json!("Ana@Exemplo.com"));
+
+        // E-mail repetido, sem diferenciar maiúsculas.
+        let (s, v) = chamar(
+            &e,
+            "POST",
+            "/api/collections/usuarios/records",
+            None,
+            Some(json!({ "email": "ANA@exemplo.com", "password": "outra-bem-longa" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["data"]["email"]["code"], json!("validation_not_unique"));
+
+        // Senha curta não passa.
+        let (s, v) = chamar(
+            &e,
+            "POST",
+            "/api/collections/usuarios/records",
+            None,
+            Some(json!({ "email": "curta@exemplo.com", "password": "123" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(
+            v["data"]["password"]["code"],
+            json!("validation_min_text_constraint")
+        );
+
+        let (s, _) = chamar(
+            &e,
+            "POST",
+            "/api/collections/usuarios/auth-with-password",
+            None,
+            Some(json!({ "identity": "ana@exemplo.com", "password": "errada" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+
+        let (s, v) = chamar(
+            &e,
+            "POST",
+            "/api/collections/usuarios/auth-with-password",
+            None,
+            Some(json!({ "identity": "ana@exemplo.com", "password": "senha-bem-longa" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let token = v["token"].as_str().unwrap().to_string();
+        assert_eq!(v["record"]["id"], json!(ana_id));
+
+        // Refresh e a regra `id = @request.auth.id`.
+        let auth = format!("Bearer {token}");
+        let (s, v) = chamar(
+            &e,
+            "POST",
+            "/api/collections/usuarios/auth-refresh",
+            Some(&auth),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let (s, v) = chamar(
+            &e,
+            "GET",
+            "/api/collections/usuarios/records",
+            Some(&auth),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v["totalItems"], json!(1), "{v}");
+
+        // Verificação de e-mail.
+        let (s, _) = chamar(
+            &e,
+            "POST",
+            "/api/collections/usuarios/request-verification",
+            None,
+            Some(json!({ "email": "ana@exemplo.com" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+        let token_verificacao = token_do_email(&memoria);
+        let (s, v) = chamar(
+            &e,
+            "POST",
+            "/api/collections/usuarios/confirm-verification",
+            None,
+            Some(json!({ "token": token_verificacao })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NO_CONTENT, "{v}");
+        let (_, v) = chamar(
+            &e,
+            "GET",
+            &format!("/api/collections/usuarios/records/{ana_id}"),
+            Some(&auth),
+            None,
+        )
+        .await;
+        assert_eq!(v["verified"], json!(true));
+
+        // Troca de e-mail.
+        memoria.limpar();
+        let (s, v) = chamar(
+            &e,
+            "POST",
+            "/api/collections/usuarios/request-email-change",
+            Some(&auth),
+            Some(json!({ "newEmail": "ana.nova@exemplo.com" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NO_CONTENT, "{v}");
+        let token_email = token_do_email(&memoria);
+        let (s, v) = chamar(
+            &e,
+            "POST",
+            "/api/collections/usuarios/confirm-email-change",
+            None,
+            Some(json!({ "token": token_email, "password": "senha-bem-longa" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NO_CONTENT, "{v}");
+        let (s, _) = chamar(
+            &e,
+            "POST",
+            "/api/collections/usuarios/auth-with-password",
+            None,
+            Some(json!({ "identity": "ana@exemplo.com", "password": "senha-bem-longa" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "o e-mail antigo devia sair");
+        let (s, v) = chamar(
+            &e,
+            "POST",
+            "/api/collections/usuarios/auth-with-password",
+            None,
+            Some(json!({ "identity": "ana.nova@exemplo.com", "password": "senha-bem-longa" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+
+        // Redefinição de senha.
+        memoria.limpar();
+        let (s, _) = chamar(
+            &e,
+            "POST",
+            "/api/collections/usuarios/request-password-reset",
+            None,
+            Some(json!({ "email": "ana.nova@exemplo.com" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+        let token_redefinicao = token_do_email(&memoria);
+        let (s, v) = chamar(
+            &e,
+            "POST",
+            "/api/collections/usuarios/confirm-password-reset",
+            None,
+            Some(json!({
+                "token": token_redefinicao,
+                "password": "senha-muito-longa",
+                "passwordConfirm": "senha-muito-longa"
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NO_CONTENT, "{v}");
+        let (s, _) = chamar(
+            &e,
+            "POST",
+            "/api/collections/usuarios/auth-with-password",
+            None,
+            Some(json!({ "identity": "ana.nova@exemplo.com", "password": "senha-bem-longa" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "a senha antiga devia sair");
+        let (s, v) = chamar(
+            &e,
+            "POST",
+            "/api/collections/usuarios/auth-with-password",
+            None,
+            Some(json!({ "identity": "ana.nova@exemplo.com", "password": "senha-muito-longa" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+
+        // O token emitido antes da troca de senha não vale mais.
+        let (s, _) = chamar(
+            &e,
+            "GET",
+            "/api/collections/usuarios/records",
+            Some(&auth),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn campos_de_sistema_nao_sao_editaveis() {
+        let (e, _) = estado_com_memoria().await;
+        let admin = login(&e).await;
+        colecao_usuarios(&e, &admin, json!("")).await;
+        let (s, ana) = chamar(
+            &e,
+            "POST",
+            "/api/collections/usuarios/records",
+            None,
+            Some(json!({
+                "email": "ana@exemplo.com",
+                "password": "senha-bem-longa",
+                "verified": true
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{ana}");
+        assert_eq!(ana["verified"], json!(false), "{ana}");
+        let id = ana["id"].as_str().unwrap().to_string();
+
+        let (_, v) = chamar(
+            &e,
+            "POST",
+            "/api/collections/usuarios/auth-with-password",
+            None,
+            Some(json!({ "identity": "ana@exemplo.com", "password": "senha-bem-longa" })),
+        )
+        .await;
+        let auth = format!("Bearer {}", v["token"].as_str().unwrap());
+        let rota = format!("/api/collections/usuarios/records/{id}");
+
+        // O dono não se marca como verificado...
+        let (s, v) = chamar(
+            &e,
+            "PATCH",
+            &rota,
+            Some(&auth),
+            Some(json!({ "verified": true, "nome": "Ana" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["verified"], json!(false));
+
+        // ...nem troca o e-mail sem o fluxo com token.
+        let (s, v) = chamar(
+            &e,
+            "PATCH",
+            &rota,
+            Some(&auth),
+            Some(json!({ "email": "outro@exemplo.com" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{v}");
+    }
+
+    #[tokio::test]
+    async fn personificar_e_visibilidade_do_email() {
+        let (e, _) = estado_com_memoria().await;
+        let admin = login(&e).await;
+        colecao_usuarios(&e, &admin, json!("")).await;
+        let ana = cadastrar(&e, "ana@exemplo.com", "senha-bem-longa").await;
+        let ana_id = ana["id"].as_str().unwrap().to_string();
+        cadastrar(&e, "bia@exemplo.com", "senha-bem-longa").await;
+
+        // Visitante lista (regra pública) e não vê e-mail.
+        let (s, v) = chamar(&e, "GET", "/api/collections/usuarios/records", None, None).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["totalItems"], json!(2));
+        assert!(v["items"][0].get("email").is_none(), "{v}");
+        assert!(v["items"][0].get("emailVisibility").is_some());
+        assert!(v["items"][0].get("verified").is_some());
+
+        // Superusuário pode personificar, e o token resultante é do usuário.
+        let (s, v) = chamar(
+            &e,
+            "POST",
+            &format!("/api/collections/usuarios/impersonate/{ana_id}"),
+            Some(&admin),
+            Some(json!({ "duration": 600 })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let token = format!("Bearer {}", v["token"].as_str().unwrap());
+
+        // O dono vê o próprio e-mail, mesmo com `emailVisibility` falso.
+        let (s, v) = chamar(
+            &e,
+            "GET",
+            &format!("/api/collections/usuarios/records/{ana_id}"),
+            Some(&token),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["email"], json!("ana@exemplo.com"));
+
+        // Com `emailVisibility` ligado, o visitante vê o e-mail.
+        let (s, v) = chamar(
+            &e,
+            "PATCH",
+            &format!("/api/collections/usuarios/records/{ana_id}"),
+            Some(&admin),
+            Some(json!({ "emailVisibility": true })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let (_, v) = chamar(&e, "GET", "/api/collections/usuarios/records", None, None).await;
+        let item = v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["id"] == json!(ana_id))
+            .unwrap();
+        assert_eq!(item["email"], json!("ana@exemplo.com"));
+
+        // Outro usuário não pode se passar por ninguém.
+        let (s, _) = chamar(
+            &e,
+            "POST",
+            &format!("/api/collections/usuarios/impersonate/{ana_id}"),
+            Some(&token),
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
     }
 }
