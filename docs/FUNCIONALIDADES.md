@@ -76,7 +76,7 @@ Versão atual: **0.0.2**. O Forja só vira **1.0.0** quando estiver estável
 |---|---|
 | Tipo **base** | ✅ |
 | Tipo **auth** (campos de sistema, e-mail único sem diferenciar maiúsculas e senha em Argon2id) | ✅ |
-| Tipo **view** (consulta SQL somente leitura) | ✅ (modelo) · 📋 (comportamento) |
+| Tipo **view** (consulta SQL somente leitura) | ✅ |
 | Listar, criar, ver e apagar coleções (`/api/collections`) | ✅ |
 | Atualizar coleção (`PATCH`, com mudança de campos) | 📋 |
 | Importar coleções em lote (`PUT /api/collections/import`) | 📋 |
@@ -117,7 +117,8 @@ com uma mensagem clara. "✅" quer dizer validado e guardado.
 | Regras de auth: login (`authRule`) e gerenciar outros usuários (`manageRule`) | 📋 |
 | Regra nula = só superusuário; `""` = público | ✅ |
 | Regras com `@request.auth.*` | ✅ |
-| Regras com `@request.body.*`, `@request.query.*`, `@request.headers.*`, `@request.context` e `@collection.*` | 📋 |
+| Regras com `@collection.colecao.campo` (join por `EXISTS`) | ✅ |
+| Regras com `@request.body.*`, `@request.query.*`, `@request.headers.*` e `@request.context` | 📋 |
 
 ## 4. Registros (CRUD) e consulta
 

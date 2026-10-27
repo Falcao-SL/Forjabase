@@ -152,12 +152,14 @@ de validação vêm no formato do PocketBase:
 {"code":400,"message":"Failed to create record.","data":{"nome":{"code":"validation_required","message":"Cannot be blank."}}}
 ```
 
-Regras e filtros já aceitam `@request.auth.*` (o registro autenticado).
+Regras e filtros já aceitam `@request.auth.*` (o registro autenticado) e
+`@collection.colecao.campo` (uma linha de outra coleção, via `EXISTS`).
+No `filter` da URL, `@request` e `@collection` são só do superusuário.
 `expand` direto, aninhado e reverso já responde em listar, ver, criar e
-atualizar.
-*(planejado)* `fields`, operadores `?=`, as demais macros `@request` e
-`@collection`, coleções `view`, `PATCH` de coleção, e a URL por projeto
-(`https://host/p/loja`).
+atualizar. Coleção `view` (`"type": "view"`, `"viewQuery": "SELECT id, …"`)
+lista e mostra; criar, atualizar e apagar registro nela falham.
+*(planejado)* `fields`, operadores `?=`, as demais macros `@request`,
+`PATCH` de coleção, e a URL por projeto (`https://host/p/loja`).
 
 ## 6. Autenticação
 

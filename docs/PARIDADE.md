@@ -31,8 +31,8 @@ Três consequências:
 | Filtros, ordenação, paginação | ✅ | ✅ | ✅ | feito |
 | Superusuário, impersonate | ✅ | ✅ (console) | ✅ | feito |
 | E-mail: verificação, senha, troca | ✅ | ✅ | ✅ (console; SMTP na 0.5) | feito |
-| Relações + `expand` | ✅ | ✅ | ✅ (falta `view`) | 0.2 |
-| Views (SQL somente leitura) | ✅ | ⛔ | 📋 | 0.2 |
+| Relações + `expand` | ✅ | ✅ | ✅ | 0.2 |
+| Views (SQL somente leitura) | ✅ | ⛔ | ✅ | 0.2 |
 | Arquivos + miniaturas | ✅ | ✅ (buckets) | 📋 | 0.3 |
 | Lote (`/api/batch`) | ✅ | ⛔ | 📋 | 0.3 |
 | Tempo real | ✅ (SSE) | ✅ (WebSocket) | 📋 | 0.3 |
@@ -74,8 +74,7 @@ o caso de uso com um contrato só) e a arquitetura de containers.
 
 | Recurso | Detalhe que importa | Onda |
 |---|---|---|
-| `view` e `@collection.*` | O que ainda fecha a 0.2. `relation`, cascata e `expand` (direto, aninhado e reverso) já estão. | 0.2 |
-| Operadores `?=`, `?~`, `:isset`, `:changed`, `:length`, `:each` | Filtros de lista JSON e regras de transição (`status:changed`). | 0.2/0.3 |
+| Operadores `?=`, `?~`, `:isset`, `:changed`, `:length`, `:each` | Filtros de lista JSON e regras de transição (`status:changed`). `view` e `@collection.*` (com `=`, `~` e os outros operadores já existentes) fecharam a 0.2. | 0.3 |
 | `file` com miniaturas e URL assinada | Upload, recorte e proteção. | 0.3 |
 | SSE com filtro por regra | O cliente só recebe o que pode ver. | 0.3 |
 | `_settings`, logs, cron, rate limit | Operação de verdade, sem SSH. | 0.5 |
@@ -90,8 +89,8 @@ o caso de uso com um contrato só) e a arquitetura de containers.
 
 Ordem por **impacto no app real**, não por tamanho:
 
-1. **0.2 — Views e `@collection.*`.** Relação, cascata e `expand` já evitam o
-   N+1. Falta a coleção somente leitura e a macro que olha outra coleção.
+1. **0.2 — Views e `@collection.*`.** Feito. Relação, cascata e `expand` evitam
+   o N+1; a view é a consulta somente leitura; `@collection` olha outra coleção.
 2. **0.3 — Arquivos, lote e tempo real.** Fecha o trio que faz um app parecer
    pronto: anexo, upload em lote e atualização ao vivo.
 3. **0.4 — Painel.** Quem não programa precisa criar coleção e ver registro.

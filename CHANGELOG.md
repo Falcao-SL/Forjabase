@@ -2,6 +2,13 @@
 
 ## Não lançado
 
+- Coleções `view`: `viewQuery` é um único `SELECT` (ou `WITH`) com coluna `id`.
+  Os outros nomes viram campos, inferidos do tipo SQL. O registro é somente
+  leitura (API e painel). Apagar uma coleção que uma view ainda cita é recusado.
+- Macro `@collection.colecao.campo` em regras e no filtro do superusuário. Vira
+  `EXISTS`: predicados no mesmo `&&` valem para uma linha da outra coleção;
+  um `||` separa os grupos. No `filter` da query string, visitante não pode
+  usar `@collection` nem `@request` (403).
 - Barramento de escrita (ADR-001, M1): depois do commit, `criar`, `atualizar`
   e `apagar` publicam `Evento { colecao, acao, id }` num `tokio::broadcast`.
   Vale também para senha, verificação de e-mail, superusuário e cada registro

@@ -170,7 +170,7 @@ Transformação de imagem (miniatura) fica: é arquivo, onda 0.3, no processo.
 
 ## Marco seguinte — M1, barramento de escrita
 
-A 0.2 (relação, cascata, `expand`, view) continua sendo o próximo marco de **produto**. O próximo marco de **arquitetura**, e ele entra antes da cascata espalhar escrita, é:
+A 0.2 (relação, cascata, `expand`, view, `@collection.*`) fechou em 2026-10-27. O marco de **arquitetura** que entrou antes da cascata espalhar escrita foi:
 
 1. `forja-core` ganha um `Barramento` (`tokio::broadcast`) no `Banco`.
 2. `criar`, `atualizar*` e `apagar*` publicam `Evento { colecao, acao, id }` depois do commit.
