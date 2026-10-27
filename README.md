@@ -51,7 +51,7 @@ The architecture lock (one binary, what is in the core):
 ## Quick start
 
 ```sh
-git clone https://github.com/iramarfalcao/forjabase.git
+git clone https://github.com/iramarfalcao/Forjabase.git
 cd forjabase
 cargo run -p forja -- superuser upsert admin@example.com 'a-strong-password'
 cargo run -p forja -- serve

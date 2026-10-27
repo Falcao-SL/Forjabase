@@ -6,6 +6,6 @@ members = ["crates/forja", "crates/forja-core", "crates/forja-server", "crates/f
 version = "0.0.3"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/iramarfalcao/forjabase"
+repository = "https://github.com/iramarfalcao/Forjabase"
 authors = ["Iramar Falcão <juniorjunior331@gmail.com>"]
 rust-version = "1.99"

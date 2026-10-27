@@ -24,7 +24,7 @@ Requisitos: Rust estável recente (`rustup`). Não há etapa de build de
 front-end: o painel vai junto com o binário.
 
 ```sh
-git clone https://github.com/iramarfalcao/forjabase.git
+git clone https://github.com/iramarfalcao/Forjabase.git
 cd forjabase
 cargo build --release -p forja
 ./target/release/forja --version     # forja 0.0.3
