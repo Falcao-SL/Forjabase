@@ -237,8 +237,15 @@ pub fn colecao(c: &Collection, lista: &Lista, filtro: &str) -> Markup {
             h1 { (c.name) }
             span .contagem { (tipo_nome(c.kind)) " · " (lista.total_items) " registros" }
             div .acoes {
-                a .botao.solido href=(format!("/_/collections/{}/new", c.name)) { "Novo" }
+                @if c.kind == CollectionType::View {
+                    span .etiqueta { "somente leitura" }
+                } @else {
+                    a .botao.solido href=(format!("/_/collections/{}/new", c.name)) { "Novo" }
+                }
             }
+        }
+        @if let Some(q) = &c.view_query {
+            p { code { (q) } }
         }
         form .busca
              hx-get=(format!("/_/collections/{}/tabela", c.name))
@@ -277,17 +284,25 @@ pub fn tabela(c: &Collection, lista: &Lista, filtro: &str) -> Markup {
                         @for r in &lista.items {
                             @let id = r["id"].as_str().unwrap_or_default();
                             tr {
-                                td { a href=(format!("/_/collections/{}/records/{id}", c.name)) { (id) } }
+                                td {
+                                    @if c.kind == CollectionType::View {
+                                        (id)
+                                    } @else {
+                                        a href=(format!("/_/collections/{}/records/{id}", c.name)) { (id) }
+                                    }
+                                }
                                 @for f in &colunas {
                                     td { (valor_curto(r.get(&f.name))) }
                                 }
                                 td .direita {
-                                    a .botao href=(format!("/_/collections/{}/records/{id}", c.name)) { "Editar" }
-                                    button .botao.perigo type="button"
-                                        hx-post=(format!("/_/collections/{}/records/{id}/delete", c.name))
-                                        hx-confirm="Apagar este registro?"
-                                        hx-target="#tabela"
-                                        hx-swap="outerHTML" { "Apagar" }
+                                    @if c.kind != CollectionType::View {
+                                        a .botao href=(format!("/_/collections/{}/records/{id}", c.name)) { "Editar" }
+                                        button .botao.perigo type="button"
+                                            hx-post=(format!("/_/collections/{}/records/{id}/delete", c.name))
+                                            hx-confirm="Apagar este registro?"
+                                            hx-target="#tabela"
+                                            hx-swap="outerHTML" { "Apagar" }
+                                    }
                                 }
                             }
                         }

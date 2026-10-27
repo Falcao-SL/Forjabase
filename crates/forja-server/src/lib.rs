@@ -472,6 +472,7 @@ async fn registros_listar(
         pular_total: p.skip_total.unwrap_or(false),
         regra,
         contexto: quem.contexto(),
+        superusuario: quem.superusuario(),
     };
     let mut lista = e.banco.listar(&c, &q).await?;
     if let Some(exp) = p.expand.filter(|s| !s.trim().is_empty()) {
@@ -515,6 +516,14 @@ async fn registros_ver(
     Ok(Json(apresentar(&e, &quem, &c, r).await))
 }
 
+fn exigir_gravavel(c: &Collection) -> Res<()> {
+    if c.kind == CollectionType::View {
+        Err(ErroApi(Erro::invalido("The collection is not writable.")))
+    } else {
+        Ok(())
+    }
+}
+
 async fn registros_criar(
     State(e): State<Estado>,
     quem: Chamador,
@@ -523,6 +532,7 @@ async fn registros_criar(
     Json(mut dados): Json<Map<String, Value>>,
 ) -> Res<Json<Value>> {
     let c = colecao_de(&e, nome).await?;
+    exigir_gravavel(&c)?;
     // `verified` é de sistema: só superusuário marca e-mail como verificado.
     if c.kind == CollectionType::Auth && !quem.superusuario() {
         dados.remove("verified");
@@ -563,6 +573,7 @@ async fn registros_atualizar(
     Json(mut dados): Json<Map<String, Value>>,
 ) -> Res<Json<Value>> {
     let c = colecao_de(&e, nome).await?;
+    exigir_gravavel(&c)?;
     let regra = regra_para(&quem, &c.update_rule)?;
     // Campos de sistema de coleções `auth`.
     if c.kind == CollectionType::Auth && !quem.superusuario() {
@@ -610,6 +621,7 @@ async fn registros_apagar(
     Path((nome, id)): Path<(String, String)>,
 ) -> Res<StatusCode> {
     let c = colecao_de(&e, nome).await?;
+    exigir_gravavel(&c)?;
     let regra = regra_para(&quem, &c.delete_rule)?;
     e.banco
         .apagar_com(&c, &id, regra.as_deref(), &quem.contexto())
@@ -2181,5 +2193,88 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "{ruim}");
+    }
+
+    #[tokio::test]
+    async fn view_e_collection_na_api() {
+        let e = estado().await;
+        let t = login(&e).await;
+        let (s, _) = chamar(
+            &e,
+            "POST",
+            "/api/collections",
+            Some(&t),
+            Some(json!({
+                "name": "posts",
+                "fields": [{"name": "titulo", "type": "text"}],
+                "listRule": "",
+                "viewRule": ""
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, post) = chamar(
+            &e,
+            "POST",
+            "/api/collections/posts/records",
+            Some(&t),
+            Some(json!({"titulo": "Olá"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{post}");
+
+        let (s, vista) = chamar(
+            &e,
+            "POST",
+            "/api/collections",
+            Some(&t),
+            Some(json!({
+                "name": "titulos",
+                "type": "view",
+                "viewQuery": "SELECT id, titulo FROM posts",
+                "listRule": "",
+                "viewRule": ""
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{vista}");
+        assert_eq!(vista["viewQuery"], json!("SELECT id, titulo FROM posts"));
+        assert!(vista.get("createRule").unwrap().is_null());
+
+        let (s, lista) = chamar(&e, "GET", "/api/collections/titulos/records", None, None).await;
+        assert_eq!(s, StatusCode::OK, "{lista}");
+        assert_eq!(lista["totalItems"], json!(1));
+        assert_eq!(lista["items"][0]["titulo"], json!("Olá"));
+
+        let (s, recusa) = chamar(
+            &e,
+            "POST",
+            "/api/collections/titulos/records",
+            Some(&t),
+            Some(json!({"titulo": "X"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{recusa}");
+        assert_eq!(recusa["message"], json!("The collection is not writable."));
+
+        let (s, _) = chamar(
+            &e,
+            "GET",
+            "/api/collections/posts/records?filter=@collection.posts.titulo%20%3D%20%22Ol%C3%A1%22",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let (s, super_) = chamar(
+            &e,
+            "GET",
+            "/api/collections/posts/records?filter=@collection.posts.titulo%20%3D%20%22Ol%C3%A1%22",
+            Some(&t),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{super_}");
+        assert_eq!(super_["totalItems"], json!(1));
     }
 }

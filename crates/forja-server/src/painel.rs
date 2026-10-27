@@ -14,7 +14,7 @@ use axum::{Form, Router};
 use forja_admin as admin;
 use forja_core::auth::{self, COLECAO_SUPERUSERS, TIPO_AUTH, VALIDADE_SUPERUSER};
 use forja_core::store::{Consulta, Lista, Superusuario};
-use forja_core::{Collection, Erro, FieldType};
+use forja_core::{Collection, CollectionType, Erro, FieldType};
 use maud::Markup;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -199,6 +199,9 @@ async fn novo_form(
     let Ok(c) = e.banco.colecao(&nome).await else {
         return pagina_erro(Erro::NaoEncontrado("A coleção não existe.".into()));
     };
+    if let Some(resp) = recusar_view(&c) {
+        return resp;
+    }
     html(admin::pagina(
         &format!("Novo em {}", c.name),
         admin::formulario(&c, None, &Map::new(), None),
@@ -216,6 +219,9 @@ async fn editar_form(
     let Ok(c) = e.banco.colecao(&nome).await else {
         return pagina_erro(Erro::NaoEncontrado("A coleção não existe.".into()));
     };
+    if let Some(resp) = recusar_view(&c) {
+        return resp;
+    }
     match e.banco.registro(&c, &id, None).await {
         Ok(r) => html(admin::pagina(
             &format!("Editar {}", c.name),
@@ -239,6 +245,9 @@ async fn criar(
     let Ok(c) = e.banco.colecao(&nome).await else {
         return pagina_erro(Erro::NaoEncontrado("A coleção não existe.".into()));
     };
+    if let Some(resp) = recusar_view(&c) {
+        return resp;
+    }
     let dados = dados_do_form(&c, &pares(&corpo));
     match e.banco.criar(&c, &dados).await {
         Ok(_) => Redirect::to(&format!("/_/collections/{nome}")).into_response(),
@@ -265,6 +274,9 @@ async fn atualizar(
     let Ok(c) = e.banco.colecao(&nome).await else {
         return pagina_erro(Erro::NaoEncontrado("A coleção não existe.".into()));
     };
+    if let Some(resp) = recusar_view(&c) {
+        return resp;
+    }
     let Ok(atual) = e.banco.registro(&c, &id, None).await else {
         return html(admin::nao_encontrado("O registro não existe."));
     };
@@ -298,6 +310,9 @@ async fn apagar(
     let Ok(c) = e.banco.colecao(&nome).await else {
         return pagina_erro(Erro::NaoEncontrado("A coleção não existe.".into()));
     };
+    if let Some(resp) = recusar_view(&c) {
+        return resp;
+    }
     if let Err(erro) = e.banco.apagar(&c, &id, None).await {
         return pagina_erro(erro);
     }
@@ -318,9 +333,21 @@ async fn listar(e: &Estado, c: &Collection, page: u32, filtro: &str) -> Result<L
         filtro: (!filtro.trim().is_empty()).then(|| filtro.to_string()),
         pagina: page.max(1),
         por_pagina: 30,
+        // O painel é a sessão do superusuário: o filtro pode usar `@collection`.
+        superusuario: true,
         ..Default::default()
     };
     e.banco.listar(c, &q).await
+}
+
+fn recusar_view(c: &Collection) -> Option<Response> {
+    if c.kind == CollectionType::View {
+        Some(pagina_erro(Erro::invalido(
+            "The collection is not writable.",
+        )))
+    } else {
+        None
+    }
 }
 
 fn html(m: Markup) -> Response {
