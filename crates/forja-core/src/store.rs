@@ -30,6 +30,8 @@ pub struct Consulta {
     pub regra: Option<String>,
     /// Quem está pedindo, para as macros `@request.auth.*`.
     pub contexto: Contexto,
+    /// Superusuário pode filtrar com `@request` e `@collection`. O cliente comum não.
+    pub superusuario: bool,
 }
 
 impl Default for Consulta {
@@ -42,6 +44,7 @@ impl Default for Consulta {
             pular_total: false,
             regra: None,
             contexto: Contexto::default(),
+            superusuario: false,
         }
     }
 }
@@ -172,6 +175,7 @@ impl Banco {
                 .collect(),
         )
         .await?;
+        b.migrar().await?;
         Ok(b)
     }
 
@@ -271,7 +275,8 @@ fn esquema(d: Dialeto) -> Vec<String> {
                 \"deleteRule\" TEXT,
                 \"indexes\" TEXT NOT NULL DEFAULT '[]',
                 \"created\" TEXT NOT NULL,
-                \"updated\" TEXT NOT NULL
+                \"updated\" TEXT NOT NULL,
+                \"viewQuery\" TEXT
             )"
         ),
         format!(
@@ -747,12 +752,29 @@ fn para_json(f: &Field, v: Valor) -> Value {
     }
 }
 
+/// Base e auth têm `created`/`updated` fora da lista de campos. A view só tem
+/// as colunas da consulta — se projetar essas datas, elas já estão em `fields`.
+fn com_carimbo(c: &Collection) -> bool {
+    c.kind != CollectionType::View
+}
+
 fn colunas(c: &Collection) -> String {
     let mut cols = vec!["\"id\"".to_string()];
     cols.extend(c.fields.iter().map(|f| format!("\"{}\"", f.name)));
-    cols.push("\"created\"".into());
-    cols.push("\"updated\"".into());
+    if com_carimbo(c) {
+        cols.push("\"created\"".into());
+        cols.push("\"updated\"".into());
+    }
     cols.join(", ")
+}
+
+/// Desempate estável. View sem `created` ordena só por `id`.
+fn ordem_estavel(c: &Collection) -> &'static str {
+    if c.coluna_valida("created") {
+        "\"created\", \"id\""
+    } else {
+        "\"id\""
+    }
 }
 
 fn linha_para_registro(c: &Collection, l: Linha) -> Value {
@@ -772,18 +794,20 @@ fn linha_para_registro(c: &Collection, l: Linha) -> Value {
         }
         m.insert(f.name.clone(), para_json(f, valor));
     }
-    m.insert(
-        "created".into(),
-        json!(it.next().unwrap_or(Valor::Nulo).texto_ou_vazio()),
-    );
-    m.insert(
-        "updated".into(),
-        json!(it.next().unwrap_or(Valor::Nulo).texto_ou_vazio()),
-    );
+    if com_carimbo(c) {
+        m.insert(
+            "created".into(),
+            json!(it.next().unwrap_or(Valor::Nulo).texto_ou_vazio()),
+        );
+        m.insert(
+            "updated".into(),
+            json!(it.next().unwrap_or(Valor::Nulo).texto_ou_vazio()),
+        );
+    }
     Value::Object(m)
 }
 
-const COLS_COLECAO: &str = "\"id\", \"name\", \"type\", \"system\", \"fields\", \"listRule\", \"viewRule\", \"createRule\", \"updateRule\", \"deleteRule\", \"indexes\", \"created\", \"updated\"";
+const COLS_COLECAO: &str = "\"id\", \"name\", \"type\", \"system\", \"fields\", \"listRule\", \"viewRule\", \"createRule\", \"updateRule\", \"deleteRule\", \"indexes\", \"created\", \"updated\", \"viewQuery\"";
 
 fn ler_colecao(l: Linha) -> Collection {
     let mut it = l.into_iter();
@@ -819,6 +843,10 @@ fn ler_colecao(l: Linha) -> Collection {
         indexes: serde_json::from_str(&indices).unwrap_or_default(),
         created: prox().texto_ou_vazio(),
         updated: prox().texto_ou_vazio(),
+        view_query: match prox() {
+            Valor::Texto(t) if !t.is_empty() => Some(t),
+            _ => None,
+        },
     }
 }
 
@@ -851,7 +879,7 @@ fn injetar_campos_auth(campos: Vec<Field>) -> Vec<Field> {
     out
 }
 
-fn validar_colecao(c: &Collection, d: Dialeto) -> Resultado<()> {
+fn validar_colecao(c: &Collection) -> Resultado<()> {
     let mut erros = Map::new();
     if !nome_valido(&c.name)
         || c.name.starts_with('_')
@@ -865,14 +893,6 @@ fn validar_colecao(c: &Collection, d: Dialeto) -> Resultado<()> {
             "Invalid collection name.".into(),
         );
     }
-    if c.kind == CollectionType::View {
-        erro_campo(
-            &mut erros,
-            "type",
-            "validation_not_supported",
-            "Only 'base' and 'auth' collections are supported in this version.".into(),
-        );
-    }
     if c.kind == CollectionType::Auth && c.campo("email").is_none() {
         erro_campo(
             &mut erros,
@@ -884,10 +904,9 @@ fn validar_colecao(c: &Collection, d: Dialeto) -> Resultado<()> {
     let mut vistos: Vec<String> = vec![];
     for (i, f) in c.fields.iter().enumerate() {
         let chave = format!("fields.{i}.name");
-        if !nome_valido(&f.name)
-            || RESERVADOS.contains(&f.name.as_str())
-            || f.name.contains("_via_")
-        {
+        let reservado = RESERVADOS.contains(&f.name.as_str())
+            && !(c.kind == CollectionType::View && matches!(f.name.as_str(), "created" | "updated"));
+        if !nome_valido(&f.name) || reservado || f.name.contains("_via_") {
             erro_campo(
                 &mut erros,
                 &chave,
@@ -941,26 +960,34 @@ fn validar_colecao(c: &Collection, d: Dialeto) -> Resultado<()> {
         }
     }
     if erros.is_empty() {
-        // As regras são filtros: precisam ser válidas para esta coleção.
-        for (nome, regra) in [
-            ("listRule", &c.list_rule),
-            ("viewRule", &c.view_rule),
-            ("createRule", &c.create_rule),
-            ("updateRule", &c.update_rule),
-            ("deleteRule", &c.delete_rule),
-        ] {
-            if let Some(r) = regra.as_deref().filter(|r| !r.trim().is_empty())
-                && let Err(e) = filtro::para_sql(r, &|n| c.coluna_valida(n), d)
-            {
-                erro_campo(&mut erros, nome, "validation_invalid_rule", e.to_string());
-            }
-        }
-    }
-    if erros.is_empty() {
         Ok(())
     } else {
         Err(invalido("Failed to create collection.", erros))
     }
+}
+
+fn resolver_externo(
+    atual: &Collection,
+    outras: &HashMap<String, Collection>,
+    colecao: &str,
+    campo: &str,
+) -> Resultado<String> {
+    let c = if colecao.eq_ignore_ascii_case(&atual.name) {
+        atual
+    } else {
+        outras.get(&colecao.to_ascii_lowercase()).ok_or_else(|| {
+            Erro::invalido(format!(
+                "Invalid filter: unknown collection '{colecao}'"
+            ))
+        })?
+    };
+    if !c.coluna_valida(campo) {
+        return Err(Erro::invalido(format!(
+            "Invalid filter: unknown field '{campo}' in '{}'",
+            c.name
+        )));
+    }
+    Ok(c.name.clone())
 }
 
 fn nao_encontrado() -> Erro {
@@ -971,14 +998,37 @@ fn nao_encontrado() -> Erro {
 
 impl Banco {
     /// Regra de acesso + filtro do usuário em um `WHERE`, com os parâmetros.
-    fn onde(
+    ///
+    /// `@collection` e `@request` no filtro do cliente exigem `privilegiado`.
+    /// Na regra da coleção (escrita pelo superusuário) continuam valendo.
+    async fn onde(
         &self,
         c: &Collection,
         regra: Option<&str>,
         filtro_usuario: Option<&str>,
         ctx: &Contexto,
+        privilegiado: bool,
     ) -> Resultado<(String, Vec<Valor>)> {
+        if let Some(f) = filtro_usuario.filter(|f| !privilegiado && filtro::macro_restrita(f)) {
+            return Err(Erro::Proibido(
+                "Only superusers can filter by @request and @collection.".into(),
+            ));
+        }
+        let mut citados = Vec::new();
+        for f in [regra, filtro_usuario].into_iter().flatten() {
+            citados.extend(filtro::colecoes_citadas(f));
+        }
+        let outras = if citados.is_empty() {
+            HashMap::new()
+        } else {
+            self.carregar_citadas(&citados).await?
+        };
         let valido = |n: &str| c.coluna_valida(n);
+        let resolver = |col: &str, campo: &str| resolver_externo(c, &outras, col, campo);
+        let escopo = filtro::Escopo {
+            tabela: &c.name,
+            externa: &resolver,
+        };
         let mut partes = vec![];
         let mut params = vec![];
         for f in [regra, filtro_usuario]
@@ -986,7 +1036,7 @@ impl Banco {
             .flatten()
             .filter(|f| !f.trim().is_empty())
         {
-            let sql = filtro::para_sql_com(f, &valido, self.dialeto(), ctx)?;
+            let sql = filtro::para_sql_escopo(f, &valido, self.dialeto(), ctx, &escopo)?;
             partes.push(sql.texto);
             params.extend(sql.params.into_iter().map(literal_valor));
         }
@@ -996,6 +1046,203 @@ impl Banco {
             format!(" WHERE {}", partes.join(" AND "))
         };
         Ok((texto, params))
+    }
+
+    /// Coluna `viewQuery` em bancos criados antes da 0.2.
+    async fn migrar(&self) -> Resultado<()> {
+        let tem = match self.dialeto() {
+            Dialeto::Sqlite => {
+                let cols = self
+                    .ex
+                    .consultar("PRAGMA table_info('_collections')", vec![])
+                    .await?;
+                cols.iter()
+                    .any(|l| l.get(1).and_then(Valor::texto) == Some("viewQuery"))
+            }
+            Dialeto::Postgres => {
+                let cols = self
+                    .ex
+                    .consultar(
+                        "SELECT column_name FROM information_schema.columns WHERE table_name = '_collections' AND column_name = 'viewQuery'",
+                        vec![],
+                    )
+                    .await?;
+                !cols.is_empty()
+            }
+        };
+        if !tem {
+            let sql = if self.dialeto() == Dialeto::Postgres {
+                "ALTER TABLE \"_collections\" ADD COLUMN IF NOT EXISTS \"viewQuery\" TEXT"
+            } else {
+                "ALTER TABLE \"_collections\" ADD COLUMN \"viewQuery\" TEXT"
+            };
+            self.ex.executar(sql, vec![]).await?;
+        }
+        Ok(())
+    }
+
+    async fn carregar_citadas(&self, nomes: &[String]) -> Resultado<HashMap<String, Collection>> {
+        let mut mapa = HashMap::new();
+        for nome in nomes {
+            let chave = nome.to_ascii_lowercase();
+            if mapa.contains_key(&chave) {
+                continue;
+            }
+            if let Ok(c) = self.colecao(nome).await {
+                mapa.insert(c.name.to_ascii_lowercase(), c);
+            }
+        }
+        Ok(mapa)
+    }
+
+    /// As regras são filtros. `@collection` precisa das outras coleções já salvas.
+    async fn validar_regras(&self, c: &Collection) -> Resultado<()> {
+        let regras = [
+            ("listRule", &c.list_rule),
+            ("viewRule", &c.view_rule),
+            ("createRule", &c.create_rule),
+            ("updateRule", &c.update_rule),
+            ("deleteRule", &c.delete_rule),
+        ];
+        let mut citados = Vec::new();
+        for (_, regra) in regras {
+            if let Some(r) = regra.as_deref() {
+                citados.extend(filtro::colecoes_citadas(r));
+            }
+        }
+        let outras = self.carregar_citadas(&citados).await?;
+        let valido = |n: &str| c.coluna_valida(n);
+        let resolver = |col: &str, campo: &str| resolver_externo(c, &outras, col, campo);
+        let escopo = filtro::Escopo {
+            tabela: &c.name,
+            externa: &resolver,
+        };
+        let mut erros = Map::new();
+        for (nome, regra) in regras {
+            if let Some(r) = regra.as_deref().filter(|r| !r.trim().is_empty())
+                && let Err(e) =
+                    filtro::para_sql_escopo(r, &valido, self.dialeto(), &Contexto::default(), &escopo)
+            {
+                erro_campo(&mut erros, nome, "validation_invalid_rule", e.to_string());
+            }
+        }
+        if erros.is_empty() {
+            Ok(())
+        } else {
+            Err(invalido("Failed to create collection.", erros))
+        }
+    }
+
+    /// Cria uma view temporária, lê as colunas e apaga. O `id` é obrigatório.
+    async fn campos_da_consulta(&self, query: &str) -> Resultado<Vec<Field>> {
+        let temp = format!("_forja_probe_{}", id::aleatorio(12));
+        if let Err(e) = self
+            .ex
+            .executar(&format!("CREATE VIEW \"{temp}\" AS {query}"), vec![])
+            .await
+        {
+            return Err(crate::view::erro_consulta(
+                "validation_invalid_view_query",
+                format!("Invalid view query: {e}"),
+            ));
+        }
+        let descrito = self.descrever_colunas(&temp).await;
+        let executa = self
+            .ex
+            .consultar(&format!("SELECT * FROM \"{temp}\" LIMIT 0"), vec![])
+            .await;
+        let _ = self
+            .ex
+            .executar(&format!("DROP VIEW IF EXISTS \"{temp}\""), vec![])
+            .await;
+        let cols = descrito.map_err(|e| {
+            crate::view::erro_consulta(
+                "validation_invalid_view_query",
+                format!("Invalid view query: {e}"),
+            )
+        })?;
+        executa.map_err(|e| {
+            crate::view::erro_consulta(
+                "validation_invalid_view_query",
+                format!("Invalid view query: {e}"),
+            )
+        })?;
+        let mut viu_id = false;
+        let mut fields = Vec::new();
+        let mut vistos: Vec<String> = Vec::new();
+        for (nome, tipo) in cols {
+            if !crate::view::coluna_aceita(&nome) {
+                return Err(crate::view::erro_consulta(
+                    "validation_invalid_view_query",
+                    format!("Invalid view column '{nome}'."),
+                ));
+            }
+            if vistos.iter().any(|v| v.eq_ignore_ascii_case(&nome)) {
+                return Err(crate::view::erro_consulta(
+                    "validation_invalid_view_query",
+                    format!("Duplicated view column '{nome}'."),
+                ));
+            }
+            vistos.push(nome.clone());
+            if nome == "id" {
+                viu_id = true;
+                continue;
+            }
+            fields.push(Field {
+                id: String::new(),
+                name: nome,
+                kind: crate::view::tipo_inferido(&tipo),
+                required: false,
+                hidden: false,
+                system: false,
+                options: Map::new(),
+            });
+        }
+        if !viu_id {
+            return Err(crate::view::erro_consulta(
+                "validation_invalid_view_query",
+                "The view query must have an 'id' column.".into(),
+            ));
+        }
+        Ok(fields)
+    }
+
+    async fn descrever_colunas(&self, nome: &str) -> Resultado<Vec<(String, String)>> {
+        match self.dialeto() {
+            Dialeto::Sqlite => {
+                let linhas = self
+                    .ex
+                    .consultar(&format!("PRAGMA table_info('{nome}')"), vec![])
+                    .await?;
+                Ok(linhas
+                    .into_iter()
+                    .map(|l| {
+                        (
+                            l.get(1).map(Valor::texto_ou_vazio).unwrap_or_default(),
+                            l.get(2).map(Valor::texto_ou_vazio).unwrap_or_default(),
+                        )
+                    })
+                    .collect())
+            }
+            Dialeto::Postgres => {
+                let linhas = self
+                    .ex
+                    .consultar(
+                        "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = ? ORDER BY ordinal_position",
+                        vec![nome.into()],
+                    )
+                    .await?;
+                Ok(linhas
+                    .into_iter()
+                    .map(|l| {
+                        (
+                            l.first().map(Valor::texto_ou_vazio).unwrap_or_default(),
+                            l.get(1).map(Valor::texto_ou_vazio).unwrap_or_default(),
+                        )
+                    })
+                    .collect())
+            }
+        }
     }
 
     async fn contar(&self, sql: &str, params: Vec<Valor>) -> Resultado<i64> {
@@ -1139,7 +1386,27 @@ impl Banco {
         if c.kind == CollectionType::Auth {
             c.fields = injetar_campos_auth(c.fields);
         }
-        validar_colecao(&c, d)?;
+        if c.kind == CollectionType::View {
+            let q = match c.view_query.as_deref() {
+                Some(q) => crate::view::normalizar_consulta(q)?,
+                None => {
+                    return Err(crate::view::erro_consulta(
+                        "validation_required",
+                        "Cannot be blank.".into(),
+                    ));
+                }
+            };
+            c.fields = self.campos_da_consulta(&q).await?;
+            c.view_query = Some(q);
+            // View não tem escrita: as três regras ficam trancadas.
+            c.create_rule = None;
+            c.update_rule = None;
+            c.delete_rule = None;
+            c.indexes.clear();
+        } else {
+            c.view_query = None;
+        }
+        validar_colecao(&c)?;
         let agora = agora();
         if c.id.is_empty() {
             c.id = format!("pbc_{}", id::novo());
@@ -1157,6 +1424,7 @@ impl Banco {
             }
         }
         self.normalizar_relacoes(&mut c).await?;
+        self.validar_regras(&c).await?;
         let existe = self
             .contar(
                 "SELECT COUNT(*) FROM \"_collections\" WHERE lower(\"name\") = lower(?) OR \"id\" = ?",
@@ -1177,16 +1445,18 @@ impl Banco {
             return Err(duplicado());
         }
         let mut colunas_sql = vec!["\"id\" TEXT PRIMARY KEY NOT NULL".to_string()];
-        colunas_sql.extend(
-            c.fields
-                .iter()
-                .map(|f| format!("\"{}\" {}", f.name, tipo_sql(f, d))),
-        );
-        colunas_sql.push("\"created\" TEXT NOT NULL DEFAULT ''".into());
-        colunas_sql.push("\"updated\" TEXT NOT NULL DEFAULT ''".into());
+        if c.kind != CollectionType::View {
+            colunas_sql.extend(
+                c.fields
+                    .iter()
+                    .map(|f| format!("\"{}\" {}", f.name, tipo_sql(f, d))),
+            );
+            colunas_sql.push("\"created\" TEXT NOT NULL DEFAULT ''".into());
+            colunas_sql.push("\"updated\" TEXT NOT NULL DEFAULT ''".into());
+        }
         let insert = (
             format!(
-                "INSERT INTO \"_collections\" ({COLS_COLECAO}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                "INSERT INTO \"_collections\" ({COLS_COLECAO}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             ),
             vec![
                 c.id.clone().into(),
@@ -1210,15 +1480,16 @@ impl Banco {
                     .into(),
                 c.created.clone().into(),
                 c.updated.clone().into(),
+                c.view_query.clone().into(),
             ],
         );
-        let mut comandos = vec![
-            (
-                format!("CREATE TABLE \"{}\" ({})", c.name, colunas_sql.join(", ")),
-                vec![],
-            ),
-            insert,
-        ];
+        let criar_relacao = if c.kind == CollectionType::View {
+            let q = c.view_query.clone().unwrap_or_default();
+            format!("CREATE VIEW \"{}\" AS {q}", c.name)
+        } else {
+            format!("CREATE TABLE \"{}\" ({})", c.name, colunas_sql.join(", "))
+        };
+        let mut comandos = vec![(criar_relacao, vec![]), insert];
         if c.kind == CollectionType::Auth {
             // E-mail é único sem diferenciar maiúsculas, como no PocketBase.
             comandos.push((
@@ -1244,9 +1515,30 @@ impl Banco {
         if c.system {
             return Err(Erro::invalido("System collections can't be deleted."));
         }
+        if c.kind != CollectionType::View {
+            for outra in self.colecoes().await? {
+                if outra.id != c.id
+                    && outra.kind == CollectionType::View
+                    && outra
+                        .view_query
+                        .as_deref()
+                        .is_some_and(|q| crate::view::cita(q, &c.name))
+                {
+                    return Err(Erro::invalido(format!(
+                        "The collection is referenced by view '{}'.",
+                        outra.name
+                    )));
+                }
+            }
+        }
+        let verbo = if c.kind == CollectionType::View {
+            "VIEW"
+        } else {
+            "TABLE"
+        };
         self.ex
             .lote(vec![
-                (format!("DROP TABLE IF EXISTS \"{}\"", c.name), vec![]),
+                (format!("DROP {verbo} IF EXISTS \"{}\"", c.name), vec![]),
                 (
                     "DELETE FROM \"_collections\" WHERE \"id\" = ?".into(),
                     vec![c.id.clone().into()],
@@ -1258,8 +1550,15 @@ impl Banco {
     pub async fn listar(&self, c: &Collection, q: &Consulta) -> Resultado<Lista> {
         let por_pagina = q.por_pagina.clamp(1, 1000);
         let pagina = q.pagina.max(1);
-        let (onde_sql, params) =
-            self.onde(c, q.regra.as_deref(), q.filtro.as_deref(), &q.contexto)?;
+        let (onde_sql, params) = self
+            .onde(
+                c,
+                q.regra.as_deref(),
+                q.filtro.as_deref(),
+                &q.contexto,
+                q.superusuario,
+            )
+            .await?;
         // "id" desempata valores iguais: a mesma consulta devolve sempre a mesma
         // ordem, e a paginação não repete nem pula registros.
         let ordem = match q.ordem.as_deref().filter(|s| !s.trim().is_empty()) {
@@ -1267,7 +1566,7 @@ impl Banco {
                 " ORDER BY {}, \"id\"",
                 filtro::ordem(s, &|n| c.coluna_valida(n), self.dialeto())?
             ),
-            None => " ORDER BY \"created\", \"id\"".into(),
+            None => format!(" ORDER BY {}", ordem_estavel(c)),
         };
         let total = if q.pular_total {
             -1
@@ -1322,7 +1621,7 @@ impl Banco {
         regra: Option<&str>,
         ctx: &Contexto,
     ) -> Resultado<Value> {
-        let (onde_sql, mut params) = self.onde(c, regra, None, ctx)?;
+        let (onde_sql, mut params) = self.onde(c, regra, None, ctx, true).await?;
         let filtro_id = if onde_sql.is_empty() {
             " WHERE \"id\" = ?".to_string()
         } else {
@@ -1357,6 +1656,9 @@ impl Banco {
         ctx: &Contexto,
         superusuario: bool,
     ) -> Resultado<Value> {
+        if c.kind == CollectionType::View {
+            return Err(Erro::invalido("The collection is not writable."));
+        }
         let mut erros = Map::new();
         let novo_id = match dados
             .get("id")
@@ -1487,6 +1789,9 @@ impl Banco {
         ctx: &Contexto,
         superusuario: bool,
     ) -> Resultado<Value> {
+        if c.kind == CollectionType::View {
+            return Err(Erro::invalido("The collection is not writable."));
+        }
         let atual = self.registro_com(c, id, regra, ctx).await?;
         let mut erros = Map::new();
         let mut sets: Vec<(String, Valor)> = vec![];
@@ -1584,6 +1889,9 @@ impl Banco {
         regra: Option<&str>,
         ctx: &Contexto,
     ) -> Resultado<()> {
+        if c.kind == CollectionType::View {
+            return Err(Erro::invalido("The collection is not writable."));
+        }
         self.registro_com(c, id, regra, ctx).await?;
         let efeitos = self.planejar_cascata(c, id).await?;
         self.aplicar_efeitos(efeitos).await
@@ -2161,7 +2469,7 @@ impl Banco {
         };
         for bloco in ids.chunks(400) {
             let ph = vec!["?"; bloco.len()].join(", ");
-            let (onde, mut params) = self.onde(alvo, regra, None, ctx)?;
+            let (onde, mut params) = self.onde(alvo, regra, None, ctx, true).await?;
             params.extend(bloco.iter().cloned().map(Valor::from));
             let n = self
                 .contar(
@@ -2340,16 +2648,17 @@ impl Banco {
         let mut out = vec![];
         for bloco in ids.chunks(400) {
             let ph = vec!["?"; bloco.len()].join(", ");
-            let (onde, mut params) = self.onde(c, regra, None, ctx)?;
+            let (onde, mut params) = self.onde(c, regra, None, ctx, true).await?;
             params.extend(bloco.iter().cloned().map(Valor::from));
             let linhas = self
                 .ex
                 .consultar(
                     &format!(
-                        "SELECT {} FROM \"{}\"{} ORDER BY \"created\", \"id\"",
+                        "SELECT {} FROM \"{}\"{} ORDER BY {}",
                         colunas(c),
                         c.name,
-                        juntar_where(&onde, &format!("\"id\" IN ({ph})"))
+                        juntar_where(&onde, &format!("\"id\" IN ({ph})")),
+                        ordem_estavel(c)
                     ),
                     params,
                 )
@@ -2379,16 +2688,17 @@ impl Banco {
         for bloco in pais.chunks(200) {
             let pred =
                 predicado_reverso(&campo.name, campo.multiplo(), bloco.len(), self.dialeto());
-            let (onde, mut params) = self.onde(c, regra, None, ctx)?;
+            let (onde, mut params) = self.onde(c, regra, None, ctx, true).await?;
             params.extend(bloco.iter().cloned().map(Valor::from));
             let linhas = self
                 .ex
                 .consultar(
                     &format!(
-                        "SELECT {} FROM \"{}\"{} ORDER BY \"created\", \"id\"",
+                        "SELECT {} FROM \"{}\"{} ORDER BY {}",
                         colunas(c),
                         c.name,
-                        juntar_where(&onde, &pred)
+                        juntar_where(&onde, &pred),
+                        ordem_estavel(c)
                     ),
                     params,
                 )
@@ -3095,6 +3405,226 @@ mod tests {
         };
         let l = b.listar(&notas, &q).await.unwrap();
         assert_eq!(l.total_items, 0);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn view_e_somente_leitura() {
+        let b = Banco::sqlite_memoria().await.unwrap();
+        let produtos = b
+            .criar_colecao(base(
+                "produtos",
+                json!([
+                    {"name": "nome", "type": "text"},
+                    {"name": "preco", "type": "number"},
+                    {"name": "ativo", "type": "bool"}
+                ]),
+            ))
+            .await
+            .unwrap();
+        b.criar(
+            &produtos,
+            &obj(json!({"nome": "Café", "preco": 32, "ativo": true})),
+        )
+        .await
+        .unwrap();
+        b.criar(
+            &produtos,
+            &obj(json!({"nome": "Chá", "preco": 10, "ativo": false})),
+        )
+        .await
+        .unwrap();
+
+        let vista = b
+            .criar_colecao(
+                serde_json::from_value(json!({
+                    "name": "ativos",
+                    "type": "view",
+                    "viewQuery": "SELECT id, nome, preco FROM produtos WHERE ativo = 1",
+                    "listRule": "",
+                    "viewRule": ""
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(vista.id.starts_with("pbc_"));
+        assert_eq!(
+            vista.view_query.as_deref(),
+            Some("SELECT id, nome, preco FROM produtos WHERE ativo = 1")
+        );
+        assert_eq!(vista.campo("nome").unwrap().kind, FieldType::Text);
+        assert_eq!(vista.campo("preco").unwrap().kind, FieldType::Number);
+        assert!(vista.create_rule.is_none());
+        let lida = b.colecao("ativos").await.unwrap();
+        assert_eq!(lida.view_query, vista.view_query);
+
+        let l = b.listar(&vista, &Consulta::default()).await.unwrap();
+        assert_eq!(l.total_items, 1);
+        assert_eq!(l.items[0]["nome"], json!("Café"));
+        assert_eq!(l.items[0]["preco"], json!(32));
+        assert!(l.items[0].get("created").is_none());
+
+        let filtrada = b
+            .listar(
+                &vista,
+                &Consulta {
+                    filtro: Some("nome ~ 'caf'".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(filtrada.total_items, 1);
+        assert!(
+            b.criar(&vista, &obj(json!({"nome": "X"}))).await.is_err(),
+            "view aceita escrita"
+        );
+        let id = l.items[0]["id"].as_str().unwrap();
+        assert!(b.atualizar(&vista, id, &obj(json!({"nome": "Y"})), None).await.is_err());
+        assert!(b.apagar(&vista, id, None).await.is_err());
+
+        assert!(
+            b.criar_colecao(
+                serde_json::from_value(json!({
+                    "name": "ruim",
+                    "type": "view",
+                    "viewQuery": "SELECT nome FROM produtos"
+                }))
+                .unwrap(),
+            )
+            .await
+            .is_err(),
+            "view sem id"
+        );
+        assert!(
+            b.criar_colecao(
+                serde_json::from_value(json!({
+                    "name": "ruim",
+                    "type": "view",
+                    "viewQuery": "DELETE FROM produtos"
+                }))
+                .unwrap(),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            b.criar_colecao(
+                serde_json::from_value(json!({
+                    "name": "ruim",
+                    "type": "view",
+                    "viewQuery": "SELECT id FROM produtos; DROP TABLE produtos"
+                }))
+                .unwrap(),
+            )
+            .await
+            .is_err()
+        );
+        assert!(b.apagar_colecao("produtos").await.is_err(), "view ainda cita");
+        b.apagar_colecao("ativos").await.unwrap();
+        b.apagar_colecao("produtos").await.unwrap();
+        assert!(b.colecoes().await.unwrap().is_empty());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn macro_collection_filtra_outra_colecao() {
+        let b = Banco::sqlite_memoria().await.unwrap();
+        let comentarios = b
+            .criar_colecao(base(
+                "comentarios",
+                json!([
+                    {"name": "post", "type": "text"},
+                    {"name": "status", "type": "text"}
+                ]),
+            ))
+            .await
+            .unwrap();
+        let posts = b
+            .criar_colecao(
+                serde_json::from_value(json!({
+                    "name": "posts",
+                    "fields": [{"name": "titulo", "type": "text"}],
+                    "listRule": "@collection.comentarios.post = id && @collection.comentarios.status = \"ok\"",
+                    "viewRule": ""
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let p1 = b
+            .criar(&posts, &obj(json!({"titulo": "Com ok"})))
+            .await
+            .unwrap();
+        let p2 = b
+            .criar(&posts, &obj(json!({"titulo": "Sem ok"})))
+            .await
+            .unwrap();
+        b.criar(
+            &comentarios,
+            &obj(json!({"post": p1["id"], "status": "ok"})),
+        )
+        .await
+        .unwrap();
+        b.criar(
+            &comentarios,
+            &obj(json!({"post": p2["id"], "status": "ruim"})),
+        )
+        .await
+        .unwrap();
+
+        let l = b
+            .listar(
+                &posts,
+                &Consulta {
+                    regra: posts.list_rule.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(l.total_items, 1);
+        assert_eq!(l.items[0]["titulo"], json!("Com ok"));
+
+        let negado = b
+            .listar(
+                &posts,
+                &Consulta {
+                    filtro: Some("@collection.comentarios.post = id".into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(matches!(negado, Err(Erro::Proibido(_))));
+
+        let l = b
+            .listar(
+                &posts,
+                &Consulta {
+                    filtro: Some(
+                        "@collection.comentarios.post = id && @collection.comentarios.status = \"ok\""
+                            .into(),
+                    ),
+                    superusuario: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(l.total_items, 1);
+
+        let regra_ruim = b
+            .criar_colecao(
+                serde_json::from_value(json!({
+                    "name": "orfas",
+                    "fields": [{"name": "t", "type": "text"}],
+                    "listRule": "@collection.nao_existe.id = id"
+                }))
+                .unwrap(),
+            )
+            .await;
+        assert!(regra_ruim.is_err());
     }
 
     #[cfg(feature = "sqlite")]

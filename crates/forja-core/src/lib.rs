@@ -15,6 +15,7 @@ pub mod id;
 pub mod motor;
 mod relacao;
 pub mod store;
+mod view;
 pub mod valor;
 
 pub use erro::Erro;
@@ -190,6 +191,9 @@ pub struct Collection {
     pub delete_rule: Option<String>,
     #[serde(default)]
     pub indexes: Vec<String>,
+    /// Consulta `SELECT` de uma coleção `view`. Ausente nos outros tipos.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_query: Option<String>,
     #[serde(default)]
     pub created: String,
     #[serde(default)]
@@ -210,7 +214,12 @@ impl Collection {
         {
             return false;
         }
-        matches!(nome, "id" | "created" | "updated") || self.campo(nome).is_some()
+        if nome == "id" || self.campo(nome).is_some() {
+            return true;
+        }
+        // `created` e `updated` são colunas fixas de base e auth. Numa view
+        // só existem se a consulta as projetar (aí entram em `fields`).
+        self.kind != CollectionType::View && matches!(nome, "created" | "updated")
     }
 }
 

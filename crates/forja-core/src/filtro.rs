@@ -4,11 +4,13 @@
 //!
 //! Suportado nesta versão: `=`, `!=`, `>`, `>=`, `<`, `<=`, `~` (contém),
 //! `!~`, `&&`, `||`, parênteses, textos entre aspas simples ou duplas,
-//! números, `true`, `false` e `null`. Macros (`@request`, `@collection`,
-//! `@now`), operadores "algum item" (`?=`) e modificadores (`:isset`) ainda
-//! não (FUNCIONALIDADES §4).
+//! números, `true`, `false` e `null`. Macros: `@request.auth.*` (vira
+//! parâmetro) e `@collection.colecao.campo` (vira `EXISTS`, uma linha da
+//! outra coleção que satisfaz o `&&`). Operadores "algum item" (`?=`) e
+//! modificadores (`:isset`) ainda não (FUNCIONALIDADES §4).
 
 use crate::erro::{Erro, Resultado};
+use std::collections::HashMap;
 
 /// Tamanho máximo de um filtro, como no PocketBase.
 const MAX_FILTRO: usize = 3500;
@@ -309,11 +311,25 @@ impl Contexto {
     }
 }
 
+/// Onde `@collection.colecao.campo` procura a outra coleção.
+///
+/// `externa(colecao, campo)` devolve o nome canônico da tabela, ou erro se a
+/// coleção ou o campo não existem.
+pub struct Escopo<'a> {
+    pub tabela: &'a str,
+    pub externa: &'a dyn Fn(&str, &str) -> Resultado<String>,
+}
+
 struct Escritor<'a> {
     dialeto: Dialeto,
     params: Vec<Literal>,
     valido: &'a dyn Fn(&str) -> bool,
     ctx: &'a Contexto,
+    escopo: Option<&'a Escopo<'a>>,
+    /// Dentro de um `EXISTS`, o campo local ganha o nome da tabela.
+    qualificar: bool,
+    /// `(nome canônico, alias)` da coleção do `EXISTS` em curso.
+    alias: Option<(String, String)>,
 }
 
 impl Escritor<'_> {
@@ -326,13 +342,159 @@ impl Escritor<'_> {
 
     fn operando(&mut self, o: &Operando) -> Resultado<String> {
         match o {
-            Operando::Campo(n) => coluna(n, self.valido),
+            Operando::Campo(n) => {
+                let col = coluna(n, self.valido)?;
+                if self.qualificar {
+                    let tabela = self.escopo.map(|e| e.tabela).unwrap_or("");
+                    Ok(format!("\"{tabela}\".{col}"))
+                } else {
+                    Ok(col)
+                }
+            }
+            Operando::Macro(n) if n.starts_with("@collection.") => self.coluna_externa(n),
             Operando::Macro(n) => {
                 let l = self.ctx.resolver(n)?;
                 Ok(self.marcador(l))
             }
             Operando::Valor(l) => Ok(self.marcador(l.clone())),
         }
+    }
+
+    fn coluna_externa(&self, nome: &str) -> Resultado<String> {
+        let (citada, campo) = partir_colecao(nome)?;
+        let (canon, alias) = self.alias.as_ref().ok_or_else(|| {
+            Erro::invalido(format!(
+                "Invalid filter: macro '{nome}' is not supported yet"
+            ))
+        })?;
+        let escopo = self.escopo.ok_or_else(|| {
+            Erro::invalido("Invalid filter: macro '@collection' is not supported yet")
+        })?;
+        let resolvido = (escopo.externa)(&citada, &campo)?;
+        if !resolvido.eq_ignore_ascii_case(canon) {
+            return Err(Erro::invalido(
+                "Invalid filter: a comparison cannot reference two collections".into(),
+            ));
+        }
+        Ok(format!("\"{alias}\".\"{campo}\""))
+    }
+
+    /// SQL da expressão. Sem `@collection`, o caminho antigo (coluna nua).
+    fn compilar(&mut self, e: &Expr) -> Resultado<String> {
+        if !tem_colecao(e) {
+            return self.expr(e);
+        }
+        if self.escopo.is_none() {
+            return Err(Erro::invalido(
+                "Invalid filter: macro '@collection' is not supported yet",
+            ));
+        }
+        match e {
+            Expr::Ou(a, b) => Ok(format!(
+                "({} OR {})",
+                self.compilar(a)?,
+                self.compilar(b)?
+            )),
+            _ => self.conjuncao(e),
+        }
+    }
+
+    /// Um `&&`: cada coleção vira um `EXISTS` (a mesma linha cumpre todos os
+    /// predicados dela). Um `||` dentro quebra o grupo — cada lado tem o seu.
+    fn conjuncao(&mut self, e: &Expr) -> Resultado<String> {
+        let mut partes = vec![];
+        achatar(e, &mut partes);
+        enum Slot<'b> {
+            Local(&'b Expr),
+            Grupo { termos: Vec<&'b Expr> },
+        }
+        let mut slots: Vec<Slot> = vec![];
+        let mut indice: HashMap<String, usize> = HashMap::new();
+        for parte in partes {
+            if let Some(chave) = self.chave_colecao(parte)? {
+                if let Some(&i) = indice.get(&chave) {
+                    if let Slot::Grupo { termos } = &mut slots[i] {
+                        termos.push(parte);
+                    }
+                } else {
+                    indice.insert(chave, slots.len());
+                    slots.push(Slot::Grupo {
+                        termos: vec![parte],
+                    });
+                }
+            } else {
+                slots.push(Slot::Local(parte));
+            }
+        }
+        let mut sqls = Vec::with_capacity(slots.len());
+        for slot in slots {
+            match slot {
+                Slot::Local(p) => sqls.push(self.compilar(p)?),
+                Slot::Grupo { termos } => sqls.push(self.exists(&termos)?),
+            }
+        }
+        if sqls.len() == 1 {
+            Ok(sqls.pop().unwrap_or_default())
+        } else {
+            Ok(format!("({})", sqls.join(" AND ")))
+        }
+    }
+
+    fn chave_colecao(&self, e: &Expr) -> Resultado<Option<String>> {
+        let Expr::Cmp { esq, dir, .. } = e else {
+            return Ok(None);
+        };
+        let a = colecao_do_operando(esq)?;
+        let b = colecao_do_operando(dir)?;
+        let citada = match (a, b) {
+            (None, None) => return Ok(None),
+            (Some((c, _)), None) | (None, Some((c, _))) => c,
+            (Some((c1, _)), Some((c2, _))) if c1.eq_ignore_ascii_case(&c2) => c1,
+            _ => {
+                return Err(Erro::invalido(
+                    "Invalid filter: a comparison cannot reference two collections".into(),
+                ));
+            }
+        };
+        let campo = campo_da_colecao(esq, &citada)
+            .or_else(|| campo_da_colecao(dir, &citada))
+            .unwrap_or_default();
+        let escopo = self.escopo.ok_or_else(|| {
+            Erro::invalido("Invalid filter: macro '@collection' is not supported yet")
+        })?;
+        let canon = (escopo.externa)(&citada, &campo)?;
+        Ok(Some(canon.to_ascii_lowercase()))
+    }
+
+    fn exists(&mut self, termos: &[&Expr]) -> Resultado<String> {
+        let Some(Expr::Cmp { esq, dir, .. }) = termos.first().copied() else {
+            return Err(Erro::invalido("Invalid filter: empty @collection group"));
+        };
+        let (citada, campo) = colecao_do_operando(esq)?
+            .or(colecao_do_operando(dir)?)
+            .ok_or_else(|| Erro::invalido("Invalid filter: empty @collection group"))?;
+        let escopo = self.escopo.ok_or_else(|| {
+            Erro::invalido("Invalid filter: macro '@collection' is not supported yet")
+        })?;
+        let canon = (escopo.externa)(&citada, &campo)?;
+        let alias = format!("_c_{canon}");
+        let antigo_q = self.qualificar;
+        let antigo_a = self.alias.clone();
+        self.qualificar = true;
+        self.alias = Some((canon.clone(), alias.clone()));
+        let mut conds = Vec::with_capacity(termos.len());
+        for t in termos {
+            let Expr::Cmp { esq, op, dir } = t else {
+                return Err(Erro::invalido("Invalid filter: empty @collection group"));
+            };
+            conds.push(self.comparacao(esq, *op, dir)?);
+        }
+        self.qualificar = antigo_q;
+        self.alias = antigo_a;
+        Ok(format!(
+            "EXISTS (SELECT 1 FROM \"{canon}\" AS \"{alias}\" WHERE {})",
+            conds.join(" AND ")
+        ))
     }
 
     fn expr(&mut self, e: &Expr) -> Resultado<String> {
@@ -412,18 +574,126 @@ pub fn para_sql_com(
     dialeto: Dialeto,
     ctx: &Contexto,
 ) -> Resultado<Sql> {
+    compilar(filtro, valido, dialeto, ctx, None)
+}
+
+/// Como `para_sql_com`, e `@collection.colecao.campo` vira `EXISTS`.
+pub fn para_sql_escopo(
+    filtro: &str,
+    valido: &dyn Fn(&str) -> bool,
+    dialeto: Dialeto,
+    ctx: &Contexto,
+    escopo: &Escopo<'_>,
+) -> Resultado<Sql> {
+    compilar(filtro, valido, dialeto, ctx, Some(escopo))
+}
+
+fn compilar(
+    filtro: &str,
+    valido: &dyn Fn(&str) -> bool,
+    dialeto: Dialeto,
+    ctx: &Contexto,
+    escopo: Option<&Escopo<'_>>,
+) -> Resultado<Sql> {
     let e = analisar(filtro)?;
     let mut w = Escritor {
         dialeto,
         params: vec![],
         valido,
         ctx,
+        escopo,
+        qualificar: false,
+        alias: None,
     };
-    let texto = w.expr(&e)?;
+    let texto = w.compilar(&e)?;
     Ok(Sql {
         texto,
         params: w.params,
     })
+}
+
+/// `@request.` e `@collection.` no filtro do cliente: só o superusuário.
+pub fn macro_restrita(filtro: &str) -> bool {
+    filtro.contains("@request.") || filtro.contains("@collection.")
+}
+
+/// Nomes de coleção citados em `@collection.nome.campo`, sem repetir.
+pub fn colecoes_citadas(filtro: &str) -> Vec<String> {
+    let mut out = vec![];
+    let mut resto = filtro;
+    while let Some(i) = resto.find("@collection.") {
+        resto = &resto[i + "@collection.".len()..];
+        let nome: String = resto
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !nome.is_empty() && !out.iter().any(|n: &String| n.eq_ignore_ascii_case(&nome)) {
+            out.push(nome);
+        }
+    }
+    out
+}
+
+fn tem_colecao(e: &Expr) -> bool {
+    match e {
+        Expr::E(a, b) | Expr::Ou(a, b) => tem_colecao(a) || tem_colecao(b),
+        Expr::Cmp { esq, dir, .. } => eh_colecao(esq) || eh_colecao(dir),
+    }
+}
+
+fn eh_colecao(o: &Operando) -> bool {
+    matches!(o, Operando::Macro(n) if n.starts_with("@collection."))
+}
+
+fn achatar<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+    if let Expr::E(a, b) = e {
+        achatar(a, out);
+        achatar(b, out);
+    } else {
+        out.push(e);
+    }
+}
+
+/// `(colecao, campo)` se o operando é `@collection.colecao.campo`.
+fn colecao_do_operando(o: &Operando) -> Resultado<Option<(String, String)>> {
+    let Operando::Macro(n) = o else {
+        return Ok(None);
+    };
+    if !n.starts_with("@collection.") {
+        return Ok(None);
+    }
+    let (colecao, campo) = partir_colecao(n)?;
+    Ok(Some((colecao, campo)))
+}
+
+fn partir_colecao(nome: &str) -> Resultado<(String, String)> {
+    let resto = nome.strip_prefix("@collection.").unwrap_or("");
+    let mut p = resto.split('.');
+    let colecao = p.next().unwrap_or("");
+    let campo = p.next().unwrap_or("");
+    if colecao.is_empty()
+        || campo.is_empty()
+        || p.next().is_some()
+        || !identificador(colecao)
+        || !identificador(campo)
+    {
+        return Err(Erro::invalido(format!(
+            "Invalid filter: '{nome}' must be @collection.name.field"
+        )));
+    }
+    Ok((colecao.to_string(), campo.to_string()))
+}
+
+fn campo_da_colecao(o: &Operando, colecao: &str) -> Option<String> {
+    let (c, campo) = colecao_do_operando(o).ok().flatten()?;
+    c.eq_ignore_ascii_case(colecao).then_some(campo)
+}
+
+fn identificador(n: &str) -> bool {
+    let mut cs = n.chars();
+    matches!(cs.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && n.len() <= 100
 }
 
 /// `sort` do PocketBase (`-created,nome`, `@random`) em `ORDER BY`.
@@ -572,5 +842,96 @@ mod tests {
             "RANDOM()"
         );
         assert!(ordem("nome; DROP", &campos, Dialeto::Sqlite).is_err());
+    }
+
+    fn externas(colecao: &str, campo: &str) -> Resultado<String> {
+        let ok = match colecao {
+            "comentarios" => matches!(campo, "post" | "status" | "id"),
+            "tags" => matches!(campo, "nome" | "post"),
+            _ => false,
+        };
+        if !matches!(colecao, "comentarios" | "tags") {
+            return Err(Erro::invalido(format!(
+                "Invalid filter: unknown collection '{colecao}'"
+            )));
+        }
+        if !ok {
+            return Err(Erro::invalido(format!(
+                "Invalid filter: unknown field '{campo}'"
+            )));
+        }
+        Ok(colecao.into())
+    }
+
+    fn escopo() -> Escopo<'static> {
+        Escopo {
+            tabela: "posts",
+            externa: &externas,
+        }
+    }
+
+    #[test]
+    fn collection_vira_exists_na_mesma_linha() {
+        let s = para_sql_escopo(
+            "@collection.comentarios.post = id && @collection.comentarios.status = \"ok\"",
+            &campos,
+            Dialeto::Sqlite,
+            &Contexto::default(),
+            &escopo(),
+        )
+        .unwrap();
+        assert_eq!(
+            s.texto,
+            "EXISTS (SELECT 1 FROM \"comentarios\" AS \"_c_comentarios\" WHERE \"_c_comentarios\".\"post\" = \"posts\".\"id\" AND \"_c_comentarios\".\"status\" = ?)"
+        );
+        assert_eq!(s.params, vec![Literal::Texto("ok".into())]);
+    }
+
+    #[test]
+    fn collection_no_ou_nao_exige_a_outra_colecao() {
+        let s = para_sql_escopo(
+            "nome = \"publico\" || (@collection.comentarios.post = id && @collection.comentarios.status = \"ok\")",
+            &campos,
+            Dialeto::Sqlite,
+            &Contexto::default(),
+            &escopo(),
+        )
+        .unwrap();
+        assert_eq!(
+            s.texto,
+            "(\"nome\" = ? OR EXISTS (SELECT 1 FROM \"comentarios\" AS \"_c_comentarios\" WHERE \"_c_comentarios\".\"post\" = \"posts\".\"id\" AND \"_c_comentarios\".\"status\" = ?))"
+        );
+        assert_eq!(
+            s.params,
+            vec![Literal::Texto("publico".into()), Literal::Texto("ok".into())]
+        );
+    }
+
+    #[test]
+    fn duas_colecoes_sao_dois_exists() {
+        let s = para_sql_escopo(
+            "@collection.tags.nome = \"rust\" && @collection.tags.post = id && @collection.comentarios.post = id",
+            &campos,
+            Dialeto::Sqlite,
+            &Contexto::default(),
+            &escopo(),
+        )
+        .unwrap();
+        assert!(s.texto.contains("FROM \"tags\""));
+        assert!(s.texto.contains("FROM \"comentarios\""));
+        assert_eq!(s.texto.matches("EXISTS").count(), 2);
+    }
+
+    #[test]
+    fn collection_desconhecida_falha() {
+        let e = para_sql_escopo(
+            "@collection.ausente.id = id",
+            &campos,
+            Dialeto::Sqlite,
+            &Contexto::default(),
+            &escopo(),
+        );
+        assert!(e.is_err());
+        assert!(para_sql("@collection.comentarios.id = id", &campos, Dialeto::Sqlite).is_err());
     }
 }
