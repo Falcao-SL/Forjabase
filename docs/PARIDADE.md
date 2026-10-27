@@ -21,7 +21,7 @@ Três consequências:
 3. **Escala é vertical.** O Forja é um processo por instância, um `data.db` por
    projeto. Replicação e multi-nó ficam fora (ARQUITETURA §5).
 
-## 2. Onde estamos (2026-10-23)
+## 2. Onde estamos (2026-10-27)
 
 | Área | PocketBase | Appwrite | Forja | Onda |
 |---|---|---|---|---|
@@ -31,7 +31,7 @@ Três consequências:
 | Filtros, ordenação, paginação | ✅ | ✅ | ✅ | feito |
 | Superusuário, impersonate | ✅ | ✅ (console) | ✅ | feito |
 | E-mail: verificação, senha, troca | ✅ | ✅ | ✅ (console; SMTP na 0.5) | feito |
-| Relações + `expand` | ✅ | ✅ | 📋 | 0.2 |
+| Relações + `expand` | ✅ | ✅ | ✅ (falta `view`) | 0.2 |
 | Views (SQL somente leitura) | ✅ | ⛔ | 📋 | 0.2 |
 | Arquivos + miniaturas | ✅ | ✅ (buckets) | 📋 | 0.3 |
 | Lote (`/api/batch`) | ✅ | ⛔ | 📋 | 0.3 |
@@ -74,8 +74,7 @@ o caso de uso com um contrato só) e a arquitetura de containers.
 
 | Recurso | Detalhe que importa | Onda |
 |---|---|---|
-| `relation` + `expand` | É o que transforma tabelas em API utilizável. Inclui cascata e relações reversas. | 0.2 |
-| `@collection.*` nas regras | Permite regra do tipo "só quem é admin em `equipes`". | 0.2 |
+| `view` e `@collection.*` | O que ainda fecha a 0.2. `relation`, cascata e `expand` (direto, aninhado e reverso) já estão. | 0.2 |
 | Operadores `?=`, `?~`, `:isset`, `:changed`, `:length`, `:each` | Filtros de lista JSON e regras de transição (`status:changed`). | 0.2/0.3 |
 | `file` com miniaturas e URL assinada | Upload, recorte e proteção. | 0.3 |
 | SSE com filtro por regra | O cliente só recebe o que pode ver. | 0.3 |
@@ -91,8 +90,8 @@ o caso de uso com um contrato só) e a arquitetura de containers.
 
 Ordem por **impacto no app real**, não por tamanho:
 
-1. **0.2 — Relações, `expand` e views.** Sem isso, todo cliente faz N+1 na mão.
-   Junto: `@collection.*` e os operadores de lista.
+1. **0.2 — Views e `@collection.*`.** Relação, cascata e `expand` já evitam o
+   N+1. Falta a coleção somente leitura e a macro que olha outra coleção.
 2. **0.3 — Arquivos, lote e tempo real.** Fecha o trio que faz um app parecer
    pronto: anexo, upload em lote e atualização ao vivo.
 3. **0.4 — Painel.** Quem não programa precisa criar coleção e ver registro.

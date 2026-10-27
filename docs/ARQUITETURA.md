@@ -122,7 +122,9 @@ Não se escreve SDK antes da 0.9. Até lá, o SDK oficial do PocketBase é o
 cliente: se ele funciona, a compatibilidade é real e não autodeclarada.
 
 **Estado:** a onda 1 está concluída (2026-10-23) com o envio de e-mail no
-console; o SMTP entra na onda 5, atrás do mesmo trait `Correio`.
+console; o SMTP entra na onda 5, atrás do mesmo trait `Correio`. Em 2026-10-27
+entrou o barramento de escrita (M1) e a fatia de relações da onda 2
+(`relation`, cascata, `expand`). Faltam `view` e `@collection.*`.
 
 ## 5. O que fica de fora, por decisão
 

@@ -18,7 +18,9 @@ use forja_core::store::{Banco, Consulta, Credenciais, Motor, Superusuario};
 use forja_core::{Collection, CollectionType, Erro, Field};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 
 /// Onboarding do primeiro superusuário.
@@ -367,6 +369,73 @@ fn esconder(c: &Collection, quem: &Chamador, mut v: Value) -> Value {
     v
 }
 
+/// Esconde campos do registro e de tudo que veio em `expand`.
+fn apresentar<'a>(
+    e: &'a Estado,
+    quem: &'a Chamador,
+    c: &'a Collection,
+    v: Value,
+) -> Pin<Box<dyn Future<Output = Value> + Send + 'a>> {
+    Box::pin(async move {
+        let mut v = esconder(c, quem, v);
+        let Some(exp) = v.as_object_mut().and_then(|m| m.remove("expand")) else {
+            return v;
+        };
+        let Value::Object(obj) = exp else {
+            if let Some(m) = v.as_object_mut() {
+                m.insert("expand".into(), exp);
+            }
+            return v;
+        };
+        let mut novo = Map::new();
+        for (k, val) in obj {
+            novo.insert(k, apresentar_valor(e, quem, val).await);
+        }
+        if let Some(m) = v.as_object_mut() {
+            m.insert("expand".into(), Value::Object(novo));
+        }
+        v
+    })
+}
+
+fn apresentar_valor<'a>(
+    e: &'a Estado,
+    quem: &'a Chamador,
+    val: Value,
+) -> Pin<Box<dyn Future<Output = Value> + Send + 'a>> {
+    Box::pin(async move {
+        match val {
+            Value::Array(a) => {
+                let mut out = Vec::with_capacity(a.len());
+                for item in a {
+                    out.push(apresentar_qualquer(e, quem, item).await);
+                }
+                Value::Array(out)
+            }
+            Value::Object(_) => apresentar_qualquer(e, quem, val).await,
+            other => other,
+        }
+    })
+}
+
+fn apresentar_qualquer<'a>(
+    e: &'a Estado,
+    quem: &'a Chamador,
+    v: Value,
+) -> Pin<Box<dyn Future<Output = Value> + Send + 'a>> {
+    Box::pin(async move {
+        let nome = v
+            .get("collectionName")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        match e.banco.colecao(&nome).await {
+            Ok(c) => apresentar(e, quem, &c, v).await,
+            Err(_) => v,
+        }
+    })
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ParamsLista {
@@ -375,6 +444,12 @@ struct ParamsLista {
     sort: Option<String>,
     filter: Option<String>,
     skip_total: Option<bool>,
+    expand: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct ParamsExpand {
+    expand: Option<String>,
 }
 
 async fn colecao_de(e: &Estado, nome: String) -> Res<Collection> {
@@ -399,11 +474,22 @@ async fn registros_listar(
         contexto: quem.contexto(),
     };
     let mut lista = e.banco.listar(&c, &q).await?;
-    lista.items = lista
-        .items
-        .into_iter()
-        .map(|v| esconder(&c, &quem, v))
-        .collect();
+    if let Some(exp) = p.expand.filter(|s| !s.trim().is_empty()) {
+        e.banco
+            .expandir(
+                &c,
+                &mut lista.items,
+                &exp,
+                quem.superusuario(),
+                &quem.contexto(),
+            )
+            .await?;
+    }
+    let mut items = Vec::with_capacity(lista.items.len());
+    for v in lista.items {
+        items.push(apresentar(&e, &quem, &c, v).await);
+    }
+    lista.items = items;
     Ok(Json(serde_json::to_value(lista).unwrap_or_default()))
 }
 
@@ -411,20 +497,29 @@ async fn registros_ver(
     State(e): State<Estado>,
     quem: Chamador,
     Path((nome, id)): Path<(String, String)>,
+    Query(p): Query<ParamsExpand>,
 ) -> Res<Json<Value>> {
     let c = colecao_de(&e, nome).await?;
     let regra = regra_para(&quem, &c.view_rule)?;
-    let r = e
+    let mut r = e
         .banco
         .registro_com(&c, &id, regra.as_deref(), &quem.contexto())
         .await?;
-    Ok(Json(esconder(&c, &quem, r)))
+    if let Some(exp) = p.expand.filter(|s| !s.trim().is_empty()) {
+        let mut itens = vec![r];
+        e.banco
+            .expandir(&c, &mut itens, &exp, quem.superusuario(), &quem.contexto())
+            .await?;
+        r = itens.pop().unwrap_or(Value::Null);
+    }
+    Ok(Json(apresentar(&e, &quem, &c, r).await))
 }
 
 async fn registros_criar(
     State(e): State<Estado>,
     quem: Chamador,
     Path(nome): Path<String>,
+    Query(p): Query<ParamsExpand>,
     Json(mut dados): Json<Map<String, Value>>,
 ) -> Res<Json<Value>> {
     let c = colecao_de(&e, nome).await?;
@@ -433,7 +528,10 @@ async fn registros_criar(
         dados.remove("verified");
     }
     let regra = regra_para(&quem, &c.create_rule)?;
-    let r = e.banco.criar(&c, &dados).await?;
+    let r = e
+        .banco
+        .criar_chamador(&c, &dados, &quem.contexto(), quem.superusuario())
+        .await?;
     // A regra de criação é conferida no registro criado; se não passar, ele sai.
     if let Some(regra) = regra {
         let id = r["id"].as_str().unwrap_or_default();
@@ -446,13 +544,22 @@ async fn registros_criar(
             return Err(ErroApi(Erro::invalido("Failed to create record.")));
         }
     }
-    Ok(Json(esconder(&c, &quem, r)))
+    let mut r = r;
+    if let Some(exp) = p.expand.filter(|s| !s.trim().is_empty()) {
+        let mut itens = vec![r];
+        e.banco
+            .expandir(&c, &mut itens, &exp, quem.superusuario(), &quem.contexto())
+            .await?;
+        r = itens.pop().unwrap_or(Value::Null);
+    }
+    Ok(Json(apresentar(&e, &quem, &c, r).await))
 }
 
 async fn registros_atualizar(
     State(e): State<Estado>,
     quem: Chamador,
     Path((nome, id)): Path<(String, String)>,
+    Query(p): Query<ParamsExpand>,
     Json(mut dados): Json<Map<String, Value>>,
 ) -> Res<Json<Value>> {
     let c = colecao_de(&e, nome).await?;
@@ -476,11 +583,25 @@ async fn registros_atualizar(
             dados.remove("email");
         }
     }
-    let r = e
+    let mut r = e
         .banco
-        .atualizar_com(&c, &id, &dados, regra.as_deref(), &quem.contexto())
+        .atualizar_chamador(
+            &c,
+            &id,
+            &dados,
+            regra.as_deref(),
+            &quem.contexto(),
+            quem.superusuario(),
+        )
         .await?;
-    Ok(Json(esconder(&c, &quem, r)))
+    if let Some(exp) = p.expand.filter(|s| !s.trim().is_empty()) {
+        let mut itens = vec![r];
+        e.banco
+            .expandir(&c, &mut itens, &exp, quem.superusuario(), &quem.contexto())
+            .await?;
+        r = itens.pop().unwrap_or(Value::Null);
+    }
+    Ok(Json(apresentar(&e, &quem, &c, r).await))
 }
 
 async fn registros_apagar(
@@ -1967,5 +2088,98 @@ mod tests {
         assert_eq!(h["location"], "/_/login");
         let set = h["set-cookie"].to_str().unwrap();
         assert!(set.contains("Max-Age=0"), "{set}");
+    }
+
+    #[tokio::test]
+    async fn expand_na_listagem_e_no_registro() {
+        let e = estado().await;
+        let t = login(&e).await;
+        let (s, autores) = chamar(
+            &e,
+            "POST",
+            "/api/collections",
+            Some(&t),
+            Some(json!({
+                "name": "autores",
+                "fields": [{"name": "nome", "type": "text", "required": true}],
+                "listRule": "",
+                "viewRule": ""
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{autores}");
+        let (s, autor) = chamar(
+            &e,
+            "POST",
+            "/api/collections/autores/records",
+            Some(&t),
+            Some(json!({"nome": "Ana"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{autor}");
+        let (s, posts) = chamar(
+            &e,
+            "POST",
+            "/api/collections",
+            Some(&t),
+            Some(json!({
+                "name": "posts",
+                "fields": [
+                    {"name": "titulo", "type": "text", "required": true},
+                    {
+                        "name": "autor",
+                        "type": "relation",
+                        "collectionId": autores["id"],
+                        "required": true
+                    }
+                ],
+                "listRule": "",
+                "viewRule": "",
+                "createRule": ""
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{posts}");
+        assert_eq!(posts["fields"][1]["collectionId"], autores["id"]);
+        let (s, post) = chamar(
+            &e,
+            "POST",
+            "/api/collections/posts/records?expand=autor",
+            None,
+            Some(json!({"titulo": "Olá", "autor": autor["id"]})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{post}");
+        assert_eq!(post["expand"]["autor"]["nome"], json!("Ana"));
+        let id = post["id"].as_str().unwrap();
+        let (s, visto) = chamar(
+            &e,
+            "GET",
+            &format!("/api/collections/posts/records/{id}?expand=autor"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{visto}");
+        assert_eq!(visto["expand"]["autor"]["id"], autor["id"]);
+        let (s, lista) = chamar(
+            &e,
+            "GET",
+            "/api/collections/posts/records?expand=autor",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{lista}");
+        assert_eq!(lista["items"][0]["expand"]["autor"]["nome"], json!("Ana"));
+        let (s, ruim) = chamar(
+            &e,
+            "GET",
+            &format!("/api/collections/posts/records/{id}?expand=nao_existe"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{ruim}");
     }
 }

@@ -2,6 +2,15 @@
 
 ## Não lançado
 
+- Barramento de escrita (ADR-001, M1): depois do commit, `criar`, `atualizar`
+  e `apagar` publicam `Evento { colecao, acao, id }` num `tokio::broadcast`.
+  Vale também para senha, verificação de e-mail, superusuário e cada registro
+  atingido pela cascata. Sem assinante, ou com assinante lento, a escrita fica.
+  Ainda não há rota SSE.
+- Campo `relation` (um e vários), com `collectionId`, `minSelect`, `maxSelect`
+  e `cascadeDelete`. O `expand` cobre relação direta, aninhada e reversa
+  (`colecao_via_campo`) em listar, ver, criar e atualizar. O painel edita o
+  id (ou ids separados por vírgula).
 - Coleções **auth** de verdade: toda coleção do tipo `auth` ganha os cinco campos
   de sistema do PocketBase (`email`, `emailVisibility`, `verified`, `password`,
   `tokenKey`), e-mail único sem diferenciar maiúsculas e senha guardada em

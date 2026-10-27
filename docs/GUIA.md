@@ -127,9 +127,10 @@ curl -X POST http://127.0.0.1:8090/api/collections \
 ```
 
 Tipos de campo que já guardam valores: `text`, `editor`, `number`, `bool`,
-`email`, `url`, `date`, `select` e `json`. Os outros (`file`, `relation`,
-`password`, `autodate`, `geoPoint`) são recusados com uma mensagem clara até
-chegarem.
+`email`, `url`, `date`, `select`, `json`, `relation` e `password` (só em
+coleção `auth`). Os outros (`file`, `autodate`, `geoPoint`) são recusados
+com uma mensagem clara até chegarem. `relation` guarda o id (ou uma lista,
+se `maxSelect` > 1) e aceita `?expand=campo` ou `?expand=colecao_via_campo`.
 
 Registros:
 
@@ -152,8 +153,11 @@ de validação vêm no formato do PocketBase:
 ```
 
 Regras e filtros já aceitam `@request.auth.*` (o registro autenticado).
-*(planejado)* `expand`, `fields`, operadores `?=`, as demais macros `@request`,
-`PATCH` de coleção, e a URL por projeto (`https://host/p/loja`).
+`expand` direto, aninhado e reverso já responde em listar, ver, criar e
+atualizar.
+*(planejado)* `fields`, operadores `?=`, as demais macros `@request` e
+`@collection`, coleções `view`, `PATCH` de coleção, e a URL por projeto
+(`https://host/p/loja`).
 
 ## 6. Autenticação
 

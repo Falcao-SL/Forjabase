@@ -5,6 +5,7 @@
 //! Cada coleção base vira uma tabela com o nome dela: `id`, uma coluna por
 //! campo, `created` e `updated`. As coleções ficam descritas em `_collections`.
 
+use crate::barramento::{Acao, Barramento, Evento};
 use crate::erro::{Erro, Resultado};
 use crate::filtro::{self, Contexto, Dialeto, Literal};
 use crate::motor::{Executor, Linha};
@@ -12,6 +13,9 @@ use crate::valor::Valor;
 use crate::{Collection, CollectionType, Field, FieldType, agora, auth, id};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 /// Pedido de listagem, com os parâmetros da API do PocketBase.
@@ -118,6 +122,8 @@ pub struct Credenciais {
 #[derive(Clone)]
 pub struct Banco {
     ex: Arc<dyn Executor>,
+    /// Escritas de registro. Clonar o banco não abre outro canal.
+    barramento: Barramento,
 }
 
 // ── Abrir ────────────────────────────────────────────────────────────────
@@ -155,7 +161,10 @@ impl Banco {
     }
     /// Sobre um executor já aberto; cria as tabelas de sistema se faltarem.
     pub async fn novo(ex: Arc<dyn Executor>) -> Resultado<Banco> {
-        let b = Banco { ex };
+        let b = Banco {
+            ex,
+            barramento: Barramento::novo(),
+        };
         b.ex.lote(
             esquema(b.dialeto())
                 .into_iter()
@@ -216,6 +225,20 @@ impl Banco {
     /// `sqlite`, `turso` ou `postgres`.
     pub fn motor(&self) -> &'static str {
         self.ex.nome()
+    }
+
+    /// Assina as escritas de registro. O receptor só vê o que acontecer
+    /// depois desta chamada; evento antigo não é repetido.
+    pub fn assinar(&self) -> tokio::sync::broadcast::Receiver<Evento> {
+        self.barramento.assinar()
+    }
+
+    fn publicar(&self, colecao: &str, acao: Acao, id: &str) {
+        self.barramento.publicar(Evento {
+            colecao: colecao.to_string(),
+            acao,
+            id: id.to_string(),
+        });
     }
 }
 
@@ -293,7 +316,9 @@ fn tipo_sql(f: &Field, d: Dialeto) -> &'static str {
         (FieldType::Number, Dialeto::Postgres) => "DOUBLE PRECISION NOT NULL DEFAULT 0",
         (FieldType::Bool, _) => "BOOLEAN NOT NULL DEFAULT FALSE",
         (FieldType::Json, _) => "TEXT DEFAULT NULL",
-        (FieldType::Select, _) if f.multiplo() => "TEXT NOT NULL DEFAULT '[]'",
+        (FieldType::Select | FieldType::Relation, _) if f.multiplo() => {
+            "TEXT NOT NULL DEFAULT '[]'"
+        }
         _ => "TEXT NOT NULL DEFAULT ''",
     }
 }
@@ -599,8 +624,89 @@ fn valor_do_campo(f: &Field, v: Option<&Value>, erros: &mut Map<String, Value>) 
                 Valor::Texto(valor.to_string())
             }
         }
+        FieldType::Relation => valor_relacao(f, v, erros),
         // Tipos ainda não suportados não chegam aqui: a coleção é recusada antes.
         _ => Valor::Nulo,
+    }
+}
+
+/// Forma e limites de um `relation`. A existência dos ids é conferida depois,
+/// porque precisa do banco.
+fn valor_relacao(f: &Field, v: Option<&Value>, erros: &mut Map<String, Value>) -> Valor {
+    let n = f.name.as_str();
+    let mut ids = match v {
+        None | Some(Value::Null) => vec![],
+        Some(Value::String(s)) if s.is_empty() => vec![],
+        Some(Value::String(s)) => vec![s.clone()],
+        Some(Value::Array(a)) => {
+            let mut out = vec![];
+            for x in a {
+                match x.as_str() {
+                    Some("") => {}
+                    Some(s) if !out.iter().any(|o| o == s) => out.push(s.to_string()),
+                    Some(_) => {}
+                    None => erro_campo(
+                        erros,
+                        n,
+                        "validation_invalid_value",
+                        "Invalid value.".into(),
+                    ),
+                }
+            }
+            out
+        }
+        _ => {
+            erro_campo(
+                erros,
+                n,
+                "validation_invalid_value",
+                "Invalid value.".into(),
+            );
+            vec![]
+        }
+    };
+    if ids.iter().any(|id| !id::valido(id)) {
+        erro_campo(
+            erros,
+            n,
+            "validation_invalid_id",
+            "Must be 15 characters [a-z0-9].".into(),
+        );
+    } else {
+        let max = {
+            let m = f.opcao_f64("maxSelect").unwrap_or(1.0);
+            if m < 1.0 { 1 } else { m as usize }
+        };
+        let mut min = f.opcao_f64("minSelect").unwrap_or(0.0).max(0.0) as usize;
+        if f.required && min < 1 {
+            min = 1;
+        }
+        if ids.len() > max {
+            erro_campo(
+                erros,
+                n,
+                "validation_too_many_values",
+                format!("Select no more than {max}."),
+            );
+            ids.truncate(max);
+        }
+        if ids.len() < min {
+            if ids.is_empty() {
+                erro_campo(erros, n, "validation_required", "Cannot be blank.".into());
+            } else {
+                erro_campo(
+                    erros,
+                    n,
+                    "validation_min_select_constraint",
+                    format!("Select at least {min}."),
+                );
+            }
+        }
+    }
+    if f.multiplo() {
+        Valor::Texto(serde_json::to_string(&ids).unwrap_or_else(|_| "[]".into()))
+    } else {
+        Valor::Texto(ids.into_iter().next().unwrap_or_default())
     }
 }
 
@@ -615,7 +721,11 @@ fn numero_json(x: f64) -> Value {
 /// Valor do banco para o JSON da resposta, igual em todos os motores.
 fn para_json(f: &Field, v: Valor) -> Value {
     match (f.kind, v) {
-        (_, Valor::Nulo) if f.kind == FieldType::Select && f.multiplo() => json!([]),
+        (_, Valor::Nulo)
+            if matches!(f.kind, FieldType::Select | FieldType::Relation) && f.multiplo() =>
+        {
+            json!([])
+        }
         (FieldType::Json, Valor::Nulo) => Value::Null,
         (FieldType::Number, Valor::Nulo) => json!(0),
         (FieldType::Bool, Valor::Nulo) => json!(false),
@@ -627,7 +737,7 @@ fn para_json(f: &Field, v: Valor) -> Value {
         }
         (FieldType::Bool, v) => json!(v.bool()),
         (FieldType::Json, Valor::Texto(t)) => serde_json::from_str(&t).unwrap_or(Value::Null),
-        (FieldType::Select, Valor::Texto(t)) if f.multiplo() => {
+        (FieldType::Select | FieldType::Relation, Valor::Texto(t)) if f.multiplo() => {
             serde_json::from_str(&t).unwrap_or(json!([]))
         }
         (_, Valor::Texto(t)) => json!(t),
@@ -746,6 +856,7 @@ fn validar_colecao(c: &Collection, d: Dialeto) -> Resultado<()> {
     if !nome_valido(&c.name)
         || c.name.starts_with('_')
         || c.name.to_lowercase().starts_with("sqlite_")
+        || c.name.contains("_via_")
     {
         erro_campo(
             &mut erros,
@@ -773,7 +884,10 @@ fn validar_colecao(c: &Collection, d: Dialeto) -> Resultado<()> {
     let mut vistos: Vec<String> = vec![];
     for (i, f) in c.fields.iter().enumerate() {
         let chave = format!("fields.{i}.name");
-        if !nome_valido(&f.name) || RESERVADOS.contains(&f.name.as_str()) {
+        if !nome_valido(&f.name)
+            || RESERVADOS.contains(&f.name.as_str())
+            || f.name.contains("_via_")
+        {
             erro_campo(
                 &mut erros,
                 &chave,
@@ -797,6 +911,21 @@ fn validar_colecao(c: &Collection, d: Dialeto) -> Resultado<()> {
                 "validation_not_supported",
                 "Password fields are only allowed in auth collections.".into(),
             );
+        }
+        if f.kind == FieldType::Relation {
+            let max = {
+                let m = f.opcao_f64("maxSelect").unwrap_or(1.0);
+                if m < 1.0 { 1.0 } else { m }
+            };
+            let min = f.opcao_f64("minSelect").unwrap_or(0.0);
+            if min > max {
+                erro_campo(
+                    &mut erros,
+                    &format!("fields.{i}.minSelect"),
+                    "validation_min_select_constraint",
+                    "Min select cannot be greater than max select.".into(),
+                );
+            }
         }
         if !f.kind.suportado() {
             let tipo = serde_json::to_value(f.kind)
@@ -1027,6 +1156,7 @@ impl Banco {
                 f.id = format!("{tipo}{}", id::aleatorio(10));
             }
         }
+        self.normalizar_relacoes(&mut c).await?;
         let existe = self
             .contar(
                 "SELECT COUNT(*) FROM \"_collections\" WHERE lower(\"name\") = lower(?) OR \"id\" = ?",
@@ -1213,6 +1343,20 @@ impl Banco {
     }
 
     pub async fn criar(&self, c: &Collection, dados: &Map<String, Value>) -> Resultado<Value> {
+        // Chamada interna e painel: enxerga os alvos das relações.
+        self.criar_chamador(c, dados, &Contexto::default(), true)
+            .await
+    }
+
+    /// Como `criar`. `superusuario` falso só aceita relação com registro que
+    /// a `viewRule` do alvo deixa ver.
+    pub async fn criar_chamador(
+        &self,
+        c: &Collection,
+        dados: &Map<String, Value>,
+        ctx: &Contexto,
+        superusuario: bool,
+    ) -> Resultado<Value> {
         let mut erros = Map::new();
         let novo_id = match dados
             .get("id")
@@ -1247,6 +1391,16 @@ impl Banco {
                 "validation_not_unique",
                 "The email is invalid or already in use.".into(),
             );
+        }
+        if erros.is_empty() {
+            self.conferir_relacoes(
+                c,
+                c.fields.iter().zip(valores.iter()),
+                ctx,
+                superusuario,
+                &mut erros,
+            )
+            .await?;
         }
         if !erros.is_empty() {
             return Err(invalido("Failed to create record.", erros));
@@ -1294,6 +1448,7 @@ impl Banco {
             return Err(invalido("Failed to create record.", erros));
         }
         r?;
+        self.publicar(&c.name, Acao::Criar, &novo_id);
         self.registro(c, &novo_id, None).await
     }
 
@@ -1304,7 +1459,7 @@ impl Banco {
         dados: &Map<String, Value>,
         regra: Option<&str>,
     ) -> Resultado<Value> {
-        self.atualizar_com(c, id, dados, regra, &Contexto::default())
+        self.atualizar_chamador(c, id, dados, regra, &Contexto::default(), true)
             .await
     }
 
@@ -1316,6 +1471,21 @@ impl Banco {
         dados: &Map<String, Value>,
         regra: Option<&str>,
         ctx: &Contexto,
+    ) -> Resultado<Value> {
+        self.atualizar_chamador(c, id, dados, regra, ctx, true)
+            .await
+    }
+
+    /// Como `atualizar_com`. `superusuario` falso aplica a `viewRule` do alvo
+    /// de cada relação enviada.
+    pub async fn atualizar_chamador(
+        &self,
+        c: &Collection,
+        id: &str,
+        dados: &Map<String, Value>,
+        regra: Option<&str>,
+        ctx: &Contexto,
+        superusuario: bool,
     ) -> Resultado<Value> {
         let atual = self.registro_com(c, id, regra, ctx).await?;
         let mut erros = Map::new();
@@ -1370,6 +1540,19 @@ impl Banco {
             sets.push(("tokenKey".into(), Valor::Texto(id::aleatorio(50))));
         }
         sets.push(("updated".into(), agora().into()));
+        self.conferir_relacoes(
+            c,
+            sets.iter()
+                .map(|(n, v)| (c.campo(n), v))
+                .filter_map(|(f, v)| f.map(|f| (f, v))),
+            ctx,
+            superusuario,
+            &mut erros,
+        )
+        .await?;
+        if !erros.is_empty() {
+            return Err(invalido("Failed to update record.", erros));
+        }
         let atribuicoes: Vec<String> = sets
             .iter()
             .map(|(nome, _)| format!("\"{nome}\" = ?"))
@@ -1386,6 +1569,7 @@ impl Banco {
                 valores,
             )
             .await?;
+        self.publicar(&c.name, Acao::Atualizar, id);
         self.registro_com(c, id, None, ctx).await
     }
 
@@ -1401,13 +1585,8 @@ impl Banco {
         ctx: &Contexto,
     ) -> Resultado<()> {
         self.registro_com(c, id, regra, ctx).await?;
-        self.ex
-            .executar(
-                &format!("DELETE FROM \"{}\" WHERE \"id\" = ?", c.name),
-                vec![id.into()],
-            )
-            .await?;
-        Ok(())
+        let efeitos = self.planejar_cascata(c, id).await?;
+        self.aplicar_efeitos(efeitos).await
     }
 
     /// Credenciais de um usuário de coleção `auth`, por e-mail ou por id.
@@ -1476,6 +1655,7 @@ impl Banco {
                 ],
             )
             .await?;
+        self.publicar(&c.name, Acao::Atualizar, id);
         Ok(())
     }
 
@@ -1510,6 +1690,7 @@ impl Banco {
                     .await?;
             }
         }
+        self.publicar(&c.name, Acao::Atualizar, id);
         Ok(())
     }
 
@@ -1563,6 +1744,7 @@ impl Banco {
                         vec![hash.into(), chave.into(), agora.into(), i.clone().into()],
                     )
                     .await?;
+                self.publicar("_superusers", Acao::Atualizar, &i);
                 i
             }
             None => {
@@ -1573,6 +1755,7 @@ impl Banco {
                         vec![i.clone().into(), email.into(), hash.into(), chave.into(), agora.clone().into(), agora.into()],
                     )
                     .await?;
+                self.publicar("_superusers", Acao::Criar, &i);
                 i
             }
         };
@@ -1645,7 +1828,9 @@ impl Banco {
         let agora = agora();
         self.ex
             .executar(
-                &format!("INSERT INTO \"_superusers\" ({COLS_SUPERUSER}) VALUES (?, ?, ?, ?, ?, ?)"),
+                &format!(
+                    "INSERT INTO \"_superusers\" ({COLS_SUPERUSER}) VALUES (?, ?, ?, ?, ?, ?)"
+                ),
                 vec![
                     id_su.clone().into(),
                     email.into(),
@@ -1656,6 +1841,7 @@ impl Banco {
                 ],
             )
             .await?;
+        self.publicar("_superusers", Acao::Criar, &id_su);
         self.superuser(&id_su).await
     }
 
@@ -1679,6 +1865,7 @@ impl Banco {
                 ],
             )
             .await?;
+        self.publicar("_superusers", Acao::Atualizar, &su.id);
         self.superuser(&su.id).await
     }
 
@@ -1697,15 +1884,12 @@ impl Banco {
                 vec![su.id.clone().into()],
             )
             .await?;
+        self.publicar("_superusers", Acao::Apagar, &su.id);
         Ok(su)
     }
 
     /// Valida e-mail e senha e devolve `(email_normalizado, hash)`.
-    async fn superuser_normalizar(
-        &self,
-        email: &str,
-        senha: &str,
-    ) -> Resultado<(String, String)> {
+    async fn superuser_normalizar(&self, email: &str, senha: &str) -> Resultado<(String, String)> {
         let mut erros = Map::new();
         let email = email.trim().to_lowercase();
         let ok_email = email
@@ -1735,6 +1919,668 @@ impl Banco {
             .await
             .map_err(|e| Erro::Interno(e.to_string()))??;
         Ok((email, hash))
+    }
+}
+
+// ── Relações, cascata e expand (0.2) ─────────────────────────────────────
+
+struct Reverso<'a> {
+    colecao: &'a str,
+    campo: &'a str,
+    chave: &'a str,
+    sufixo: &'a str,
+}
+
+enum Efeito {
+    Apagar {
+        colecao: Collection,
+        id: String,
+    },
+    Desligar {
+        colecao: Collection,
+        id: String,
+        campo: Field,
+        restantes: Vec<String>,
+    },
+}
+
+fn expand_desconhecido(nome: &str) -> Erro {
+    Erro::invalido(format!("Invalid expand: unknown relation '{nome}'."))
+}
+
+fn ids_guardados(f: &Field, v: &Valor) -> Vec<String> {
+    let texto = v.texto().unwrap_or("");
+    if texto.is_empty() {
+        return vec![];
+    }
+    if f.multiplo() {
+        serde_json::from_str(texto).unwrap_or_default()
+    } else {
+        vec![texto.to_string()]
+    }
+}
+
+fn ids_no_registro(reg: &Value, campo: &Field) -> Vec<String> {
+    match reg.get(&campo.name) {
+        Some(Value::String(s)) if !s.is_empty() => vec![s.clone()],
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => vec![],
+    }
+}
+
+fn inserir_expand(item: &mut Value, chave: &str, valor: Value) {
+    let Some(obj) = item.as_object_mut() else {
+        return;
+    };
+    let expand = obj.entry("expand".to_string()).or_insert_with(|| json!({}));
+    if !expand.is_object() {
+        *expand = json!({});
+    }
+    if let Some(m) = expand.as_object_mut() {
+        m.insert(chave.to_string(), valor);
+    }
+}
+
+fn juntar_where(onde: &str, extra: &str) -> String {
+    if onde.is_empty() {
+        format!(" WHERE {extra}")
+    } else {
+        format!("{onde} AND {extra}")
+    }
+}
+
+fn predicado_aponta(campo: &str, multiplo: bool, d: Dialeto) -> String {
+    if !multiplo {
+        return format!("\"{campo}\" = ?");
+    }
+    match d {
+        Dialeto::Sqlite => {
+            format!("EXISTS (SELECT 1 FROM json_each(\"{campo}\") AS je WHERE je.value = ?)")
+        }
+        Dialeto::Postgres => format!(
+            "EXISTS (SELECT 1 FROM json_array_elements_text((\"{campo}\")::json) elem WHERE elem = ?)"
+        ),
+    }
+}
+
+fn predicado_reverso(campo: &str, multiplo: bool, n: usize, d: Dialeto) -> String {
+    let ph = vec!["?"; n].join(", ");
+    if !multiplo {
+        return format!("\"{campo}\" IN ({ph})");
+    }
+    match d {
+        Dialeto::Sqlite => {
+            format!("EXISTS (SELECT 1 FROM json_each(\"{campo}\") AS je WHERE je.value IN ({ph}))")
+        }
+        Dialeto::Postgres => format!(
+            "EXISTS (SELECT 1 FROM json_array_elements_text((\"{campo}\")::json) elem WHERE elem IN ({ph}))"
+        ),
+    }
+}
+
+impl Banco {
+    /// `collectionId` pode vir como id ou nome. Grava sempre o id.
+    /// O nome da própria coleção vale para relação consigo mesma.
+    async fn normalizar_relacoes(&self, c: &mut Collection) -> Resultado<()> {
+        let relacoes: Vec<(usize, String)> = c
+            .fields
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.kind == FieldType::Relation)
+            .map(|(i, f)| {
+                let bruto = f
+                    .options
+                    .get("collectionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                (i, bruto)
+            })
+            .collect();
+        let mut erros = Map::new();
+        let mut ajustes = vec![];
+        for (i, bruto) in relacoes {
+            if bruto.is_empty() {
+                erro_campo(
+                    &mut erros,
+                    &format!("fields.{i}.collectionId"),
+                    "validation_required",
+                    "Cannot be blank.".into(),
+                );
+                continue;
+            }
+            if bruto == c.id || bruto.eq_ignore_ascii_case(&c.name) {
+                ajustes.push((i, c.id.clone()));
+                continue;
+            }
+            match self.colecao(&bruto).await {
+                Ok(alvo) => ajustes.push((i, alvo.id)),
+                Err(_) => erro_campo(
+                    &mut erros,
+                    &format!("fields.{i}.collectionId"),
+                    "validation_missing_collection",
+                    "The relation collection doesn't exist.".into(),
+                ),
+            }
+        }
+        if !erros.is_empty() {
+            return Err(invalido("Failed to create collection.", erros));
+        }
+        for (i, id_alvo) in ajustes {
+            c.fields[i]
+                .options
+                .insert("collectionId".into(), json!(id_alvo));
+        }
+        Ok(())
+    }
+
+    async fn conferir_relacoes<'a, I>(
+        &self,
+        _c: &Collection,
+        pares: I,
+        ctx: &Contexto,
+        superusuario: bool,
+        erros: &mut Map<String, Value>,
+    ) -> Resultado<()>
+    where
+        I: IntoIterator<Item = (&'a Field, &'a Valor)>,
+    {
+        let pares: Vec<(&Field, &Valor)> = pares.into_iter().collect();
+        for (f, v) in pares {
+            if f.kind != FieldType::Relation {
+                continue;
+            }
+            let ids = ids_guardados(f, v);
+            if ids.is_empty() {
+                continue;
+            }
+            let Some(alvo_id) = f
+                .options
+                .get("collectionId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                erro_campo(
+                    erros,
+                    &f.name,
+                    "validation_missing_collection",
+                    "The relation collection doesn't exist.".into(),
+                );
+                continue;
+            };
+            let alvo = match self.colecao(&alvo_id).await {
+                Ok(a) => a,
+                Err(_) => {
+                    erro_campo(
+                        erros,
+                        &f.name,
+                        "validation_missing_collection",
+                        "The relation collection doesn't exist.".into(),
+                    );
+                    continue;
+                }
+            };
+            if !self
+                .relacoes_existem(&alvo, &ids, superusuario, ctx)
+                .await?
+            {
+                erro_campo(
+                    erros,
+                    &f.name,
+                    "validation_missing_rel_records",
+                    "Failed to find all relation records.".into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn relacoes_existem(
+        &self,
+        alvo: &Collection,
+        ids: &[String],
+        superusuario: bool,
+        ctx: &Contexto,
+    ) -> Resultado<bool> {
+        if ids.is_empty() {
+            return Ok(true);
+        }
+        if !superusuario && alvo.view_rule.is_none() {
+            return Ok(false);
+        }
+        let regra = if superusuario {
+            None
+        } else {
+            alvo.view_rule.as_deref()
+        };
+        for bloco in ids.chunks(400) {
+            let ph = vec!["?"; bloco.len()].join(", ");
+            let (onde, mut params) = self.onde(alvo, regra, None, ctx)?;
+            params.extend(bloco.iter().cloned().map(Valor::from));
+            let n = self
+                .contar(
+                    &format!(
+                        "SELECT COUNT(*) FROM \"{}\"{}",
+                        alvo.name,
+                        juntar_where(&onde, &format!("\"id\" IN ({ph})"))
+                    ),
+                    params,
+                )
+                .await?;
+            if n != bloco.len() as i64 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// O que apagar e o que só desligar, antes de qualquer escrita.
+    /// Relação obrigatória sem cascata impede o apagamento inteiro.
+    async fn planejar_cascata(&self, raiz: &Collection, raiz_id: &str) -> Resultado<Vec<Efeito>> {
+        let mut efeitos = Vec::new();
+        let mut vistos = HashSet::new();
+        let mut fila = VecDeque::new();
+        fila.push_back((raiz.clone(), raiz_id.to_string()));
+        while let Some((c, id)) = fila.pop_front() {
+            if !vistos.insert((c.id.clone(), id.clone())) {
+                continue;
+            }
+            efeitos.push(Efeito::Apagar {
+                colecao: c.clone(),
+                id: id.clone(),
+            });
+            for (outra, campo) in self.relacoes_que_apontam(&c).await? {
+                for reg in self.registros_que_apontam(&outra, &campo, &id).await? {
+                    let Some(rid) = reg.get("id").and_then(Value::as_str).map(str::to_string)
+                    else {
+                        continue;
+                    };
+                    if rid.is_empty() || vistos.contains(&(outra.id.clone(), rid.clone())) {
+                        continue;
+                    }
+                    let atuais = ids_no_registro(&reg, &campo);
+                    let restantes: Vec<String> = atuais
+                        .iter()
+                        .filter(|x| x.as_str() != id)
+                        .cloned()
+                        .collect();
+                    if restantes.is_empty() && campo.opcao_bool("cascadeDelete") {
+                        fila.push_back((outra.clone(), rid));
+                    } else if restantes.is_empty() && campo.required {
+                        return Err(Erro::invalido(
+                            "The record cannot be deleted because it is part of a required relation.",
+                        ));
+                    } else if restantes.len() != atuais.len() {
+                        efeitos.push(Efeito::Desligar {
+                            colecao: outra.clone(),
+                            id: rid,
+                            campo: campo.clone(),
+                            restantes,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(efeitos)
+    }
+
+    async fn aplicar_efeitos(&self, efeitos: Vec<Efeito>) -> Resultado<()> {
+        let mortos: HashSet<(String, String)> = efeitos
+            .iter()
+            .filter_map(|e| match e {
+                Efeito::Apagar { colecao, id } => Some((colecao.id.clone(), id.clone())),
+                Efeito::Desligar { .. } => None,
+            })
+            .collect();
+        for efeito in efeitos {
+            match efeito {
+                Efeito::Apagar { colecao, id } => {
+                    self.ex
+                        .executar(
+                            &format!("DELETE FROM \"{}\" WHERE \"id\" = ?", colecao.name),
+                            vec![id.clone().into()],
+                        )
+                        .await?;
+                    self.publicar(&colecao.name, Acao::Apagar, &id);
+                }
+                Efeito::Desligar {
+                    colecao,
+                    id,
+                    campo,
+                    restantes,
+                } => {
+                    if mortos.contains(&(colecao.id.clone(), id.clone())) {
+                        continue;
+                    }
+                    let valor = if campo.multiplo() {
+                        Valor::Texto(
+                            serde_json::to_string(&restantes).unwrap_or_else(|_| "[]".into()),
+                        )
+                    } else {
+                        Valor::Texto(restantes.first().cloned().unwrap_or_default())
+                    };
+                    self.ex
+                        .executar(
+                            &format!(
+                                "UPDATE \"{}\" SET \"{}\" = ?, \"updated\" = ? WHERE \"id\" = ?",
+                                colecao.name, campo.name
+                            ),
+                            vec![valor, agora().into(), id.clone().into()],
+                        )
+                        .await?;
+                    self.publicar(&colecao.name, Acao::Atualizar, &id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn relacoes_que_apontam(&self, alvo: &Collection) -> Resultado<Vec<(Collection, Field)>> {
+        let mut out = vec![];
+        for outra in self.colecoes().await? {
+            for f in &outra.fields {
+                if f.kind != FieldType::Relation {
+                    continue;
+                }
+                let id_alvo = f
+                    .options
+                    .get("collectionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if id_alvo == alvo.id {
+                    out.push((outra.clone(), f.clone()));
+                }
+            }
+        }
+        out.sort_by(|a, b| (&a.0.name, &a.1.name).cmp(&(&b.0.name, &b.1.name)));
+        Ok(out)
+    }
+
+    async fn registros_que_apontam(
+        &self,
+        c: &Collection,
+        campo: &Field,
+        id: &str,
+    ) -> Resultado<Vec<Value>> {
+        let pred = predicado_aponta(&campo.name, campo.multiplo(), self.dialeto());
+        let linhas = self
+            .ex
+            .consultar(
+                &format!("SELECT {} FROM \"{}\" WHERE {pred}", colunas(c), c.name),
+                vec![id.into()],
+            )
+            .await?;
+        Ok(linhas
+            .into_iter()
+            .map(|l| linha_para_registro(c, l))
+            .collect())
+    }
+
+    async fn registros_por_ids(
+        &self,
+        c: &Collection,
+        ids: &[String],
+        superusuario: bool,
+        ctx: &Contexto,
+    ) -> Resultado<Vec<Value>> {
+        if ids.is_empty() || (!superusuario && c.view_rule.is_none()) {
+            return Ok(vec![]);
+        }
+        let regra = if superusuario {
+            None
+        } else {
+            c.view_rule.as_deref()
+        };
+        let mut out = vec![];
+        for bloco in ids.chunks(400) {
+            let ph = vec!["?"; bloco.len()].join(", ");
+            let (onde, mut params) = self.onde(c, regra, None, ctx)?;
+            params.extend(bloco.iter().cloned().map(Valor::from));
+            let linhas = self
+                .ex
+                .consultar(
+                    &format!(
+                        "SELECT {} FROM \"{}\"{} ORDER BY \"created\", \"id\"",
+                        colunas(c),
+                        c.name,
+                        juntar_where(&onde, &format!("\"id\" IN ({ph})"))
+                    ),
+                    params,
+                )
+                .await?;
+            out.extend(linhas.into_iter().map(|l| linha_para_registro(c, l)));
+        }
+        Ok(out)
+    }
+
+    async fn registros_reversos(
+        &self,
+        c: &Collection,
+        campo: &Field,
+        pais: &[String],
+        superusuario: bool,
+        ctx: &Contexto,
+    ) -> Resultado<Vec<Value>> {
+        if pais.is_empty() || (!superusuario && c.view_rule.is_none()) {
+            return Ok(vec![]);
+        }
+        let regra = if superusuario {
+            None
+        } else {
+            c.view_rule.as_deref()
+        };
+        let mut out = vec![];
+        for bloco in pais.chunks(200) {
+            let pred =
+                predicado_reverso(&campo.name, campo.multiplo(), bloco.len(), self.dialeto());
+            let (onde, mut params) = self.onde(c, regra, None, ctx)?;
+            params.extend(bloco.iter().cloned().map(Valor::from));
+            let linhas = self
+                .ex
+                .consultar(
+                    &format!(
+                        "SELECT {} FROM \"{}\"{} ORDER BY \"created\", \"id\"",
+                        colunas(c),
+                        c.name,
+                        juntar_where(&onde, &pred)
+                    ),
+                    params,
+                )
+                .await?;
+            out.extend(linhas.into_iter().map(|l| linha_para_registro(c, l)));
+        }
+        Ok(out)
+    }
+
+    /// Preenche `expand` nos registros já carregados.
+    /// Relação direta vira objeto (um) ou lista (vários). Relação reversa
+    /// (`colecao_via_campo`) vira lista: sem índice único, vários registros
+    /// podem apontar para o mesmo id.
+    pub async fn expandir(
+        &self,
+        c: &Collection,
+        itens: &mut [Value],
+        caminho: &str,
+        superusuario: bool,
+        ctx: &Contexto,
+    ) -> Resultado<()> {
+        self.expandir_em(c, itens, caminho, superusuario, ctx, 0)
+            .await
+    }
+
+    fn expandir_em<'a>(
+        &'a self,
+        c: &'a Collection,
+        itens: &'a mut [Value],
+        caminho: &'a str,
+        superusuario: bool,
+        ctx: &'a Contexto,
+        profundidade: usize,
+    ) -> Pin<Box<dyn Future<Output = Resultado<()>> + Send + 'a>> {
+        Box::pin(async move {
+            if caminho.trim().is_empty() || itens.is_empty() {
+                return Ok(());
+            }
+            if profundidade >= crate::relacao::PROFUNDIDADE_MAX {
+                return Err(Erro::invalido("Expand nesting is too deep."));
+            }
+            for (nome, sufixo) in crate::relacao::pedidos(caminho) {
+                if let Some((colecao, campo)) = crate::relacao::partir_via(&nome) {
+                    self.anexar_reverso(
+                        c,
+                        itens,
+                        Reverso {
+                            colecao,
+                            campo,
+                            chave: &nome,
+                            sufixo: &sufixo,
+                        },
+                        superusuario,
+                        ctx,
+                        profundidade,
+                    )
+                    .await?;
+                } else {
+                    let Some(campo) = c.campo(&nome).cloned() else {
+                        return Err(expand_desconhecido(&nome));
+                    };
+                    if campo.kind != FieldType::Relation || (campo.hidden && !superusuario) {
+                        return Err(expand_desconhecido(&nome));
+                    }
+                    self.anexar_direto(itens, &campo, &sufixo, superusuario, ctx, profundidade)
+                        .await?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    async fn anexar_direto(
+        &self,
+        itens: &mut [Value],
+        campo: &Field,
+        sufixo: &str,
+        superusuario: bool,
+        ctx: &Contexto,
+        profundidade: usize,
+    ) -> Resultado<()> {
+        let alvo_id = campo
+            .options
+            .get("collectionId")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let alvo = self
+            .colecao(alvo_id)
+            .await
+            .map_err(|_| expand_desconhecido(&campo.name))?;
+        let mut ids = vec![];
+        for item in itens.iter() {
+            ids.extend(ids_no_registro(item, campo));
+        }
+        ids.sort();
+        ids.dedup();
+        let mut achados = self
+            .registros_por_ids(&alvo, &ids, superusuario, ctx)
+            .await?;
+        if !sufixo.is_empty() {
+            self.expandir_em(
+                &alvo,
+                &mut achados,
+                sufixo,
+                superusuario,
+                ctx,
+                profundidade + 1,
+            )
+            .await?;
+        }
+        let mapa: HashMap<String, Value> = achados
+            .into_iter()
+            .filter_map(|v| {
+                let id = v.get("id")?.as_str()?.to_string();
+                Some((id, v))
+            })
+            .collect();
+        for item in itens.iter_mut() {
+            let do_item = ids_no_registro(item, campo);
+            let valor = if campo.multiplo() {
+                Value::Array(
+                    do_item
+                        .iter()
+                        .filter_map(|id| mapa.get(id).cloned())
+                        .collect(),
+                )
+            } else {
+                do_item
+                    .first()
+                    .and_then(|id| mapa.get(id).cloned())
+                    .unwrap_or(Value::Null)
+            };
+            inserir_expand(item, &campo.name, valor);
+        }
+        Ok(())
+    }
+
+    async fn anexar_reverso(
+        &self,
+        origem: &Collection,
+        itens: &mut [Value],
+        rev: Reverso<'_>,
+        superusuario: bool,
+        ctx: &Contexto,
+        profundidade: usize,
+    ) -> Resultado<()> {
+        let outra = self
+            .colecao(rev.colecao)
+            .await
+            .map_err(|_| expand_desconhecido(rev.chave))?;
+        let Some(campo) = outra.campo(rev.campo).cloned() else {
+            return Err(expand_desconhecido(rev.chave));
+        };
+        let aponta = campo
+            .options
+            .get("collectionId")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if campo.kind != FieldType::Relation
+            || aponta != origem.id
+            || (campo.hidden && !superusuario)
+        {
+            return Err(expand_desconhecido(rev.chave));
+        }
+        let pais: Vec<String> = itens
+            .iter()
+            .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        let mut achados = self
+            .registros_reversos(&outra, &campo, &pais, superusuario, ctx)
+            .await?;
+        if !rev.sufixo.is_empty() {
+            self.expandir_em(
+                &outra,
+                &mut achados,
+                rev.sufixo,
+                superusuario,
+                ctx,
+                profundidade + 1,
+            )
+            .await?;
+        }
+        for item in itens.iter_mut() {
+            let pid = item.get("id").and_then(Value::as_str).unwrap_or("");
+            let lista: Vec<Value> = achados
+                .iter()
+                .filter(|r| ids_no_registro(r, &campo).iter().any(|x| x == pid))
+                .cloned()
+                .collect();
+            inserir_expand(item, rev.chave, Value::Array(lista));
+        }
+        Ok(())
     }
 }
 
@@ -2249,5 +3095,393 @@ mod tests {
         };
         let l = b.listar(&notas, &q).await.unwrap();
         assert_eq!(l.total_items, 0);
+    }
+
+    #[cfg(feature = "sqlite")]
+    async fn evento(rx: &mut tokio::sync::broadcast::Receiver<Evento>) -> Evento {
+        tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("evento não chegou a tempo")
+            .expect("canal fechado")
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn base(nome: &str, campos: Value) -> Collection {
+        serde_json::from_value(json!({
+            "name": nome,
+            "fields": campos,
+            "listRule": "",
+            "viewRule": ""
+        }))
+        .unwrap()
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn barramento_entrega_evento_e_escrita_sobrevive() {
+        let b = Banco::sqlite_memoria().await.unwrap();
+        let c = b
+            .criar_colecao(base("notas", json!([{"name": "t", "type": "text"}])))
+            .await
+            .unwrap();
+        let obj = |t: &str| json!({"t": t}).as_object().unwrap().clone();
+
+        // Sem assinante a escrita fica, e quem assina depois não recebe o passado.
+        let sozinho = b.criar(&c, &obj("sozinho")).await.unwrap();
+        let id_sozinho = sozinho["id"].as_str().unwrap();
+        assert!(b.registro(&c, id_sozinho, None).await.is_ok());
+        let mut rx = b.assinar();
+        assert!(rx.try_recv().is_err());
+
+        let ouvido = b.criar(&c, &obj("ouvido")).await.unwrap();
+        let id = ouvido["id"].as_str().unwrap().to_string();
+        let ev = rx.recv().await.unwrap();
+        assert_eq!(
+            ev,
+            Evento {
+                colecao: "notas".into(),
+                acao: Acao::Criar,
+                id: id.clone(),
+            }
+        );
+        b.atualizar(&c, &id, &obj("novo"), None).await.unwrap();
+        assert_eq!(rx.recv().await.unwrap().acao, Acao::Atualizar);
+        b.apagar(&c, &id, None).await.unwrap();
+        assert_eq!(rx.recv().await.unwrap().acao, Acao::Apagar);
+        assert!(b.registro(&c, &id, None).await.is_err());
+
+        // Assinante lento: o canal enche, as escritas continuam.
+        let mut lento = b.assinar();
+        for i in 0..(crate::barramento::CAPACIDADE + 3) {
+            b.criar(&c, &obj(&format!("n{i}"))).await.unwrap();
+        }
+        assert!(
+            b.listar(&c, &Consulta::default())
+                .await
+                .unwrap()
+                .total_items
+                > crate::barramento::CAPACIDADE as i64
+        );
+        assert!(matches!(
+            lento.recv().await,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
+        ));
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn relacao_expand_cascata_e_regra() {
+        let b = Banco::sqlite_memoria().await.unwrap();
+        let cidades = b
+            .criar_colecao(base("cidades", json!([{"name": "nome", "type": "text"}])))
+            .await
+            .unwrap();
+        let sp = b
+            .criar(&cidades, json!({"nome": "São Paulo"}).as_object().unwrap())
+            .await
+            .unwrap();
+        let usuarios = b
+            .criar_colecao(base(
+                "usuarios",
+                json!([
+                    {"name": "nome", "type": "text", "required": true},
+                    {"name": "cidade", "type": "relation", "collectionId": cidades.id}
+                ]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            usuarios.campo("cidade").unwrap().options["collectionId"],
+            json!(cidades.id)
+        );
+        let ana = b
+            .criar(
+                &usuarios,
+                json!({"nome": "Ana", "cidade": sp["id"]})
+                    .as_object()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let tags = b
+            .criar_colecao(base("tags", json!([{"name": "nome", "type": "text"}])))
+            .await
+            .unwrap();
+        let t1 = b
+            .criar(&tags, json!({"nome": "rust"}).as_object().unwrap())
+            .await
+            .unwrap();
+        let t2 = b
+            .criar(&tags, json!({"nome": "sqlite"}).as_object().unwrap())
+            .await
+            .unwrap();
+        let posts = b
+            .criar_colecao(base(
+                "posts",
+                json!([
+                    {"name": "titulo", "type": "text", "required": true},
+                    {"name": "publicado", "type": "bool"},
+                    {
+                        "name": "autor",
+                        "type": "relation",
+                        "collectionId": "usuarios",
+                        "required": true
+                    },
+                    {
+                        "name": "etiquetas",
+                        "type": "relation",
+                        "collectionId": tags.id,
+                        "maxSelect": 5
+                    }
+                ]),
+            ))
+            .await
+            .unwrap();
+        let post = b
+            .criar(
+                &posts,
+                json!({
+                    "titulo": "Olá",
+                    "publicado": true,
+                    "autor": ana["id"],
+                    "etiquetas": [t1["id"], t2["id"]]
+                })
+                .as_object()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(post["autor"], ana["id"]);
+        assert_eq!(post["etiquetas"], json!([t1["id"], t2["id"]]));
+        let comentarios = b
+            .criar_colecao(base(
+                "comentarios",
+                json!([
+                    {"name": "texto", "type": "text"},
+                    {
+                        "name": "post",
+                        "type": "relation",
+                        "collectionId": posts.id,
+                        "required": true,
+                        "cascadeDelete": true
+                    }
+                ]),
+            ))
+            .await
+            .unwrap();
+        let c1 = b
+            .criar(
+                &comentarios,
+                json!({"texto": "um", "post": post["id"]})
+                    .as_object()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let _c2 = b
+            .criar(
+                &comentarios,
+                json!({"texto": "dois", "post": post["id"]})
+                    .as_object()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let mut itens = vec![post.clone()];
+        b.expandir(
+            &posts,
+            &mut itens,
+            "autor.cidade,etiquetas,comentarios_via_post",
+            true,
+            &Contexto::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(itens[0]["expand"]["autor"]["nome"], json!("Ana"));
+        assert_eq!(
+            itens[0]["expand"]["autor"]["expand"]["cidade"]["nome"],
+            json!("São Paulo")
+        );
+        assert_eq!(itens[0]["expand"]["etiquetas"].as_array().unwrap().len(), 2);
+        let reversos = itens[0]["expand"]["comentarios_via_post"]
+            .as_array()
+            .unwrap();
+        let textos: Vec<&str> = reversos
+            .iter()
+            .filter_map(|r| r["texto"].as_str())
+            .collect();
+        assert_eq!(textos.len(), 2);
+        assert!(textos.contains(&"um") && textos.contains(&"dois"), "{textos:?}");
+
+        // Id que não existe.
+        let ruim = b
+            .criar(
+                &posts,
+                json!({
+                    "titulo": "x",
+                    "autor": "abcdefghijklmno",
+                    "etiquetas": []
+                })
+                .as_object()
+                .unwrap(),
+            )
+            .await
+            .unwrap_err();
+        match ruim {
+            Erro::Invalido { campos, .. } => {
+                assert_eq!(
+                    campos["autor"]["code"],
+                    json!("validation_missing_rel_records")
+                );
+            }
+            outro => panic!("{outro:?}"),
+        }
+
+        // Coleção alvo inexistente.
+        let fantasma = b
+            .criar_colecao(base(
+                "fantasmas",
+                json!([{"name": "alvo", "type": "relation", "collectionId": "nao_existe"}]),
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(fantasma, Erro::Invalido { .. }));
+
+        // Relação obrigatória sem cascata: apagar a usuária não leva o post.
+        let mut rx = b.assinar();
+        let bloqueado = b
+            .apagar(&usuarios, ana["id"].as_str().unwrap(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(bloqueado, Erro::Invalido { .. }));
+        assert!(rx.try_recv().is_err(), "falha não publica");
+        assert!(
+            b.registro(&usuarios, ana["id"].as_str().unwrap(), None)
+                .await
+                .is_ok()
+        );
+
+        // Tirar uma etiqueta desliga o id e publica atualização do post.
+        b.apagar(&tags, t1["id"].as_str().unwrap(), None)
+            .await
+            .unwrap();
+        let ev1 = evento(&mut rx).await;
+        let ev2 = evento(&mut rx).await;
+        assert_eq!(ev1.acao, Acao::Apagar);
+        assert_eq!(ev1.id, t1["id"].as_str().unwrap());
+        assert_eq!(ev2.acao, Acao::Atualizar);
+        assert_eq!(ev2.id, post["id"].as_str().unwrap());
+        let post = b
+            .registro(&posts, post["id"].as_str().unwrap(), None)
+            .await
+            .unwrap();
+        assert_eq!(post["etiquetas"], json!([t2["id"]]));
+
+        // Apagar o post apaga os comentários (cascata) e publica cada um.
+        let pid = post["id"].as_str().unwrap().to_string();
+        b.apagar(&posts, &pid, None).await.unwrap();
+        let mut apagados = vec![];
+        for _ in 0..3 {
+            let ev = evento(&mut rx).await;
+            assert_eq!(ev.acao, Acao::Apagar);
+            apagados.push(ev.id);
+        }
+        assert!(rx.try_recv().is_err(), "cascata publicou evento a mais");
+        assert_eq!(apagados[0], pid);
+        assert!(apagados.contains(&c1["id"].as_str().unwrap().to_string()));
+        assert!(b.registro(&posts, &pid, None).await.is_err());
+        assert!(
+            b.registro(&comentarios, c1["id"].as_str().unwrap(), None)
+                .await
+                .is_err()
+        );
+
+        // Visitante não liga nem expande registro fora da viewRule.
+        let posts_privados = b
+            .criar_colecao(
+                serde_json::from_value(json!({
+                    "name": "rascunhos",
+                    "fields": [
+                        {"name": "titulo", "type": "text"},
+                        {"name": "publicado", "type": "bool"}
+                    ],
+                    "listRule": "",
+                    "viewRule": "publicado = true"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let escondido = b
+            .criar(
+                &posts_privados,
+                json!({"titulo": "segredo", "publicado": false})
+                    .as_object()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let visivel = b
+            .criar(
+                &posts_privados,
+                json!({"titulo": "publico", "publicado": true})
+                    .as_object()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let notas = b
+            .criar_colecao(base(
+                "notas",
+                json!([
+                    {"name": "texto", "type": "text"},
+                    {"name": "origem", "type": "relation", "collectionId": posts_privados.id}
+                ]),
+            ))
+            .await
+            .unwrap();
+        let negado = b
+            .criar_chamador(
+                &notas,
+                json!({"texto": "x", "origem": escondido["id"]})
+                    .as_object()
+                    .unwrap(),
+                &Contexto::default(),
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(negado, Erro::Invalido { .. }));
+        let ok = b
+            .criar_chamador(
+                &notas,
+                json!({"texto": "y", "origem": visivel["id"]})
+                    .as_object()
+                    .unwrap(),
+                &Contexto::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let mut itens = vec![ok];
+        b.expandir(&notas, &mut itens, "origem", false, &Contexto::default())
+            .await
+            .unwrap();
+        assert_eq!(itens[0]["expand"]["origem"]["titulo"], json!("publico"));
+        let mut itens = vec![
+            b.criar(
+                &notas,
+                json!({"texto": "z", "origem": escondido["id"]})
+                    .as_object()
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        ];
+        b.expandir(&notas, &mut itens, "origem", false, &Contexto::default())
+            .await
+            .unwrap();
+        assert!(itens[0]["expand"]["origem"].is_null());
     }
 }

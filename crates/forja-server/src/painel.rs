@@ -392,6 +392,23 @@ fn dados_do_form(c: &Collection, pares: &[(String, String)]) -> Map<String, Valu
                 serde_json::from_str::<Value>(primeiro).unwrap_or_else(|_| json!(primeiro))
             }
             FieldType::Select if f.multiplo() => json!(valores),
+            FieldType::Relation if f.multiplo() => {
+                let texto = primeiro.trim();
+                if texto.is_empty() {
+                    json!([])
+                } else if let Ok(Value::Array(a)) = serde_json::from_str::<Value>(texto) {
+                    Value::Array(a)
+                } else {
+                    json!(
+                        texto
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .collect::<Vec<_>>()
+                    )
+                }
+            }
+            FieldType::Relation => json!(primeiro.trim()),
             _ => json!(primeiro),
         };
         dados.insert(f.name.clone(), valor);

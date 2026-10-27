@@ -479,6 +479,24 @@ fn campo(
                     @let v = valor.map(texto_puro).unwrap_or_default();
                     input type="url" id=(f.name) name=(f.name) value=(v) required[f.required];
                 }
+                FieldType::Relation => {
+                    @let v = match valor {
+                        Some(Value::Array(a)) => a
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        Some(Value::String(s)) => s.clone(),
+                        Some(outro) => texto_puro(outro),
+                        None => String::new(),
+                    };
+                    input type="text" id=(f.name) name=(f.name) value=(v) required[f.required];
+                    @if f.multiplo() {
+                        p .dica { "Ids separados por vírgula." }
+                    } @else {
+                        p .dica { "Id do registro relacionado." }
+                    }
+                }
                 _ => {
                     @let v = valor.map(texto_puro).unwrap_or_default();
                     input type="text" id=(f.name) name=(f.name) value=(v) required[f.required];

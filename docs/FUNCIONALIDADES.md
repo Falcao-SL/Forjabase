@@ -100,7 +100,7 @@ Versão atual: **0.0.2**. O Forja só vira **1.0.0** quando estiver estável
 | `autodate` | data de criação ou atualização, preenchida sozinha | ✅ (tipo) |
 | `select` | um ou vários valores de uma lista | ✅ |
 | `file` | um ou vários arquivos, com tipos MIME, tamanho e miniaturas | ✅ (tipo) |
-| `relation` | um ou vários registros de outra coleção, com exclusão em cascata | ✅ (tipo) |
+| `relation` | um ou vários registros de outra coleção, com exclusão em cascata | ✅ |
 | `json` | qualquer JSON, com tamanho máximo | ✅ |
 | `password` | senha com hash (Argon2id), nunca devolvida nem filtrável | ✅ |
 | `geoPoint` | latitude e longitude | ✅ (tipo) |
@@ -132,7 +132,7 @@ com uma mensagem clara. "✅" quer dizer validado e guardado.
 | Funções `geoDistance()` e `strftime()` | 📋 |
 | Ordenação (`sort`, com `-` e `@random`) | ✅ |
 | Ordenação por `@rowid` | 📋 |
-| Expandir relações (`expand`, inclusive aninhadas e reversas `coleção_via_campo`) | 📋 |
+| Expandir relações (`expand`, inclusive aninhadas e reversas `coleção_via_campo`) | ✅ |
 | Escolher campos (`fields`, com `:excerpt`) | 📋 |
 | Modificadores de valor no envio (`campo+`, `+campo`, `campo-`) | 📋 |
 | Upload de arquivos em `multipart/form-data` | 📋 |
@@ -319,7 +319,7 @@ remoto (com token).
 
 | Funcionalidade | Estado |
 |---|---|
-| Testes de unidade e de API em todo crate | ✅ (32 testes) |
+| Testes de unidade e de API em todo crate | ✅ (37 testes) |
 | Cliente Python do PocketBase (`pocketbase` 0.16) funciona contra o Forja: login, CRUD, filtro e ordenação | ✅ (conferido à mão em 2026-10-21) |
 | Suíte de compatibilidade: as mesmas chamadas contra PocketBase e Forja, respostas iguais | 📋 |
 | CI no GitHub Actions (formatação, lint e testes nos três SOs) | ✅ |

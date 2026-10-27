@@ -7,11 +7,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 pub mod auth;
+pub mod barramento;
 pub mod correio;
 pub mod erro;
 pub mod filtro;
 pub mod id;
 pub mod motor;
+mod relacao;
 pub mod store;
 pub mod valor;
 
@@ -85,6 +87,7 @@ impl FieldType {
                 | FieldType::Url
                 | FieldType::Date
                 | FieldType::Select
+                | FieldType::Relation
                 | FieldType::Json
                 | FieldType::Password
         )
@@ -152,9 +155,13 @@ impl Field {
             .unwrap_or(false)
     }
 
-    /// `select` com `maxSelect` maior que 1 guarda uma lista.
+    /// `select`, `relation` e `file` com `maxSelect` maior que 1 guardam uma lista.
+    /// Ausente ou até 1 é um valor só (string), como no PocketBase.
     pub fn multiplo(&self) -> bool {
-        self.kind == FieldType::Select && self.opcao_f64("maxSelect").unwrap_or(1.0) > 1.0
+        matches!(
+            self.kind,
+            FieldType::Select | FieldType::Relation | FieldType::File
+        ) && self.opcao_f64("maxSelect").unwrap_or(1.0) > 1.0
     }
 }
 
