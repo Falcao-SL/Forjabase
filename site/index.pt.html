@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Forja | Um backend de código aberto em um executável</title>
+<meta name="description" content="SQLite, autenticação e painel administrativo num executável em Rust. A API HTTP segue a do PocketBase. Versão 0.0.3, em desenvolvimento. MIT.">
+<meta name="theme-color" content="#fafaf9">
+<link rel="canonical" href="https://forja.falcaosl.com/index.pt.html">
+<meta property="og:type" content="website">
+<meta property="og:locale" content="pt_BR">
+<meta property="og:title" content="Forja | Um backend de código aberto em um executável">
+<meta property="og:description" content="SQLite, autenticação e painel administrativo num executável em Rust. A API HTTP segue a do PocketBase. Versão 0.0.3, em desenvolvimento. MIT.">
+<meta property="og:url" content="https://forja.falcaosl.com/index.pt.html">
+<meta property="og:site_name" content="Forja">
+<meta name="author" content="Francisco Iramar Falcão Junior">
+<meta name="robots" content="index, follow, max-image-preview:large">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "Forja",
+  "url": "https://forja.falcaosl.com/index.pt.html",
+  "applicationCategory": "DeveloperApplication",
+  "operatingSystem": "macOS, Linux, Windows",
+  "description": "SQLite, autenticação e painel administrativo num executável em Rust. A API HTTP segue a do PocketBase. Versão 0.0.3, em desenvolvimento. MIT.",
+  "author": { "@type": "Person", "name": "Francisco Iramar Falcão Junior" },
+  "publisher": { "@type": "Organization", "name": "Falcao SL", "url": "https://falcaosl.com/" }
+}
+</script>
+<link rel="icon" href="favicon-20261017.svg" type="image/svg+xml">
+<link rel="stylesheet" href="styles.css?v=20261017">
+</head>
+<body>
+<a class="skip-link" href="#main">Pular para o conteúdo</a>
+
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="/"><img class="mark" src="favicon-20261017.svg" width="28" height="28" alt="">Forja</a>
+    <nav aria-label="Principal">
+      <a href="#features">Recursos</a>
+      <a href="#state">Estado</a>
+      <a href="#start">Para subir</a>
+      <a href="index.html" hreflang="en" lang="en">EN</a>
+      <a href="https://falcaosl.com/">Falcao SL</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+
+  <section class="section">
+    <div class="wrap">
+      <div class="hero">
+          <img class="hero-icon" src="favicon-20261017.svg" width="256" height="256" alt="Forja— ícone">
+        <h1>Forja</h1>
+        <p class="tagline">Um backend de código aberto em um executável.</p>
+        <p class="lead">O Forja guarda os dados num arquivo SQLite, autentica usuários e serve o painel no mesmo processo. A API HTTP segue a do PocketBase, e o cliente Python do PocketBase já funciona nas rotas que existem.</p>
+        <div class="actions">
+            <a class="btn btn-primary" href="https://github.com/iramarfalcao/forjabase">Código no GitHub <span aria-hidden="true">→</span></a><a class="btn btn-ghost" href="#start">Para subir</a><span class="store-soon">Sem binário ainda</span>
+          </div>
+        <p class="badge">0.0.3, em desenvolvimento</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section shots-section" aria-label="Telas">
+    <div class="wrap">
+      <div class="shots"></div>
+    </div>
+  </section>
+
+  <section class="section section--alt" id="features" aria-labelledby="features-title">
+    <div class="wrap">
+      <div class="section-head reveal">
+        <h2 id="features-title">O que roda na 0.0.3.</h2>
+      </div>
+      <div class="grid">
+        <article class="card reveal"><h3>Um arquivo SQLite</h3><p>O banco é um data.db em modo WAL. Não há outro servidor de banco para instalar.</p></article>
+        <article class="card reveal"><h3>E-mail e senha</h3><p>Login de superusuário e contas com verificação, redefinição de senha e troca de e-mail. A mensagem sai no console. SMTP fica para depois.</p></article>
+        <article class="card reveal"><h3>Registros e regras</h3><p>Listar, criar, ler, atualizar e apagar, com filtro, ordenação, paginação e regras de acesso, no formato de pedido do PocketBase.</p></article>
+        <article class="card reveal"><h3>Painel em /_/</h3><p>Entrar, e então listar, criar, editar e apagar registros. O editor de coleções não está nesta versão.</p></article>
+      </div>
+    </div>
+  </section>
+
+
+  <section class="section" id="start" aria-labelledby="start-title">
+    <div class="wrap">
+      <div class="section-head reveal">
+        <h2 id="start-title">Para subir</h2>
+        <p class="lead">Basta o Rust estável. O servidor escuta em 127.0.0.1:8090 e grava ./forja_data.</p>
+      </div>
+      <pre class="code reveal"><code>git clone https://github.com/iramarfalcao/forjabase.git
+cd forjabase
+cargo run -p forja -- superuser upsert admin@example.com 'a-strong-password'
+cargo run -p forja -- serve
+curl http://127.0.0.1:8090/api/health</code></pre>
+    </div>
+  </section>
+
+
+  <section class="section cta" id="get" aria-labelledby="get-title">
+    <div class="wrap">
+      <div class="cta-box reveal">
+        <div>
+          <h2 id="get-title">Clone e rode.</h2>
+          <p class="lead">Não há binário publicado nem imagem do servidor. Clone o repositório, crie um superusuário e suba o servidor na porta 8090.</p>
+        </div>
+        <div class="cta-actions"><a class="btn btn-primary" href="https://github.com/iramarfalcao/forjabase">Código no GitHub <span aria-hidden="true">→</span></a><a class="btn btn-ghost" href="#start">Para subir</a></div>
+        <p class="cta-fine">MIT. A API é inspirada no PocketBase (Gani Georgiev, MIT).</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section state-strip" id="state" aria-labelledby="state-title">
+    <div class="wrap">
+      <div class="state reveal">
+        <div>
+          <h2 id="state-title">Versão 0.0.3, em desenvolvimento.</h2>
+          <p class="lead">A 0.0.3 é o que dá para rodar hoje: coleções, registros, o ciclo de e-mail da conta e o painel de registros, em SQLite. O cliente Python do PocketBase foi conferido contra o Forja em 21 de outubro de 2026.</p>
+          <p class="lead">Ainda à frente: relações e expand, arquivos, tempo real, o editor de coleções, OAuth, vários projetos numa instância, extensões WASM, SDKs gerados e binários publicados. A ordem está no plano do repositório. A 1.0.0 espera a API ficar estável.</p>
+          <div class="actions"><a class="btn btn-ghost" href="https://github.com/iramarfalcao/forjabase/blob/main/docs/STATUS.md">Estado no repositório</a></div>
+        </div>
+        <dl>
+          <div><dt>Estágio</dt><dd>0.0.3, em desenvolvimento</dd></div>
+          <div><dt>Plataformas</dt><dd>macOS, Linux e Windows, a partir do código</dd></div>
+          <div><dt>Stack</dt><dd>Rust, axum, SQLite, HTML no servidor e htmx</dd></div>
+          <div><dt>Licença</dt><dd>MIT</dd></div>
+          <div><dt>Próximo</dt><dd>Relações, expand e coleções view</dd></div>
+        </dl>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="bottom">
+  <div class="wrap">
+    <span>© 2026 Falcao SL — Forja</span>
+    <span class="spacer"><a href="https://pocketbase.io/">PocketBase</a> · <a href="https://falcaosl.com/">falcaosl.com</a> · <a href="mailto:dev@falcaosl.com">dev@falcaosl.com</a></span>
+  </div>
+</footer>
+
+<script src="motion.js?v=20261017" defer></script>
+</body>
+</html>

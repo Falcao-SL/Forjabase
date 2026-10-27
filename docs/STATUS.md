@@ -1,13 +1,13 @@
 # Status — Forja
 
-> Atualizado em **2026-10-23**. Este arquivo é a fonte única de "em que pé está".
+> Atualizado em **2026-10-27**. Este arquivo é a fonte única de "em que pé está".
 
 | Campo | Valor |
 |---|---|
 | **Estágio** | **Em desenvolvimento** — 0.1 entregue: coleções base e auth, autenticação completa e painel administrativo (login e CRUD de registros) na API do PocketBase |
 | **Plataformas** | Servidor: macOS, Linux, Windows (Rust); painel: navegador, HTML no servidor + htmx (sem build de front-end) |
 | **Stack** | Rust (axum; SQLite), maud + htmx, wasmtime para extensões |
-| **Site** | — (repositório: https://github.com/iramarfalcao/forjabase) |
+| **Site** | Landing em `site/` (inglês na raiz, português em `index.pt.html`). O host previsto é https://forja.falcaosl.com, no Coolify, com `deploy/site/Dockerfile`. O DNS ainda não existe; o endereço público segue o repositório. |
 | **Monetização** | Nenhuma: código aberto, MIT |
 | **Próximo marco** | 0.2: campo `relation`, cascata, `expand`, coleções `view` e macro `@collection.*` |
 | **Data-alvo** | A definir; 1.0.0 só quando estável (PLANO §6) |
