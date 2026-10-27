@@ -905,7 +905,8 @@ fn validar_colecao(c: &Collection) -> Resultado<()> {
     for (i, f) in c.fields.iter().enumerate() {
         let chave = format!("fields.{i}.name");
         let reservado = RESERVADOS.contains(&f.name.as_str())
-            && !(c.kind == CollectionType::View && matches!(f.name.as_str(), "created" | "updated"));
+            && !(c.kind == CollectionType::View
+                && matches!(f.name.as_str(), "created" | "updated"));
         if !nome_valido(&f.name) || reservado || f.name.contains("_via_") {
             erro_campo(
                 &mut erros,
@@ -976,9 +977,7 @@ fn resolver_externo(
         atual
     } else {
         outras.get(&colecao.to_ascii_lowercase()).ok_or_else(|| {
-            Erro::invalido(format!(
-                "Invalid filter: unknown collection '{colecao}'"
-            ))
+            Erro::invalido(format!("Invalid filter: unknown collection '{colecao}'"))
         })?
     };
     if !c.coluna_valida(campo) {
@@ -1120,8 +1119,13 @@ impl Banco {
         let mut erros = Map::new();
         for (nome, regra) in regras {
             if let Some(r) = regra.as_deref().filter(|r| !r.trim().is_empty())
-                && let Err(e) =
-                    filtro::para_sql_escopo(r, &valido, self.dialeto(), &Contexto::default(), &escopo)
+                && let Err(e) = filtro::para_sql_escopo(
+                    r,
+                    &valido,
+                    self.dialeto(),
+                    &Contexto::default(),
+                    &escopo,
+                )
             {
                 erro_campo(&mut erros, nome, "validation_invalid_rule", e.to_string());
             }
@@ -3481,7 +3485,11 @@ mod tests {
             "view aceita escrita"
         );
         let id = l.items[0]["id"].as_str().unwrap();
-        assert!(b.atualizar(&vista, id, &obj(json!({"nome": "Y"})), None).await.is_err());
+        assert!(
+            b.atualizar(&vista, id, &obj(json!({"nome": "Y"})), None)
+                .await
+                .is_err()
+        );
         assert!(b.apagar(&vista, id, None).await.is_err());
 
         assert!(
@@ -3521,7 +3529,10 @@ mod tests {
             .await
             .is_err()
         );
-        assert!(b.apagar_colecao("produtos").await.is_err(), "view ainda cita");
+        assert!(
+            b.apagar_colecao("produtos").await.is_err(),
+            "view ainda cita"
+        );
         b.apagar_colecao("ativos").await.unwrap();
         b.apagar_colecao("produtos").await.unwrap();
         assert!(b.colecoes().await.unwrap().is_empty());
@@ -3842,7 +3853,10 @@ mod tests {
             .filter_map(|r| r["texto"].as_str())
             .collect();
         assert_eq!(textos.len(), 2);
-        assert!(textos.contains(&"um") && textos.contains(&"dois"), "{textos:?}");
+        assert!(
+            textos.contains(&"um") && textos.contains(&"dois"),
+            "{textos:?}"
+        );
 
         // Id que não existe.
         let ruim = b

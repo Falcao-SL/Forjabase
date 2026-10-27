@@ -4,8 +4,8 @@
 //! com uma coluna `id`. Os outros nomes viram campos. Create, update e delete
 //! de registro não existem numa view.
 
-use crate::erro::{Erro, Resultado};
 use crate::FieldType;
+use crate::erro::{Erro, Resultado};
 
 /// Normaliza a consulta de uma view. Recusa vazio, mais de um comando e
 /// qualquer coisa que não comece com `SELECT` ou `WITH`.
@@ -75,8 +75,8 @@ pub fn tipo_inferido(tipo_sql: &str) -> FieldType {
         .trim()
         .to_ascii_lowercase();
     match t.as_str() {
-        "int" | "integer" | "tinyint" | "smallint" | "mediumint" | "bigint" | "int2"
-        | "int8" | "numeric" | "real" | "double" | "float" | "decimal" | "double precision" => {
+        "int" | "integer" | "tinyint" | "smallint" | "mediumint" | "bigint" | "int2" | "int8"
+        | "numeric" | "real" | "double" | "float" | "decimal" | "double precision" => {
             FieldType::Number
         }
         "boolean" | "bool" => FieldType::Bool,

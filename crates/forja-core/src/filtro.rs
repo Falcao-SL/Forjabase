@@ -390,11 +390,7 @@ impl Escritor<'_> {
             ));
         }
         match e {
-            Expr::Ou(a, b) => Ok(format!(
-                "({} OR {})",
-                self.compilar(a)?,
-                self.compilar(b)?
-            )),
+            Expr::Ou(a, b) => Ok(format!("({} OR {})", self.compilar(a)?, self.compilar(b)?)),
             _ => self.conjuncao(e),
         }
     }
@@ -903,7 +899,10 @@ mod tests {
         );
         assert_eq!(
             s.params,
-            vec![Literal::Texto("publico".into()), Literal::Texto("ok".into())]
+            vec![
+                Literal::Texto("publico".into()),
+                Literal::Texto("ok".into())
+            ]
         );
     }
 

@@ -15,8 +15,8 @@ pub mod id;
 pub mod motor;
 mod relacao;
 pub mod store;
-mod view;
 pub mod valor;
+mod view;
 
 pub use erro::Erro;
 
