@@ -33,9 +33,9 @@ Três consequências:
 | E-mail: verificação, senha, troca | ✅ | ✅ | ✅ (console; SMTP na 0.5) | feito |
 | Relações + `expand` | ✅ | ✅ | ✅ | 0.2 |
 | Views (SQL somente leitura) | ✅ | ⛔ | ✅ | 0.2 |
-| Arquivos + miniaturas | ✅ | ✅ (buckets) | 📋 | 0.3 |
-| Lote (`/api/batch`) | ✅ | ⛔ | 📋 | 0.3 |
-| Tempo real | ✅ (SSE) | ✅ (WebSocket) | 📋 | 0.3 |
+| Arquivos + miniaturas | ✅ | ✅ (buckets) | 🔨 (disco local, protegido, download e `Range`; miniatura e S3 ficam) | 0.3 |
+| Lote (`/api/batch`) | ✅ | ⛔ | 🔨 (JSON, até 50, uma transação; sem arquivo no lote) | 0.3 |
+| Tempo real | ✅ (SSE) | ✅ (WebSocket) | 🔨 (SSE com regra e filtro; sem `expand`/`fields`) | 0.3 |
 | Painel administrativo | ✅ | ✅ | 🔨 (login e CRUD de registros; editor de coleções na 0.4) | 0.4 |
 | Logs, cron, rate limit, settings | ✅ | ✅ (parcial) | 📋 | 0.5 |
 | Backups + S3 | ✅ | ✅ (Cloud) | 📋 | 0.5 |
@@ -47,7 +47,7 @@ Três consequências:
 | GraphQL | ⛔ | ✅ | ⛔ (decisão: só REST) | — |
 | Hospedagem de sites estáticos | ⛔ | ✅ (Sites) | 📋 (avaliar na 0.7) | 0.7+ |
 
-Legenda: ✅ pronto · 📋 planejado · ⛔ fora de escopo.
+Legenda: ✅ pronto · 🔨 parcial · 📋 planejado · ⛔ fora de escopo.
 
 ## 3. O que o Appwrite tem e o PocketBase não
 
@@ -75,8 +75,8 @@ o caso de uso com um contrato só) e a arquitetura de containers.
 | Recurso | Detalhe que importa | Onda |
 |---|---|---|
 | Operadores `?=`, `?~`, `:isset`, `:changed`, `:length`, `:each` | Filtros de lista JSON e regras de transição (`status:changed`). `view` e `@collection.*` (com `=`, `~` e os outros operadores já existentes) fecharam a 0.2. | 0.3 |
-| `file` com miniaturas e URL assinada | Upload, recorte e proteção. | 0.3 |
-| SSE com filtro por regra | O cliente só recebe o que pode ver. | 0.3 |
+| Miniatura e S3 | O arquivo local, o token e o download já saem. Falta `?thumb=` de verdade e o driver S3. | 0.3 |
+| SSE: `expand` e `fields` | A regra e o filtro da assinatura já valem. Falta expandir e cortar campos no evento. | 0.3 |
 | `_settings`, logs, cron, rate limit | Operação de verdade, sem SSH. | 0.5 |
 | Backup consistente + S3 | API de backup online do SQLite + manifesto. | 0.5 |
 | OAuth2 (30 provedores), OTP, MFA | Login social é obrigatório para app de consumo. | 0.6 |

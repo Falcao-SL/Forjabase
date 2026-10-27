@@ -124,8 +124,9 @@ cliente: se ele funciona, a compatibilidade é real e não autodeclarada.
 **Estado:** a onda 1 está concluída (2026-10-23) com o envio de e-mail no
 console; o SMTP entra na onda 5, atrás do mesmo trait `Correio`. Em 2026-10-27
 entrou o barramento de escrita (M1). A onda 2 fechou no mesmo dia: `relation`,
-cascata, `expand`, coleções `view` e a macro `@collection.*`. A próxima é a
-onda 3 (arquivos, lote e SSE).
+cascata, `expand`, coleções `view` e a macro `@collection.*`. A onda 3 começou
+no mesmo dia, ainda aberta: arquivo em disco local (com token e `Range`),
+`POST /api/batch` e SSE com filtro por regra. Miniatura e S3 continuam na 0.3.
 
 ## 5. O que fica de fora, por decisão
 

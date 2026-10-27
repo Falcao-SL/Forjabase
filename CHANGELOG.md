@@ -2,6 +2,21 @@
 
 ## Não lançado
 
+- Campo `file` em disco local. O multipart do criar e do atualizar grava em
+  `storage/{colecaoId}/{registroId}/{arquivo}`, com nome normalizado. Valem
+  `maxSelect`, `maxSize` (0 = 5 MiB) e `mimeTypes`. `campo+` acrescenta e
+  `campo-` tira nomes que já estão no registro. `GET /api/files/...` serve o
+  arquivo, com `?download=1` e um `Range` simples. Protegido exige
+  `POST /api/files/token` (tipo `file`, 3 minutos) e a `viewRule`; falha é 404.
+  `?thumb=` devolve o original. Miniatura e S3 ficam para fechar a 0.3. O
+  painel mostra o nome e não envia o arquivo.
+- `POST /api/batch`: até 50 operações JSON de registro (`GET`, `POST`, `PATCH`,
+  `DELETE`) no mesmo commit do SQLite. Uma falha desfaz o lote e a resposta é
+  esse erro. O evento e a remoção de arquivo saem só depois do commit.
+- SSE em `GET` e `POST /api/realtime`, no protocolo do PocketBase (`PB_CONNECT`,
+  depois as assinaturas). Tópicos de coleção e de registro, com a `listRule` ou
+  a `viewRule` de cada cliente e um filtro opcional. Sem `expand` nem `fields`.
+  Conexão ociosa cai em 5 minutos e nenhuma passa de 30.
 - Coleções `view`: `viewQuery` é um único `SELECT` (ou `WITH`) com coluna `id`.
   Os outros nomes viram campos, inferidos do tipo SQL. O registro é somente
   leitura (API e painel). Apagar uma coleção que uma view ainda cita é recusado.
@@ -13,7 +28,8 @@
   e `apagar` publicam `Evento { colecao, acao, id }` num `tokio::broadcast`.
   Vale também para senha, verificação de e-mail, superusuário e cada registro
   atingido pela cascata. Sem assinante, ou com assinante lento, a escrita fica.
-  Ainda não há rota SSE.
+  O evento leva também o `registro` (no apagar, o último estado). A rota SSE
+  está na fatia de arquivos e lote, acima.
 - Campo `relation` (um e vários), com `collectionId`, `minSelect`, `maxSelect`
   e `cascadeDelete`. O `expand` cobre relação direta, aninhada e reversa
   (`colecao_via_campo`) em listar, ver, criar e atualizar. O painel edita o

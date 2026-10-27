@@ -494,6 +494,19 @@ fn campo(
                     @let v = valor.map(texto_puro).unwrap_or_default();
                     input type="url" id=(f.name) name=(f.name) value=(v) required[f.required];
                 }
+                FieldType::File => {
+                    @let v = match valor {
+                        Some(Value::Array(a)) => a
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        Some(Value::String(s)) if !s.is_empty() => s.clone(),
+                        _ => "—".into(),
+                    };
+                    p { (v) }
+                    p .dica { "O envio do arquivo é pela API, em multipart." }
+                }
                 FieldType::Relation => {
                     @let v = match valor {
                         Some(Value::Array(a)) => a

@@ -24,6 +24,10 @@ pub const TIPO_AUTH: &str = "auth";
 pub const TIPO_VERIFICACAO: &str = "verification";
 pub const TIPO_REDEFINICAO: &str = "passwordReset";
 pub const TIPO_TROCA_EMAIL: &str = "emailChange";
+pub const TIPO_ARQUIVO: &str = "file";
+
+/// Validade do token de arquivo protegido: 3 minutos.
+pub const VALIDADE_ARQUIVO: u64 = 180;
 
 pub fn hash_senha(senha: &str) -> Resultado<String> {
     Argon2::default()

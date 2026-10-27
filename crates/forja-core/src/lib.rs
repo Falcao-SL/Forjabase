@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+pub mod arquivos;
 pub mod auth;
 pub mod barramento;
 pub mod correio;
@@ -90,6 +91,7 @@ impl FieldType {
                 | FieldType::Select
                 | FieldType::Relation
                 | FieldType::Json
+                | FieldType::File
                 | FieldType::Password
         )
     }

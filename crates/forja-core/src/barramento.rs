@@ -4,6 +4,7 @@
 //! o `send` do `broadcast` falha e a escrita fica. Com assinante lento, o
 //! canal descarta o evento antigo (`Lagged`) e a escrita também fica.
 
+use serde_json::Value;
 use tokio::sync::broadcast;
 
 /// Quantos eventos um assinante pode deixar acumular antes de perder os mais
@@ -19,11 +20,13 @@ pub enum Acao {
 }
 
 /// Um registro acabou de ser gravado. `colecao` é o nome, não o id.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `registro` é o estado depois da escrita; no apagar, o último estado.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Evento {
     pub colecao: String,
     pub acao: Acao,
     pub id: String,
+    pub registro: Value,
 }
 
 /// Canal compartilhado por um `Banco`. Clonar o banco clona o remetente:

@@ -1,21 +1,27 @@
 //! Servidor HTTP do Forja (axum). As rotas, os corpos e os erros seguem o
 //! formato da API do PocketBase, para os SDKs existentes funcionarem.
 
+mod lote;
 mod painel;
+mod realtime;
 
-use axum::extract::{FromRequestParts, Path, Query, State};
+use axum::extract::{
+    DefaultBodyLimit, FromRequest, FromRequestParts, Multipart, Path, Query, Request, State,
+};
+use axum::http::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE};
 use axum::http::{StatusCode, request::Parts};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use forja_core::arquivos::{self, Recebido};
 use forja_core::auth::{
-    self, COLECAO_SUPERUSERS, TIPO_AUTH, TIPO_REDEFINICAO, TIPO_TROCA_EMAIL, TIPO_VERIFICACAO,
-    VALIDADE_AUTH, VALIDADE_EMAIL, VALIDADE_SUPERUSER,
+    self, COLECAO_SUPERUSERS, TIPO_ARQUIVO, TIPO_AUTH, TIPO_REDEFINICAO, TIPO_TROCA_EMAIL,
+    TIPO_VERIFICACAO, VALIDADE_ARQUIVO, VALIDADE_AUTH, VALIDADE_EMAIL, VALIDADE_SUPERUSER,
 };
 use forja_core::correio::{Console, Correio, Mensagem};
 use forja_core::filtro::Contexto;
 use forja_core::store::{Banco, Consulta, Credenciais, Motor, Superusuario};
-use forja_core::{Collection, CollectionType, Erro, Field};
+use forja_core::{Collection, CollectionType, Erro, Field, FieldType};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::future::Future;
@@ -69,6 +75,7 @@ pub struct Estado {
     pub segredo: Arc<String>,
     pub correio: Arc<dyn Correio>,
     pub instalador: Arc<Instalador>,
+    pub realtime: Arc<realtime::Hub>,
 }
 
 impl Estado {
@@ -87,11 +94,18 @@ impl Estado {
         instalador: Instalador,
     ) -> Result<Estado, Erro> {
         let segredo = banco.segredo().await?;
+        let realtime = realtime::Hub::novo();
+        let escuta = realtime.clone();
+        let banco_escuta = banco.clone();
+        tokio::spawn(async move {
+            realtime::escutar(banco_escuta, escuta).await;
+        });
         Ok(Estado {
             banco,
             segredo: Arc::new(segredo),
             correio,
             instalador: Arc::new(instalador),
+            realtime,
         })
     }
 }
@@ -192,55 +206,61 @@ impl FromRequestParts<Estado> for Chamador {
         else {
             return Ok(Chamador(None));
         };
-        // O PocketBase aceita o token puro; aceitamos também "Bearer <token>".
-        let token = bruto
-            .strip_prefix("Bearer ")
-            .unwrap_or(bruto)
-            .trim()
-            .to_string();
+        let token = token_do_header(bruto);
         if token.is_empty() {
             return Ok(Chamador(None));
         }
-        let claims = auth::validar(&e.segredo, &token).map_err(|_| token_invalido())?;
-        if claims.tipo != TIPO_AUTH {
-            return Err(token_invalido());
-        }
-        if claims.colecao == COLECAO_SUPERUSERS {
-            let su = e
-                .banco
-                .superuser(&claims.id)
-                .await
-                .map_err(|_| token_invalido())?;
-            if su.token_key != claims.tk {
-                return Err(token_invalido());
-            }
-            return Ok(Chamador(Some(Identidade::Superusuario(su))));
-        }
-        // Usuário de uma coleção `auth`: o token vale enquanto a `tokenKey` bater.
-        let colecao = e
-            .banco
-            .colecao(&claims.colecao)
-            .await
-            .map_err(|_| token_invalido())?;
-        if colecao.kind != CollectionType::Auth {
-            return Err(token_invalido());
-        }
-        let credenciais = e
-            .banco
-            .auth_credenciais_por_id(&colecao, &claims.id)
-            .await
-            .map_err(|_| token_invalido())?
-            .ok_or_else(token_invalido)?;
-        if credenciais.token_key != claims.tk {
-            return Err(token_invalido());
-        }
-        let registro = e
-            .banco
-            .registro(&colecao, &claims.id, None)
-            .await
-            .map_err(|_| token_invalido())?;
-        Ok(Chamador(Some(Identidade::Registro { colecao, registro })))
+        identificar(e, &token, TIPO_AUTH).await
     }
+}
+
+fn token_do_header(bruto: &str) -> String {
+    bruto
+        .strip_prefix("Bearer ")
+        .unwrap_or(bruto)
+        .trim()
+        .to_string()
+}
+
+async fn identificar(e: &Estado, token: &str, tipo: &str) -> Res<Chamador> {
+    let claims = auth::validar(&e.segredo, token).map_err(|_| token_invalido())?;
+    if claims.tipo != tipo {
+        return Err(token_invalido());
+    }
+    if claims.colecao == COLECAO_SUPERUSERS {
+        let su = e
+            .banco
+            .superuser(&claims.id)
+            .await
+            .map_err(|_| token_invalido())?;
+        if su.token_key != claims.tk {
+            return Err(token_invalido());
+        }
+        return Ok(Chamador(Some(Identidade::Superusuario(su))));
+    }
+    let colecao = e
+        .banco
+        .colecao(&claims.colecao)
+        .await
+        .map_err(|_| token_invalido())?;
+    if colecao.kind != CollectionType::Auth {
+        return Err(token_invalido());
+    }
+    let credenciais = e
+        .banco
+        .auth_credenciais_por_id(&colecao, &claims.id)
+        .await
+        .map_err(|_| token_invalido())?
+        .ok_or_else(token_invalido)?;
+    if credenciais.token_key != claims.tk {
+        return Err(token_invalido());
+    }
+    let registro = e
+        .banco
+        .registro(&colecao, &claims.id, None)
+        .await
+        .map_err(|_| token_invalido())?;
+    Ok(Chamador(Some(Identidade::Registro { colecao, registro })))
 }
 
 #[derive(Deserialize)]
@@ -463,24 +483,47 @@ async fn registros_listar(
     Query(p): Query<ParamsLista>,
 ) -> Res<Json<Value>> {
     let c = colecao_de(&e, nome).await?;
-    let regra = regra_para(&quem, &c.list_rule)?;
+    let pares: Vec<(String, String)> = [
+        p.page.map(|n| ("page".to_string(), n.to_string())),
+        p.per_page.map(|n| ("perPage".to_string(), n.to_string())),
+        p.sort.map(|s| ("sort".to_string(), s)),
+        p.filter.map(|s| ("filter".to_string(), s)),
+        p.skip_total
+            .map(|b| ("skipTotal".to_string(), b.to_string())),
+        p.expand.map(|s| ("expand".to_string(), s)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    Ok(Json(listar_registro(&e, &quem, &c, &pares).await?))
+}
+
+async fn listar_registro(
+    e: &Estado,
+    quem: &Chamador,
+    c: &Collection,
+    pares: &[(String, String)],
+) -> Result<Value, Erro> {
+    let regra = regra_para(quem, &c.list_rule).map_err(|err| err.0)?;
     let q = Consulta {
-        filtro: p.filter,
-        ordem: p.sort,
-        pagina: p.page.unwrap_or(1),
-        por_pagina: p.per_page.unwrap_or(30),
-        pular_total: p.skip_total.unwrap_or(false),
+        filtro: par(pares, "filter").map(str::to_string),
+        ordem: par(pares, "sort").map(str::to_string),
+        pagina: par(pares, "page").and_then(|s| s.parse().ok()).unwrap_or(1),
+        por_pagina: par(pares, "perPage")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30),
+        pular_total: par(pares, "skipTotal").is_some_and(|s| s == "true"),
         regra,
         contexto: quem.contexto(),
         superusuario: quem.superusuario(),
     };
-    let mut lista = e.banco.listar(&c, &q).await?;
-    if let Some(exp) = p.expand.filter(|s| !s.trim().is_empty()) {
+    let mut lista = e.banco.listar(c, &q).await?;
+    if let Some(exp) = par(pares, "expand").filter(|s| !s.trim().is_empty()) {
         e.banco
             .expandir(
-                &c,
+                c,
                 &mut lista.items,
-                &exp,
+                exp,
                 quem.superusuario(),
                 &quem.contexto(),
             )
@@ -488,10 +531,10 @@ async fn registros_listar(
     }
     let mut items = Vec::with_capacity(lista.items.len());
     for v in lista.items {
-        items.push(apresentar(&e, &quem, &c, v).await);
+        items.push(apresentar(e, quem, c, v).await);
     }
     lista.items = items;
-    Ok(Json(serde_json::to_value(lista).unwrap_or_default()))
+    Ok(serde_json::to_value(lista).unwrap_or_default())
 }
 
 async fn registros_ver(
@@ -501,27 +544,29 @@ async fn registros_ver(
     Query(p): Query<ParamsExpand>,
 ) -> Res<Json<Value>> {
     let c = colecao_de(&e, nome).await?;
-    let regra = regra_para(&quem, &c.view_rule)?;
+    Ok(Json(ver_registro(&e, &quem, &c, &id, p.expand).await?))
+}
+
+async fn ver_registro(
+    e: &Estado,
+    quem: &Chamador,
+    c: &Collection,
+    id: &str,
+    expand: Option<String>,
+) -> Result<Value, Erro> {
+    let regra = regra_para(quem, &c.view_rule).map_err(|err| err.0)?;
     let mut r = e
         .banco
-        .registro_com(&c, &id, regra.as_deref(), &quem.contexto())
+        .registro_com(c, id, regra.as_deref(), &quem.contexto())
         .await?;
-    if let Some(exp) = p.expand.filter(|s| !s.trim().is_empty()) {
+    if let Some(exp) = expand.filter(|s| !s.trim().is_empty()) {
         let mut itens = vec![r];
         e.banco
-            .expandir(&c, &mut itens, &exp, quem.superusuario(), &quem.contexto())
+            .expandir(c, &mut itens, &exp, quem.superusuario(), &quem.contexto())
             .await?;
         r = itens.pop().unwrap_or(Value::Null);
     }
-    Ok(Json(apresentar(&e, &quem, &c, r).await))
-}
-
-fn exigir_gravavel(c: &Collection) -> Res<()> {
-    if c.kind == CollectionType::View {
-        Err(ErroApi(Erro::invalido("The collection is not writable.")))
-    } else {
-        Ok(())
-    }
+    Ok(apresentar(e, quem, c, r).await)
 }
 
 async fn registros_criar(
@@ -529,40 +574,54 @@ async fn registros_criar(
     quem: Chamador,
     Path(nome): Path<String>,
     Query(p): Query<ParamsExpand>,
-    Json(mut dados): Json<Map<String, Value>>,
+    req: Request,
 ) -> Res<Json<Value>> {
     let c = colecao_de(&e, nome).await?;
-    exigir_gravavel(&c)?;
-    // `verified` é de sistema: só superusuário marca e-mail como verificado.
+    let (dados, arquivos) = ler_corpo(req, &c).await?;
+    Ok(Json(
+        criar_registro(&e, &quem, &c, dados, arquivos, p.expand).await?,
+    ))
+}
+
+async fn criar_registro(
+    e: &Estado,
+    quem: &Chamador,
+    c: &Collection,
+    mut dados: Map<String, Value>,
+    arquivos: Vec<Recebido>,
+    expand: Option<String>,
+) -> Result<Value, Erro> {
+    if c.kind == CollectionType::View {
+        return Err(Erro::invalido("The collection is not writable."));
+    }
     if c.kind == CollectionType::Auth && !quem.superusuario() {
         dados.remove("verified");
     }
-    let regra = regra_para(&quem, &c.create_rule)?;
+    let regra = regra_para(quem, &c.create_rule).map_err(|err| err.0)?;
     let r = e
         .banco
-        .criar_chamador(&c, &dados, &quem.contexto(), quem.superusuario())
+        .criar_com_arquivos(c, &dados, &quem.contexto(), quem.superusuario(), arquivos)
         .await?;
-    // A regra de criação é conferida no registro criado; se não passar, ele sai.
     if let Some(regra) = regra {
         let id = r["id"].as_str().unwrap_or_default();
         if e.banco
-            .registro_com(&c, id, Some(&regra), &quem.contexto())
+            .registro_com(c, id, Some(&regra), &quem.contexto())
             .await
             .is_err()
         {
-            e.banco.apagar(&c, id, None).await?;
-            return Err(ErroApi(Erro::invalido("Failed to create record.")));
+            e.banco.apagar(c, id, None).await?;
+            return Err(Erro::invalido("Failed to create record."));
         }
     }
     let mut r = r;
-    if let Some(exp) = p.expand.filter(|s| !s.trim().is_empty()) {
+    if let Some(exp) = expand.filter(|s| !s.trim().is_empty()) {
         let mut itens = vec![r];
         e.banco
-            .expandir(&c, &mut itens, &exp, quem.superusuario(), &quem.contexto())
+            .expandir(c, &mut itens, &exp, quem.superusuario(), &quem.contexto())
             .await?;
         r = itens.pop().unwrap_or(Value::Null);
     }
-    Ok(Json(apresentar(&e, &quem, &c, r).await))
+    Ok(apresentar(e, quem, c, r).await)
 }
 
 async fn registros_atualizar(
@@ -570,49 +629,65 @@ async fn registros_atualizar(
     quem: Chamador,
     Path((nome, id)): Path<(String, String)>,
     Query(p): Query<ParamsExpand>,
-    Json(mut dados): Json<Map<String, Value>>,
+    req: Request,
 ) -> Res<Json<Value>> {
     let c = colecao_de(&e, nome).await?;
-    exigir_gravavel(&c)?;
-    let regra = regra_para(&quem, &c.update_rule)?;
-    // Campos de sistema de coleções `auth`.
+    let (dados, arquivos) = ler_corpo(req, &c).await?;
+    Ok(Json(
+        atualizar_registro(&e, &quem, &c, &id, dados, arquivos, p.expand).await?,
+    ))
+}
+
+async fn atualizar_registro(
+    e: &Estado,
+    quem: &Chamador,
+    c: &Collection,
+    id: &str,
+    mut dados: Map<String, Value>,
+    arquivos: Vec<Recebido>,
+    expand: Option<String>,
+) -> Result<Value, Erro> {
+    if c.kind == CollectionType::View {
+        return Err(Erro::invalido("The collection is not writable."));
+    }
+    let regra = regra_para(quem, &c.update_rule).map_err(|err| err.0)?;
     if c.kind == CollectionType::Auth && !quem.superusuario() {
         dados.remove("verified");
-        // Trocar o e-mail só pelo fluxo com token; aqui seria troca silenciosa.
         if let Some(novo) = dados.get("email").and_then(Value::as_str) {
-            let atual = e.banco.registro(&c, &id, None).await?;
+            let atual = e.banco.registro(c, id, None).await?;
             let atual = atual
                 .get("email")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             if !novo.trim().eq_ignore_ascii_case(atual) {
-                return Err(ErroApi(Erro::Proibido(
+                return Err(Erro::Proibido(
                     "The email can be changed only by superusers or via the email change flow."
                         .into(),
-                )));
+                ));
             }
             dados.remove("email");
         }
     }
     let mut r = e
         .banco
-        .atualizar_chamador(
-            &c,
-            &id,
+        .atualizar_com_arquivos(
+            c,
+            id,
             &dados,
             regra.as_deref(),
             &quem.contexto(),
             quem.superusuario(),
+            arquivos,
         )
         .await?;
-    if let Some(exp) = p.expand.filter(|s| !s.trim().is_empty()) {
+    if let Some(exp) = expand.filter(|s| !s.trim().is_empty()) {
         let mut itens = vec![r];
         e.banco
-            .expandir(&c, &mut itens, &exp, quem.superusuario(), &quem.contexto())
+            .expandir(c, &mut itens, &exp, quem.superusuario(), &quem.contexto())
             .await?;
         r = itens.pop().unwrap_or(Value::Null);
     }
-    Ok(Json(apresentar(&e, &quem, &c, r).await))
+    Ok(apresentar(e, quem, c, r).await)
 }
 
 async fn registros_apagar(
@@ -621,12 +696,140 @@ async fn registros_apagar(
     Path((nome, id)): Path<(String, String)>,
 ) -> Res<StatusCode> {
     let c = colecao_de(&e, nome).await?;
-    exigir_gravavel(&c)?;
-    let regra = regra_para(&quem, &c.delete_rule)?;
-    e.banco
-        .apagar_com(&c, &id, regra.as_deref(), &quem.contexto())
-        .await?;
+    apagar_registro(&e, &quem, &c, &id).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn apagar_registro(
+    e: &Estado,
+    quem: &Chamador,
+    c: &Collection,
+    id: &str,
+) -> Result<(), Erro> {
+    if c.kind == CollectionType::View {
+        return Err(Erro::invalido("The collection is not writable."));
+    }
+    let regra = regra_para(quem, &c.delete_rule).map_err(|err| err.0)?;
+    e.banco
+        .apagar_com(c, id, regra.as_deref(), &quem.contexto())
+        .await
+}
+
+fn par<'a>(pares: &'a [(String, String)], nome: &str) -> Option<&'a str> {
+    pares
+        .iter()
+        .find(|(k, _)| k == nome)
+        .map(|(_, v)| v.as_str())
+}
+
+const MAX_CORPO: usize = 32 * 1024 * 1024;
+
+async fn ler_corpo(req: Request, c: &Collection) -> Res<(Map<String, Value>, Vec<Recebido>)> {
+    let ct = req
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ct.starts_with("multipart/form-data") {
+        return ler_multipart(req, c).await;
+    }
+    let bytes = axum::body::to_bytes(req.into_body(), MAX_CORPO)
+        .await
+        .map_err(|_| ErroApi(Erro::invalido("Invalid request body.")))?;
+    if bytes.is_empty() {
+        return Ok((Map::new(), vec![]));
+    }
+    let valor: Value =
+        serde_json::from_slice(&bytes).map_err(|_| ErroApi(Erro::invalido("Invalid JSON.")))?;
+    let obj = valor
+        .as_object()
+        .cloned()
+        .ok_or_else(|| ErroApi(Erro::invalido("Expected a JSON object.")))?;
+    Ok((obj, vec![]))
+}
+
+async fn ler_multipart(req: Request, c: &Collection) -> Res<(Map<String, Value>, Vec<Recebido>)> {
+    let mut mp = Multipart::from_request(req, &())
+        .await
+        .map_err(|_| ErroApi(Erro::invalido("Invalid multipart body.")))?;
+    let mut textos = Vec::new();
+    let mut recebidos = Vec::new();
+    while let Some(field) = mp
+        .next_field()
+        .await
+        .map_err(|_| ErroApi(Erro::invalido("Invalid multipart body.")))?
+    {
+        let nome = field.name().unwrap_or("").to_string();
+        if nome.is_empty() {
+            continue;
+        }
+        if let Some(arquivo) = field.file_name().map(str::to_string) {
+            let (campo, acrescentar) = nome
+                .strip_suffix('+')
+                .map(|b| (b.to_string(), true))
+                .unwrap_or((nome, false));
+            let tipo = field.content_type().unwrap_or("").to_string();
+            let bytes = field
+                .bytes()
+                .await
+                .map_err(|_| ErroApi(Erro::invalido("Invalid multipart body.")))?;
+            recebidos.push(Recebido {
+                campo,
+                acrescentar,
+                nome_original: arquivo,
+                tipo,
+                bytes: bytes.to_vec(),
+            });
+        } else {
+            let texto = field
+                .text()
+                .await
+                .map_err(|_| ErroApi(Erro::invalido("Invalid multipart body.")))?;
+            textos.push((nome, texto));
+        }
+    }
+    Ok((dados_multipart(c, &textos), recebidos))
+}
+
+fn dados_multipart(c: &Collection, pares: &[(String, String)]) -> Map<String, Value> {
+    let mut grupos: Vec<(String, Vec<String>)> = Vec::new();
+    for (k, v) in pares {
+        if let Some((_, g)) = grupos.iter_mut().find(|(n, _)| n == k) {
+            g.push(v.clone());
+        } else {
+            grupos.push((k.clone(), vec![v.clone()]));
+        }
+    }
+    let mut dados = Map::new();
+    for (k, valores) in grupos {
+        let base = k.strip_suffix(['+', '-']).unwrap_or(&k);
+        let campo = c.campo(base);
+        let valor = match campo {
+            Some(f) if f.kind == FieldType::Bool => {
+                json!(valores[0] == "true" || valores[0] == "1")
+            }
+            Some(f) if f.kind == FieldType::Number => valores[0]
+                .parse::<f64>()
+                .map(|n| json!(n))
+                .unwrap_or_else(|_| json!(&valores[0])),
+            Some(f) if f.kind == FieldType::Json => {
+                serde_json::from_str(&valores[0]).unwrap_or_else(|_| json!(&valores[0]))
+            }
+            Some(f)
+                if matches!(
+                    f.kind,
+                    FieldType::Select | FieldType::Relation | FieldType::File
+                ) && (f.multiplo() || k.ends_with('-')) =>
+            {
+                json!(valores)
+            }
+            _ if k.ends_with('-') && valores.len() > 1 => json!(valores),
+            _ => json!(&valores[0]),
+        };
+        dados.insert(k, valor);
+    }
+    dados
 }
 
 // ── Autenticação de usuários (coleções auth) ─────────────────────────────
@@ -989,6 +1192,192 @@ async fn personificar(
     Ok(Json(json!({ "token": token, "record": registro })))
 }
 
+// ── Arquivos ─────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, Default)]
+struct ParamsArquivo {
+    download: Option<String>,
+    /// Aceito e ignorado: a miniatura ainda não é gerada, então o original sai.
+    thumb: Option<String>,
+    token: Option<String>,
+}
+
+async fn arquivo_token(State(e): State<Estado>, quem: Chamador) -> Res<Json<Value>> {
+    let (id, colecao, chave) = match &quem.0 {
+        Some(Identidade::Superusuario(su)) => (
+            su.id.clone(),
+            COLECAO_SUPERUSERS.to_string(),
+            su.token_key.clone(),
+        ),
+        Some(Identidade::Registro { colecao, registro }) => {
+            let id = registro
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let cred = e
+                .banco
+                .auth_credenciais_por_id(colecao, &id)
+                .await?
+                .ok_or_else(token_invalido)?;
+            (id, colecao.id.clone(), cred.token_key)
+        }
+        None => return Err(token_invalido()),
+    };
+    let token = auth::emitir_tipo(
+        &e.segredo,
+        &id,
+        &colecao,
+        &chave,
+        TIPO_ARQUIVO,
+        VALIDADE_ARQUIVO,
+        None,
+    )?;
+    Ok(Json(json!({ "token": token })))
+}
+
+fn arquivo_ausente() -> Response {
+    ErroApi(Erro::NaoEncontrado(
+        "The requested resource wasn't found.".into(),
+    ))
+    .into_response()
+}
+
+async fn arquivo_baixar(
+    State(e): State<Estado>,
+    Path((nome, id, arquivo)): Path<(String, String, String)>,
+    Query(p): Query<ParamsArquivo>,
+    req: Request,
+) -> Response {
+    let _ = p.thumb;
+    let Ok(c) = e.banco.colecao(&nome).await else {
+        return arquivo_ausente();
+    };
+    let Ok(registro) = e.banco.registro(&c, &id, None).await else {
+        return arquivo_ausente();
+    };
+    let Some(protegido) = arquivos::arquivo_do_registro(&c, &registro, &arquivo) else {
+        return arquivo_ausente();
+    };
+    if protegido {
+        let Some(token) = p.token.as_deref().filter(|t| !t.is_empty()) else {
+            return arquivo_ausente();
+        };
+        let Ok(quem) = identificar(&e, token, TIPO_ARQUIVO).await else {
+            return arquivo_ausente();
+        };
+        let Ok(regra) = regra_para(&quem, &c.view_rule) else {
+            return arquivo_ausente();
+        };
+        let visivel = e
+            .banco
+            .visivel(&c, &id, regra.as_deref(), &quem.contexto())
+            .await
+            .unwrap_or(false);
+        if !visivel {
+            return arquivo_ausente();
+        }
+    }
+    let Some(pasta) = e.banco.pasta() else {
+        return arquivo_ausente();
+    };
+    let Ok(caminho) = arquivos::caminho(&pasta, &c.id, &id, &arquivo) else {
+        return arquivo_ausente();
+    };
+    let bytes = match tokio::task::spawn_blocking(move || std::fs::read(caminho)).await {
+        Ok(Ok(b)) => b,
+        _ => return arquivo_ausente(),
+    };
+    let faixa = req
+        .headers()
+        .get(RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let (inicio, fim, parcial) = match fatia(bytes.len(), faixa.as_deref()) {
+        Ok(v) => v,
+        Err(PedidoFaixa::Invalida) => {
+            return Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header(CONTENT_RANGE, format!("bytes */{}", bytes.len()))
+                .body(axum::body::Body::empty())
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+    };
+    let pedaco = bytes[inicio..fim].to_vec();
+    let mut resp = Response::builder()
+        .status(if parcial {
+            StatusCode::PARTIAL_CONTENT
+        } else {
+            StatusCode::OK
+        })
+        .header(CONTENT_TYPE, arquivos::tipo_por_extensao(&arquivo))
+        .header(CONTENT_LENGTH, pedaco.len().to_string())
+        .header("accept-ranges", "bytes");
+    if parcial {
+        let ultimo = fim.saturating_sub(1);
+        resp = resp.header(
+            CONTENT_RANGE,
+            format!("bytes {inicio}-{ultimo}/{}", bytes.len()),
+        );
+    }
+    if p.download.as_deref() == Some("1") {
+        resp = resp.header(
+            CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{arquivo}\""),
+        );
+    }
+    let corpo = if req.method() == axum::http::Method::HEAD {
+        axum::body::Body::empty()
+    } else {
+        axum::body::Body::from(pedaco)
+    };
+    resp.body(corpo)
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+enum PedidoFaixa {
+    Invalida,
+}
+
+/// `(início, fim exclusivo, parcial)`. Sem cabeçalho, o arquivo inteiro.
+fn fatia(len: usize, header: Option<&str>) -> Result<(usize, usize, bool), PedidoFaixa> {
+    let Some(h) = header.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok((0, len, false));
+    };
+    let Some(spec) = h.strip_prefix("bytes=") else {
+        return Err(PedidoFaixa::Invalida);
+    };
+    let spec = spec.split(',').next().unwrap_or(spec).trim();
+    let Some((a, b)) = spec.split_once('-') else {
+        return Err(PedidoFaixa::Invalida);
+    };
+    if len == 0 {
+        return Err(PedidoFaixa::Invalida);
+    }
+    if a.is_empty() {
+        let n: usize = b.parse().map_err(|_| PedidoFaixa::Invalida)?;
+        if n == 0 {
+            return Err(PedidoFaixa::Invalida);
+        }
+        let inicio = len.saturating_sub(n);
+        return Ok((inicio, len, true));
+    }
+    let inicio: usize = a.parse().map_err(|_| PedidoFaixa::Invalida)?;
+    if inicio >= len {
+        return Err(PedidoFaixa::Invalida);
+    }
+    let ultimo = if b.is_empty() {
+        len - 1
+    } else {
+        let fim: usize = b.parse().map_err(|_| PedidoFaixa::Invalida)?;
+        fim.min(len - 1)
+    };
+    if ultimo < inicio {
+        return Err(PedidoFaixa::Invalida);
+    }
+    Ok((inicio, ultimo + 1, true))
+}
+
 // ── Rotas ────────────────────────────────────────────────────────────────
 
 /// `GET /api/health`, com o mesmo corpo do PocketBase.
@@ -1062,7 +1451,18 @@ pub fn router(e: Estado) -> Router {
             "/api/collections/{colecao}/impersonate/{id}",
             post(personificar),
         )
+        .route("/api/batch", post(lote::http))
+        .route(
+            "/api/realtime",
+            get(realtime::conectar).post(realtime::inscrever),
+        )
+        .route("/api/files/token", post(arquivo_token))
+        .route(
+            "/api/files/{colecao}/{id}/{arquivo}",
+            get(arquivo_baixar).head(arquivo_baixar),
+        )
         .merge(painel::rotas())
+        .layer(DefaultBodyLimit::max(MAX_CORPO))
         .with_state(e)
 }
 
@@ -2276,5 +2676,400 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::OK, "{super_}");
         assert_eq!(super_["totalItems"], json!(1));
+    }
+
+    async fn estado_disco() -> (Estado, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let e = Estado::novo(Banco::sqlite(dir.path()).await.unwrap())
+            .await
+            .unwrap();
+        (e, dir)
+    }
+
+    fn parte(nome: &str, valor: &str) -> Vec<u8> {
+        format!(
+            "--ForjaBoundary\r\nContent-Disposition: form-data; name=\"{nome}\"\r\n\r\n{valor}\r\n"
+        )
+        .into_bytes()
+    }
+
+    fn parte_arquivo(campo: &str, arquivo: &str, tipo: &str, bytes: &[u8]) -> Vec<u8> {
+        let mut out = format!(
+            "--ForjaBoundary\r\nContent-Disposition: form-data; name=\"{campo}\"; filename=\"{arquivo}\"\r\nContent-Type: {tipo}\r\n\r\n"
+        )
+        .into_bytes();
+        out.extend_from_slice(bytes);
+        out.extend_from_slice(b"\r\n");
+        out
+    }
+
+    async fn enviar_multipart(
+        e: &Estado,
+        uri: &str,
+        token: Option<&str>,
+        corpo: Vec<u8>,
+    ) -> (StatusCode, Value) {
+        let mut req = Request::builder().method("POST").uri(uri).header(
+            "content-type",
+            "multipart/form-data; boundary=ForjaBoundary",
+        );
+        if let Some(t) = token {
+            req = req.header("authorization", t);
+        }
+        let resp = router(e.clone())
+            .oneshot(req.body(Body::from(corpo)).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn arquivo_sobe_baixa_e_recusa_tipo() {
+        let (e, _dir) = estado_disco().await;
+        let t = login(&e).await;
+        let (s, _) = chamar(
+            &e,
+            "POST",
+            "/api/collections",
+            Some(&t),
+            Some(json!({
+                "name": "posts",
+                "fields": [
+                    {"name": "titulo", "type": "text", "required": true},
+                    {"name": "capa", "type": "file", "maxSize": 1000, "mimeTypes": ["image/png"]}
+                ],
+                "listRule": "",
+                "viewRule": "",
+                "createRule": ""
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+
+        let mut ruim = parte("titulo", "Sem figura");
+        ruim.extend(parte_arquivo("capa", "nota.txt", "text/plain", b"abc"));
+        ruim.extend(b"--ForjaBoundary--\r\n");
+        let (s, v) = enviar_multipart(&e, "/api/collections/posts/records", None, ruim).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(
+            v["data"]["capa"]["code"],
+            json!("validation_invalid_mime_type")
+        );
+
+        let png = b"png-bytes-12345";
+        let mut corpo = parte("titulo", "Com figura");
+        corpo.extend(parte_arquivo("capa", "Foto.PNG", "image/png", png));
+        corpo.extend(b"--ForjaBoundary--\r\n");
+        let (s, v) = enviar_multipart(&e, "/api/collections/posts/records", None, corpo).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let id = v["id"].as_str().unwrap().to_string();
+        let nome = v["capa"].as_str().unwrap().to_string();
+        assert!(nome.starts_with("foto_"), "{nome}");
+        assert!(nome.ends_with(".png"), "{nome}");
+
+        let resp = router(e.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/files/posts/{id}/{nome}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|h| h.to_str().ok()),
+            Some("image/png")
+        );
+        let baixado = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&baixado[..], png);
+
+        let resp = router(e.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/files/posts/{id}/{nome}?download=1&thumb=100x100"
+                    ))
+                    .header("range", "bytes=0-2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        let disp = resp
+            .headers()
+            .get("content-disposition")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("");
+        assert!(disp.contains("attachment"), "{disp}");
+        let pedaco = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&pedaco[..], &png[..3]);
+
+        let resp = router(e.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/files/posts/{id}/{nome}"))
+                    .header("range", "bytes=100-200")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+
+        let (s, _) = chamar(
+            &e,
+            "GET",
+            &format!("/api/files/posts/{id}/outro.png"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn arquivo_protegido_exige_token_e_view_rule() {
+        let (e, _dir) = estado_disco().await;
+        let t = login(&e).await;
+        let (s, _) = chamar(
+            &e,
+            "POST",
+            "/api/collections",
+            Some(&t),
+            Some(json!({
+                "name": "docs",
+                "fields": [
+                    {"name": "titulo", "type": "text"},
+                    {"name": "anexo", "type": "file", "protected": true}
+                ],
+                "listRule": "",
+                "viewRule": null,
+                "createRule": ""
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let bytes = b"segredo";
+        let mut corpo = parte("titulo", "Privado");
+        corpo.extend(parte_arquivo("anexo", "segredo.txt", "text/plain", bytes));
+        corpo.extend(b"--ForjaBoundary--\r\n");
+        let (s, v) = enviar_multipart(&e, "/api/collections/docs/records", Some(&t), corpo).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let id = v["id"].as_str().unwrap();
+        let nome = v["anexo"].as_str().unwrap();
+        let uri = format!("/api/files/docs/{id}/{nome}");
+
+        let (s, _) = chamar(&e, "GET", &uri, None, None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let (s, _) = chamar(&e, "GET", &format!("{uri}?token={t}"), None, None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+
+        let (s, _) = chamar(&e, "POST", "/api/files/token", None, None).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        let (s, tok) = chamar(&e, "POST", "/api/files/token", Some(&t), None).await;
+        assert_eq!(s, StatusCode::OK, "{tok}");
+        let file_token = tok["token"].as_str().unwrap();
+        let resp = router(e.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{uri}?token={file_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let baixado = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&baixado[..], bytes);
+    }
+
+    #[tokio::test]
+    async fn lote_confirma_junto_e_desfaz_junto() {
+        let e = estado().await;
+        let t = login(&e).await;
+        let (s, _) = chamar(
+            &e,
+            "POST",
+            "/api/collections",
+            Some(&t),
+            Some(json!({
+                "name": "posts",
+                "fields": [{"name": "titulo", "type": "text", "required": true}],
+                "listRule": "",
+                "viewRule": "",
+                "createRule": ""
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+
+        let mut rx = e.banco.assinar();
+        let (s, v) = chamar(
+            &e,
+            "POST",
+            "/api/batch",
+            Some(&t),
+            Some(json!({
+                "requests": [
+                    {"method": "POST", "url": "/api/collections/posts/records", "body": {"titulo": "A"}},
+                    {"method": "POST", "url": "/api/collections/posts/records", "body": {}},
+                    {"method": "GET", "url": "/api/collections/posts/records"}
+                ]
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert!(rx.try_recv().is_err(), "lote falho publicou evento");
+        let (s, lista) = chamar(&e, "GET", "/api/collections/posts/records", None, None).await;
+        assert_eq!(s, StatusCode::OK, "{lista}");
+        assert_eq!(lista["totalItems"], json!(0));
+
+        let (s, v) = chamar(
+            &e,
+            "POST",
+            "/api/batch",
+            Some(&t),
+            Some(json!({
+                "requests": [
+                    {"method": "POST", "url": "/api/collections/posts/records", "body": {"titulo": "A"}},
+                    {"method": "POST", "url": "/api/collections/posts/records", "body": {"titulo": "B"}},
+                    {"method": "GET", "url": "/api/collections/posts/records?sort=-created"}
+                ]
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let itens = v.as_array().unwrap();
+        assert_eq!(itens.len(), 3);
+        assert_eq!(itens[0]["status"], json!(200));
+        assert_eq!(itens[2]["body"]["totalItems"], json!(2));
+        assert_eq!(
+            rx.try_recv().unwrap().acao,
+            forja_core::barramento::Acao::Criar
+        );
+        assert_eq!(
+            rx.try_recv().unwrap().acao,
+            forja_core::barramento::Acao::Criar
+        );
+
+        let (s, _) = chamar(
+            &e,
+            "POST",
+            "/api/batch",
+            Some(&t),
+            Some(json!({"requests": []})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+    }
+
+    async fn quadro_sse(body: &mut axum::body::Body) -> Option<String> {
+        let esperado = tokio::time::timeout(std::time::Duration::from_secs(2), body.frame()).await;
+        let Ok(Some(frame)) = esperado else {
+            return None;
+        };
+        let Ok(frame) = frame else {
+            return None;
+        };
+        let Ok(data) = frame.into_data() else {
+            return None;
+        };
+        Some(String::from_utf8(data.to_vec()).unwrap_or_default())
+    }
+
+    #[tokio::test]
+    async fn sse_respeita_a_regra_da_colecao() {
+        let e = estado().await;
+        let t = login(&e).await;
+        let (s, _) = chamar(
+            &e,
+            "POST",
+            "/api/collections",
+            Some(&t),
+            Some(json!({
+                "name": "posts",
+                "fields": [{"name": "titulo", "type": "text"}],
+                "createRule": ""
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+
+        let abrir = |e: &Estado| {
+            let e = e.clone();
+            async move {
+                let resp = router(e)
+                    .oneshot(
+                        Request::builder()
+                            .uri("/api/realtime")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                let mut body = resp.into_body();
+                let texto = quadro_sse(&mut body).await.expect("PB_CONNECT");
+                assert!(texto.contains("PB_CONNECT"), "{texto}");
+                let client_id = texto.split("data:").nth(1).unwrap().trim().to_string();
+                let id = serde_json::from_str::<Value>(&client_id).unwrap()["clientId"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                (id, body)
+            }
+        };
+        let (id_visita, mut corpo_visita) = abrir(&e).await;
+        let (id_su, mut corpo_su) = abrir(&e).await;
+
+        let (s, _) = chamar(
+            &e,
+            "POST",
+            "/api/realtime",
+            None,
+            Some(json!({"clientId": id_visita, "subscriptions": ["posts"]})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+        let (s, _) = chamar(
+            &e,
+            "POST",
+            "/api/realtime",
+            Some(&t),
+            Some(json!({"clientId": id_su, "subscriptions": ["posts"]})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+
+        let (s, criado) = chamar(
+            &e,
+            "POST",
+            "/api/collections/posts/records",
+            Some(&t),
+            Some(json!({"titulo": "Ao vivo"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{criado}");
+
+        let su = quadro_sse(&mut corpo_su)
+            .await
+            .expect("evento do superusuário");
+        assert!(su.contains("\"action\":\"create\""), "{su}");
+        assert!(su.contains(criado["id"].as_str().unwrap()), "{su}");
+        let visita =
+            tokio::time::timeout(std::time::Duration::from_millis(200), corpo_visita.frame()).await;
+        assert!(
+            visita.is_err(),
+            "visitante recebeu evento com listRule fechada"
+        );
     }
 }

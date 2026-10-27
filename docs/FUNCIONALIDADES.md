@@ -99,7 +99,7 @@ Versão atual: **0.0.2**. O Forja só vira **1.0.0** quando estiver estável
 | `date` | data e hora UTC, com mínimo e máximo | ✅ |
 | `autodate` | data de criação ou atualização, preenchida sozinha | ✅ (tipo) |
 | `select` | um ou vários valores de uma lista | ✅ |
-| `file` | um ou vários arquivos, com tipos MIME, tamanho e miniaturas | ✅ (tipo) |
+| `file` | um ou vários arquivos, com tipos MIME e tamanho; miniatura ainda não | ✅ |
 | `relation` | um ou vários registros de outra coleção, com exclusão em cascata | ✅ |
 | `json` | qualquer JSON, com tamanho máximo | ✅ |
 | `password` | senha com hash (Argon2id), nunca devolvida nem filtrável | ✅ |
@@ -135,9 +135,9 @@ com uma mensagem clara. "✅" quer dizer validado e guardado.
 | Ordenação por `@rowid` | 📋 |
 | Expandir relações (`expand`, inclusive aninhadas e reversas `coleção_via_campo`) | ✅ |
 | Escolher campos (`fields`, com `:excerpt`) | 📋 |
-| Modificadores de valor no envio (`campo+`, `+campo`, `campo-`) | 📋 |
-| Upload de arquivos em `multipart/form-data` | 📋 |
-| **Lote** (`/api/batch`): várias operações numa transação | 📋 |
+| Modificadores de valor no envio (`campo+`, `+campo`, `campo-`) | 🔨 (`campo+` e `campo-` no `file`; `+campo` nos outros tipos fica) |
+| Upload de arquivos em `multipart/form-data` | ✅ (API; o painel só exibe o nome) |
+| **Lote** (`/api/batch`): várias operações numa transação | 🔨 (JSON de registro, até 50, tudo ou nada; sem arquivo) |
 | Validação com mensagens de erro por campo, no formato do PocketBase | ✅ |
 | Campos `hidden` só para superusuários | ✅ |
 
@@ -159,7 +159,7 @@ com uma mensagem clara. "✅" quer dizer validado e guardado.
 | Alerta de login de novo dispositivo (`authAlert`) | 📋 |
 | Métodos de login disponíveis por coleção (`auth-methods`) | 📋 |
 | Token JWT de autenticação, invalidado ao trocar a senha | ✅ |
-| Tokens de verificação, senha, e-mail e arquivo | ✅ (verificação, senha e e-mail) |
+| Tokens de verificação, senha, e-mail e arquivo | ✅ |
 | Modelos de e-mail editáveis (verificação, senha, troca de e-mail, OTP, alerta) | 📋 (texto fixo; envio no console) |
 | Gerador do segredo do Sign in with Apple | 📋 |
 
@@ -167,21 +167,21 @@ com uma mensagem clara. "✅" quer dizer validado e guardado.
 
 | Funcionalidade | Estado |
 |---|---|
-| Armazenamento local ou em S3 compatível (AWS, MinIO, R2…) | 📋 |
-| Servir arquivos (`/api/files/{coleção}/{registro}/{arquivo}`) | 📋 |
+| Armazenamento local ou em S3 compatível (AWS, MinIO, R2…) | 🔨 (disco local; S3 fica) |
+| Servir arquivos (`/api/files/{coleção}/{registro}/{arquivo}`) | ✅ (`Range` simples; `?thumb=` devolve o original) |
 | Miniaturas sob demanda (`?thumb=100x100`, com corte e ajuste) | 📋 |
-| Arquivos protegidos com token de arquivo de curta duração | 📋 |
-| Download forçado (`?download=1`) | 📋 |
+| Arquivos protegidos com token de arquivo de curta duração | ✅ (3 minutos, e a `viewRule`) |
+| Download forçado (`?download=1`) | ✅ |
 | Testar a conexão S3 pelo painel | 📋 |
 
 ## 7. Tempo real
 
 | Funcionalidade | Estado |
 |---|---|
-| Server-Sent Events (`/api/realtime`) | 📋 |
-| Assinar uma coleção inteira ou um registro | 📋 |
-| Eventos de criação, atualização e exclusão, respeitando as regras de acesso | 📋 |
-| Opções por assinatura (filtro, expand, fields) | 📋 |
+| Server-Sent Events (`/api/realtime`) | ✅ (`PB_CONNECT`; ocioso 5 min, teto 30 min) |
+| Assinar uma coleção inteira ou um registro | ✅ |
+| Eventos de criação, atualização e exclusão, respeitando as regras de acesso | ✅ |
+| Opções por assinatura (filtro, expand, fields) | 🔨 (filtro; `expand` e `fields` ficam) |
 
 ## 8. Configurações e operação
 

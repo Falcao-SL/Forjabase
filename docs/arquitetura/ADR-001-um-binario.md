@@ -176,6 +176,6 @@ A 0.2 (relação, cascata, `expand`, view, `@collection.*`) fechou em 2026-10-27
 2. `criar`, `atualizar*` e `apagar*` publicam `Evento { colecao, acao, id }` depois do commit.
 3. Um teste prova que o assinante recebe o evento e que assinante lento ou ausente não desfaz a escrita.
 4. A cascata da 0.2 publica pelo mesmo caminho, um evento por registro afetado.
-5. Nenhum crate novo, nenhuma rota SSE ainda (isso é a 0.3).
+5. Nenhum crate novo. A rota SSE entrou na fatia da 0.3, no mesmo processo.
 
 Critério de pronto: não existe inserção, atualização ou exclusão de registro em `store.rs` que não passe por essa publicação.

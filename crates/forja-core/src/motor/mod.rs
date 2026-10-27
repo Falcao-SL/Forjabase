@@ -36,6 +36,34 @@ pub trait Executor: Send + Sync {
 
     /// Executa vários comandos numa transação: tudo ou nada.
     async fn lote(&self, comandos: Vec<(String, Vec<Valor>)>) -> Resultado<()>;
+
+    /// Transação exclusiva em volta de várias chamadas. O padrão não faz
+    /// nada: só o SQLite (o motor suportado) segura a conexão até o commit.
+    async fn abrir_transacao(&self) -> Resultado<Box<dyn Guardiao>> {
+        Ok(Box::new(TransacaoVazia))
+    }
+}
+
+/// Commit ou rollback de uma transação aberta por `Executor::abrir_transacao`.
+/// O `Drop` desfaz o que não foi confirmado.
+#[async_trait]
+pub trait Guardiao: Send {
+    async fn commit(&self) -> Resultado<()>;
+    async fn rollback(&self) -> Resultado<()>;
+}
+
+/// Motores sem transação de lote (Postgres e Turso, fora do suporte).
+pub struct TransacaoVazia;
+
+#[async_trait]
+impl Guardiao for TransacaoVazia {
+    async fn commit(&self) -> Resultado<()> {
+        Ok(())
+    }
+
+    async fn rollback(&self) -> Resultado<()> {
+        Ok(())
+    }
 }
 
 /// `?` → `$1`, `$2`… O SQL do Forja nunca tem `?` dentro de texto entre

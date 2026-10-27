@@ -5,6 +5,7 @@
 //! Cada coleção base vira uma tabela com o nome dela: `id`, uma coluna por
 //! campo, `created` e `updated`. As coleções ficam descritas em `_collections`.
 
+use crate::arquivos;
 use crate::barramento::{Acao, Barramento, Evento};
 use crate::erro::{Erro, Resultado};
 use crate::filtro::{self, Contexto, Dialeto, Literal};
@@ -121,12 +122,24 @@ pub struct Credenciais {
     pub verified: bool,
 }
 
+/// Eventos e arquivos que só saem depois do commit de `em_transacao`.
+#[derive(Default)]
+struct Pendencias {
+    eventos: Vec<Evento>,
+    diretorios: Vec<std::path::PathBuf>,
+    arquivos: Vec<std::path::PathBuf>,
+}
+
 /// O banco de um projeto.
 #[derive(Clone)]
 pub struct Banco {
     ex: Arc<dyn Executor>,
     /// Escritas de registro. Clonar o banco não abre outro canal.
     barramento: Barramento,
+    /// Pasta do projeto. `storage/` fica ao lado de `data.db`. `None` em memória.
+    pasta: Option<Arc<std::path::PathBuf>>,
+    /// Preenchido só na tarefa que abriu `em_transacao`.
+    adiados: Arc<std::sync::Mutex<Option<(tokio::task::Id, Pendencias)>>>,
 }
 
 // ── Abrir ────────────────────────────────────────────────────────────────
@@ -167,6 +180,8 @@ impl Banco {
         let b = Banco {
             ex,
             barramento: Barramento::novo(),
+            pasta: None,
+            adiados: Arc::new(std::sync::Mutex::new(None)),
         };
         b.ex.lote(
             esquema(b.dialeto())
@@ -183,10 +198,12 @@ impl Banco {
     #[cfg(feature = "sqlite")]
     pub async fn sqlite(pasta: &std::path::Path) -> Resultado<Banco> {
         criar_pasta(pasta)?;
-        Banco::novo(Arc::new(crate::motor::sqlite::Sqlite::abrir(
+        let mut b = Banco::novo(Arc::new(crate::motor::sqlite::Sqlite::abrir(
             &pasta.join("data.db"),
         )?))
-        .await
+        .await?;
+        b.pasta = Some(Arc::new(pasta.to_path_buf()));
+        Ok(b)
     }
 
     #[cfg(feature = "sqlite")]
@@ -237,12 +254,188 @@ impl Banco {
         self.barramento.assinar()
     }
 
-    fn publicar(&self, colecao: &str, acao: Acao, id: &str) {
-        self.barramento.publicar(Evento {
+    pub fn pasta(&self) -> Option<Arc<std::path::PathBuf>> {
+        self.pasta.clone()
+    }
+
+    fn publicar(&self, colecao: &str, acao: Acao, id: &str, registro: Value) {
+        let evento = Evento {
             colecao: colecao.to_string(),
             acao,
             id: id.to_string(),
-        });
+            registro,
+        };
+        if let Some(tarefa) = tokio::task::try_id() {
+            let mut g = self.adiados.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((dono, p)) = g.as_mut()
+                && *dono == tarefa
+            {
+                p.eventos.push(evento);
+                return;
+            }
+        }
+        self.barramento.publicar(evento);
+    }
+
+    fn adiando(&self) -> bool {
+        let Some(tarefa) = tokio::task::try_id() else {
+            return false;
+        };
+        self.adiados
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|(dono, _)| *dono == tarefa)
+    }
+
+    fn agendar_diretorio(&self, caminho: std::path::PathBuf) {
+        if self.adiando() {
+            self.adiados
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_mut()
+                .expect("adiando")
+                .1
+                .diretorios
+                .push(caminho);
+        } else {
+            arquivos::remover_dir(&caminho);
+        }
+    }
+
+    fn agendar_arquivo(&self, caminho: std::path::PathBuf) {
+        if self.adiando() {
+            self.adiados
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_mut()
+                .expect("adiando")
+                .1
+                .arquivos
+                .push(caminho);
+        } else if caminho.is_file() {
+            let _ = std::fs::remove_file(caminho);
+        }
+    }
+
+    fn soltar_adiados(&self) {
+        let pend = self
+            .adiados
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let Some((_, p)) = pend else { return };
+        for ev in p.eventos {
+            self.barramento.publicar(ev);
+        }
+        for caminho in p.diretorios {
+            arquivos::remover_dir(&caminho);
+        }
+        for caminho in p.arquivos {
+            if caminho.is_file() {
+                let _ = std::fs::remove_file(caminho);
+            }
+        }
+    }
+
+    fn descartar_adiados(&self) {
+        self.adiados
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+    }
+
+    /// Várias operações no mesmo commit. Se `f` falhar, nada fica gravado e
+    /// nenhum evento sai. O SQLite segura a conexão; outro motor não é atômico.
+    ///
+    /// A trava reentra pela tarefa. `block_on` (os testes) não é uma tarefa,
+    /// então o trabalho nasce numa.
+    pub async fn em_transacao<T, F>(&self, f: F) -> Resultado<T>
+    where
+        T: Send + 'static,
+        F: Future<Output = Resultado<T>> + Send + 'static,
+    {
+        if tokio::task::try_id().is_none() {
+            let banco = self.clone();
+            return tokio::spawn(async move { banco.rodar_transacao(f).await })
+                .await
+                .map_err(|e| Erro::Interno(e.to_string()))?;
+        }
+        self.rodar_transacao(f).await
+    }
+
+    async fn rodar_transacao<T, F>(&self, f: F) -> Resultado<T>
+    where
+        T: Send + 'static,
+        F: Future<Output = Resultado<T>> + Send + 'static,
+    {
+        let id = tokio::task::try_id().ok_or_else(|| {
+            Erro::Interno("em_transacao precisa rodar dentro de uma tarefa.".into())
+        })?;
+        let tx = self.ex.abrir_transacao().await?;
+        {
+            let mut g = self.adiados.lock().unwrap_or_else(|e| e.into_inner());
+            *g = Some((id, Pendencias::default()));
+        }
+        match f.await {
+            Ok(v) => match tx.commit().await {
+                Ok(()) => {
+                    self.soltar_adiados();
+                    Ok(v)
+                }
+                Err(e) => {
+                    let _ = tx.rollback().await;
+                    self.descartar_adiados();
+                    Err(e)
+                }
+            },
+            Err(e) => {
+                let _ = tx.rollback().await;
+                self.descartar_adiados();
+                Err(e)
+            }
+        }
+    }
+
+    async fn gravar_arquivos(
+        &self,
+        colecao: &str,
+        registro: &str,
+        gravar: &[arquivos::Gravacao],
+    ) -> Resultado<()> {
+        if gravar.is_empty() {
+            return Ok(());
+        }
+        let Some(pasta) = self.pasta.clone() else {
+            return Err(Erro::invalido("File storage is not available."));
+        };
+        let gravar = gravar.to_vec();
+        let colecao = colecao.to_string();
+        let registro = registro.to_string();
+        tokio::task::spawn_blocking(move || {
+            for g in gravar {
+                arquivos::gravar(&pasta, &colecao, &registro, &g.nome, &g.bytes)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| Erro::Interno(e.to_string()))?
+    }
+
+    fn esquecer_nomes(&self, colecao: &str, registro: &str, nomes: &[String]) {
+        let Some(pasta) = self.pasta.clone() else {
+            return;
+        };
+        for nome in nomes {
+            if let Ok(caminho) = arquivos::caminho(&pasta, colecao, registro, nome) {
+                self.agendar_arquivo(caminho);
+            }
+        }
+    }
+
+    fn esquecer_registro(&self, colecao: &str, registro: &str) {
+        let Some(pasta) = &self.pasta else { return };
+        self.agendar_diretorio(arquivos::pasta_registro(pasta, colecao, registro));
     }
 }
 
@@ -321,7 +514,7 @@ fn tipo_sql(f: &Field, d: Dialeto) -> &'static str {
         (FieldType::Number, Dialeto::Postgres) => "DOUBLE PRECISION NOT NULL DEFAULT 0",
         (FieldType::Bool, _) => "BOOLEAN NOT NULL DEFAULT FALSE",
         (FieldType::Json, _) => "TEXT DEFAULT NULL",
-        (FieldType::Select | FieldType::Relation, _) if f.multiplo() => {
+        (FieldType::Select | FieldType::Relation | FieldType::File, _) if f.multiplo() => {
             "TEXT NOT NULL DEFAULT '[]'"
         }
         _ => "TEXT NOT NULL DEFAULT ''",
@@ -630,6 +823,52 @@ fn valor_do_campo(f: &Field, v: Option<&Value>, erros: &mut Map<String, Value>) 
             }
         }
         FieldType::Relation => valor_relacao(f, v, erros),
+        FieldType::File => {
+            let nomes: Vec<String> = match v {
+                None | Some(Value::Null) => vec![],
+                Some(Value::String(s)) if s.is_empty() => vec![],
+                Some(Value::String(s)) => vec![s.clone()],
+                Some(Value::Array(a)) => {
+                    let mut out = vec![];
+                    for x in a {
+                        match x.as_str() {
+                            Some("") => {}
+                            Some(s) if !out.iter().any(|o| o == s) => out.push(s.to_string()),
+                            Some(_) => {}
+                            None => ruim(erros),
+                        }
+                    }
+                    out
+                }
+                _ => {
+                    ruim(erros);
+                    vec![]
+                }
+            };
+            if nomes.iter().any(|n| !arquivos::nome_seguro(n)) {
+                ruim(erros);
+            }
+            let max = {
+                let m = f.opcao_f64("maxSelect").unwrap_or(1.0);
+                if m < 1.0 { 1 } else { m as usize }
+            };
+            if nomes.len() > max {
+                erro_campo(
+                    erros,
+                    n,
+                    "validation_too_many_values",
+                    format!("Select no more than {max}."),
+                );
+            }
+            if nomes.is_empty() && f.required {
+                obrigatorio(erros);
+            }
+            if f.multiplo() {
+                Valor::Texto(serde_json::to_string(&nomes).unwrap_or_else(|_| "[]".into()))
+            } else {
+                Valor::Texto(nomes.into_iter().next().unwrap_or_default())
+            }
+        }
         // Tipos ainda não suportados não chegam aqui: a coleção é recusada antes.
         _ => Valor::Nulo,
     }
@@ -715,6 +954,38 @@ fn valor_relacao(f: &Field, v: Option<&Value>, erros: &mut Map<String, Value>) -
     }
 }
 
+fn texto_json(v: Option<&Value>) -> Valor {
+    match v {
+        Some(Value::String(s)) => Valor::Texto(s.clone()),
+        Some(Value::Number(n)) => Valor::Texto(n.to_string()),
+        Some(Value::Bool(b)) => Valor::Texto(b.to_string()),
+        _ => Valor::Texto(String::new()),
+    }
+}
+
+/// Valor na forma em que a coluna guarda, para a regra rodar sobre um snapshot.
+fn valor_snapshot(f: &Field, v: Option<&Value>) -> Valor {
+    match v {
+        None | Some(Value::Null) => {
+            if f.kind == FieldType::Json {
+                Valor::Nulo
+            } else if f.multiplo() {
+                Valor::Texto("[]".into())
+            } else if f.kind == FieldType::Number {
+                Valor::Real(0.0)
+            } else if f.kind == FieldType::Bool {
+                Valor::Bool(false)
+            } else {
+                Valor::Texto(String::new())
+            }
+        }
+        Some(Value::Bool(b)) => Valor::Bool(*b),
+        Some(Value::Number(n)) => Valor::Real(n.as_f64().unwrap_or(0.0)),
+        Some(Value::String(s)) => Valor::Texto(s.clone()),
+        Some(outro) => Valor::Texto(outro.to_string()),
+    }
+}
+
 fn numero_json(x: f64) -> Value {
     if x.fract() == 0.0 && x.abs() < 9.0e15 {
         json!(x as i64)
@@ -727,7 +998,10 @@ fn numero_json(x: f64) -> Value {
 fn para_json(f: &Field, v: Valor) -> Value {
     match (f.kind, v) {
         (_, Valor::Nulo)
-            if matches!(f.kind, FieldType::Select | FieldType::Relation) && f.multiplo() =>
+            if matches!(
+                f.kind,
+                FieldType::Select | FieldType::Relation | FieldType::File
+            ) && f.multiplo() =>
         {
             json!([])
         }
@@ -742,7 +1016,9 @@ fn para_json(f: &Field, v: Valor) -> Value {
         }
         (FieldType::Bool, v) => json!(v.bool()),
         (FieldType::Json, Valor::Texto(t)) => serde_json::from_str(&t).unwrap_or(Value::Null),
-        (FieldType::Select | FieldType::Relation, Valor::Texto(t)) if f.multiplo() => {
+        (FieldType::Select | FieldType::Relation | FieldType::File, Valor::Texto(t))
+            if f.multiplo() =>
+        {
             serde_json::from_str(&t).unwrap_or(json!([]))
         }
         (_, Valor::Texto(t)) => json!(t),
@@ -1548,7 +1824,11 @@ impl Banco {
                     vec![c.id.clone().into()],
                 ),
             ])
-            .await
+            .await?;
+        if let Some(pasta) = &self.pasta {
+            self.agendar_diretorio(arquivos::pasta_colecao(pasta, &c.id));
+        }
+        Ok(())
     }
 
     pub async fn listar(&self, c: &Collection, q: &Consulta) -> Resultado<Lista> {
@@ -1645,6 +1925,69 @@ impl Banco {
             .ok_or_else(nao_encontrado)
     }
 
+    /// A regra deixa este registro visível? `None` em `regra` é público
+    /// (o chamador já barrou "só superusuário").
+    pub async fn visivel(
+        &self,
+        c: &Collection,
+        id: &str,
+        regra: Option<&str>,
+        ctx: &Contexto,
+    ) -> Resultado<bool> {
+        match self.registro_com(c, id, regra, ctx).await {
+            Ok(_) => Ok(true),
+            Err(Erro::NaoEncontrado(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// A mesma conferência, sobre o JSON do registro. Serve o apagar: a linha
+    /// já não está na tabela, mas a regra ainda precisa ser avaliada.
+    pub async fn snapshot_visivel(
+        &self,
+        c: &Collection,
+        registro: &Value,
+        regra: Option<&str>,
+        ctx: &Contexto,
+    ) -> Resultado<bool> {
+        let Some(regra) = regra.filter(|r| !r.trim().is_empty()) else {
+            return Ok(true);
+        };
+        let (onde_sql, params_regra) = self.onde(c, Some(regra), None, ctx, true).await?;
+        let cond = onde_sql
+            .trim()
+            .trim_start_matches("WHERE")
+            .trim()
+            .to_string();
+        if cond.is_empty() {
+            return Ok(true);
+        }
+        let mut proj = Vec::new();
+        let mut params = Vec::new();
+        proj.push("? AS \"id\"".to_string());
+        params.push(texto_json(registro.get("id")));
+        for f in &c.fields {
+            if f.kind == FieldType::Password || (f.system && f.name == "tokenKey") {
+                continue;
+            }
+            proj.push(format!("? AS \"{}\"", f.name));
+            params.push(valor_snapshot(f, registro.get(&f.name)));
+        }
+        if com_carimbo(c) {
+            proj.push("? AS \"created\"".to_string());
+            params.push(texto_json(registro.get("created")));
+            proj.push("? AS \"updated\"".to_string());
+            params.push(texto_json(registro.get("updated")));
+        }
+        params.extend(params_regra);
+        let sql = format!(
+            "SELECT 1 FROM (SELECT {}) AS \"{}\" WHERE {cond}",
+            proj.join(", "),
+            c.name
+        );
+        Ok(!self.ex.consultar(&sql, params).await?.is_empty())
+    }
+
     pub async fn criar(&self, c: &Collection, dados: &Map<String, Value>) -> Resultado<Value> {
         // Chamada interna e painel: enxerga os alvos das relações.
         self.criar_chamador(c, dados, &Contexto::default(), true)
@@ -1660,9 +2003,25 @@ impl Banco {
         ctx: &Contexto,
         superusuario: bool,
     ) -> Resultado<Value> {
+        self.criar_com_arquivos(c, dados, ctx, superusuario, Vec::new())
+            .await
+    }
+
+    /// Como `criar_chamador`, gravando os arquivos do multipart no disco.
+    pub async fn criar_com_arquivos(
+        &self,
+        c: &Collection,
+        dados: &Map<String, Value>,
+        ctx: &Contexto,
+        superusuario: bool,
+        recebidos: Vec<arquivos::Recebido>,
+    ) -> Resultado<Value> {
         if c.kind == CollectionType::View {
             return Err(Erro::invalido("The collection is not writable."));
         }
+        let resolvido = arquivos::resolver(c, dados, None, recebidos)
+            .map_err(|campos| invalido("Failed to create record.", campos))?;
+        let dados = &resolvido.dados;
         let mut erros = Map::new();
         let novo_id = match dados
             .get("id")
@@ -1754,8 +2113,23 @@ impl Banco {
             return Err(invalido("Failed to create record.", erros));
         }
         r?;
-        self.publicar(&c.name, Acao::Criar, &novo_id);
-        self.registro(c, &novo_id, None).await
+        if let Err(e) = self
+            .gravar_arquivos(&c.id, &novo_id, &resolvido.gravar)
+            .await
+        {
+            let _ = self
+                .ex
+                .executar(
+                    &format!("DELETE FROM \"{}\" WHERE \"id\" = ?", c.name),
+                    vec![novo_id.clone().into()],
+                )
+                .await;
+            self.esquecer_registro(&c.id, &novo_id);
+            return Err(e);
+        }
+        let registro = self.registro(c, &novo_id, None).await?;
+        self.publicar(&c.name, Acao::Criar, &novo_id, registro.clone());
+        Ok(registro)
     }
 
     pub async fn atualizar(
@@ -1793,10 +2167,29 @@ impl Banco {
         ctx: &Contexto,
         superusuario: bool,
     ) -> Resultado<Value> {
+        self.atualizar_com_arquivos(c, id, dados, regra, ctx, superusuario, Vec::new())
+            .await
+    }
+
+    /// Como `atualizar_chamador`, com arquivos novos do multipart.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn atualizar_com_arquivos(
+        &self,
+        c: &Collection,
+        id: &str,
+        dados: &Map<String, Value>,
+        regra: Option<&str>,
+        ctx: &Contexto,
+        superusuario: bool,
+        recebidos: Vec<arquivos::Recebido>,
+    ) -> Resultado<Value> {
         if c.kind == CollectionType::View {
             return Err(Erro::invalido("The collection is not writable."));
         }
         let atual = self.registro_com(c, id, regra, ctx).await?;
+        let resolvido = arquivos::resolver(c, dados, Some(&atual), recebidos)
+            .map_err(|campos| invalido("Failed to update record.", campos))?;
+        let dados = &resolvido.dados;
         let mut erros = Map::new();
         let mut sets: Vec<(String, Valor)> = vec![];
         let mut senha_nova: Option<String> = None;
@@ -1862,6 +2255,7 @@ impl Banco {
         if !erros.is_empty() {
             return Err(invalido("Failed to update record.", erros));
         }
+        self.gravar_arquivos(&c.id, id, &resolvido.gravar).await?;
         let atribuicoes: Vec<String> = sets
             .iter()
             .map(|(nome, _)| format!("\"{nome}\" = ?"))
@@ -1878,8 +2272,10 @@ impl Banco {
                 valores,
             )
             .await?;
-        self.publicar(&c.name, Acao::Atualizar, id);
-        self.registro_com(c, id, None, ctx).await
+        self.esquecer_nomes(&c.id, id, &resolvido.apagar);
+        let registro = self.registro_com(c, id, None, ctx).await?;
+        self.publicar(&c.name, Acao::Atualizar, id, registro.clone());
+        Ok(registro)
     }
 
     pub async fn apagar(&self, c: &Collection, id: &str, regra: Option<&str>) -> Resultado<()> {
@@ -1967,7 +2363,11 @@ impl Banco {
                 ],
             )
             .await?;
-        self.publicar(&c.name, Acao::Atualizar, id);
+        let registro = self
+            .registro(c, id, None)
+            .await
+            .unwrap_or_else(|_| json!({ "id": id }));
+        self.publicar(&c.name, Acao::Atualizar, id, registro);
         Ok(())
     }
 
@@ -2002,7 +2402,11 @@ impl Banco {
                     .await?;
             }
         }
-        self.publicar(&c.name, Acao::Atualizar, id);
+        let registro = self
+            .registro(c, id, None)
+            .await
+            .unwrap_or_else(|_| json!({ "id": id }));
+        self.publicar(&c.name, Acao::Atualizar, id, registro);
         Ok(())
     }
 
@@ -2056,7 +2460,12 @@ impl Banco {
                         vec![hash.into(), chave.into(), agora.into(), i.clone().into()],
                     )
                     .await?;
-                self.publicar("_superusers", Acao::Atualizar, &i);
+                self.publicar(
+                    "_superusers",
+                    Acao::Atualizar,
+                    &i,
+                    json!({ "id": i, "email": email, "collectionName": "_superusers" }),
+                );
                 i
             }
             None => {
@@ -2064,10 +2473,15 @@ impl Banco {
                 self.ex
                     .executar(
                         &format!("INSERT INTO \"_superusers\" ({COLS_SUPERUSER}) VALUES (?, ?, ?, ?, ?, ?)"),
-                        vec![i.clone().into(), email.into(), hash.into(), chave.into(), agora.clone().into(), agora.into()],
+                        vec![i.clone().into(), email.clone().into(), hash.into(), chave.into(), agora.clone().into(), agora.into()],
                     )
                     .await?;
-                self.publicar("_superusers", Acao::Criar, &i);
+                self.publicar(
+                    "_superusers",
+                    Acao::Criar,
+                    &i,
+                    json!({ "id": i, "email": email, "collectionName": "_superusers" }),
+                );
                 i
             }
         };
@@ -2145,7 +2559,7 @@ impl Banco {
                 ),
                 vec![
                     id_su.clone().into(),
-                    email.into(),
+                    email.clone().into(),
                     hash.into(),
                     chave.into(),
                     agora.clone().into(),
@@ -2153,7 +2567,12 @@ impl Banco {
                 ],
             )
             .await?;
-        self.publicar("_superusers", Acao::Criar, &id_su);
+        self.publicar(
+            "_superusers",
+            Acao::Criar,
+            &id_su,
+            json!({ "id": id_su, "email": email, "collectionName": "_superusers" }),
+        );
         self.superuser(&id_su).await
     }
 
@@ -2177,7 +2596,12 @@ impl Banco {
                 ],
             )
             .await?;
-        self.publicar("_superusers", Acao::Atualizar, &su.id);
+        self.publicar(
+            "_superusers",
+            Acao::Atualizar,
+            &su.id,
+            json!({ "id": su.id, "email": su.email, "collectionName": "_superusers" }),
+        );
         self.superuser(&su.id).await
     }
 
@@ -2190,13 +2614,18 @@ impl Banco {
                 "The last superuser can't be deleted. Create another one first.",
             ));
         }
+        let registro = json!({
+            "id": su.id,
+            "email": su.email,
+            "collectionName": "_superusers",
+        });
         self.ex
             .executar(
                 "DELETE FROM \"_superusers\" WHERE \"id\" = ?",
                 vec![su.id.clone().into()],
             )
             .await?;
-        self.publicar("_superusers", Acao::Apagar, &su.id);
+        self.publicar("_superusers", Acao::Apagar, &su.id, registro);
         Ok(su)
     }
 
@@ -2553,13 +2982,18 @@ impl Banco {
         for efeito in efeitos {
             match efeito {
                 Efeito::Apagar { colecao, id } => {
+                    let registro = self
+                        .registro(&colecao, &id, None)
+                        .await
+                        .unwrap_or_else(|_| json!({ "id": id, "collectionName": colecao.name }));
                     self.ex
                         .executar(
                             &format!("DELETE FROM \"{}\" WHERE \"id\" = ?", colecao.name),
                             vec![id.clone().into()],
                         )
                         .await?;
-                    self.publicar(&colecao.name, Acao::Apagar, &id);
+                    self.esquecer_registro(&colecao.id, &id);
+                    self.publicar(&colecao.name, Acao::Apagar, &id, registro);
                 }
                 Efeito::Desligar {
                     colecao,
@@ -2586,7 +3020,11 @@ impl Banco {
                             vec![valor, agora().into(), id.clone().into()],
                         )
                         .await?;
-                    self.publicar(&colecao.name, Acao::Atualizar, &id);
+                    let registro = self
+                        .registro(&colecao, &id, None)
+                        .await
+                        .unwrap_or_else(|_| json!({ "id": id }));
+                    self.publicar(&colecao.name, Acao::Atualizar, &id, registro);
                 }
             }
         }
@@ -2947,8 +3385,13 @@ pub mod conformidade {
             serde_json::from_value(json!({"name":"a","fields":[{"name":"id","type":"text"}]}))
                 .unwrap();
         assert!(b.criar_colecao(ruim).await.is_err());
-        let ruim: Collection =
+        let arquivo: Collection =
             serde_json::from_value(json!({"name":"b","fields":[{"name":"f","type":"file"}]}))
+                .unwrap();
+        assert!(b.criar_colecao(arquivo).await.is_ok());
+        b.apagar_colecao("b").await.unwrap();
+        let ruim: Collection =
+            serde_json::from_value(json!({"name":"b","fields":[{"name":"f","type":"geoPoint"}]}))
                 .unwrap();
         assert!(b.criar_colecao(ruim).await.is_err());
         let ruim: Collection =
@@ -3681,14 +4124,10 @@ mod tests {
         let ouvido = b.criar(&c, &obj("ouvido")).await.unwrap();
         let id = ouvido["id"].as_str().unwrap().to_string();
         let ev = rx.recv().await.unwrap();
-        assert_eq!(
-            ev,
-            Evento {
-                colecao: "notas".into(),
-                acao: Acao::Criar,
-                id: id.clone(),
-            }
-        );
+        assert_eq!(ev.colecao, "notas");
+        assert_eq!(ev.acao, Acao::Criar);
+        assert_eq!(ev.id, id);
+        assert_eq!(ev.registro["t"], json!("ouvido"));
         b.atualizar(&c, &id, &obj("novo"), None).await.unwrap();
         assert_eq!(rx.recv().await.unwrap().acao, Acao::Atualizar);
         b.apagar(&c, &id, None).await.unwrap();
@@ -4031,5 +4470,143 @@ mod tests {
             .await
             .unwrap();
         assert!(itens[0]["expand"]["origem"].is_null());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn arquivo_grava_serve_e_some_com_o_registro() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = Banco::sqlite(dir.path()).await.unwrap();
+        let c = b
+            .criar_colecao(base(
+                "fotos",
+                json!([{
+                    "name": "capa",
+                    "type": "file",
+                    "maxSize": 8,
+                    "mimeTypes": ["image/png"],
+                    "required": true
+                }]),
+            ))
+            .await
+            .unwrap();
+        let recebidos = vec![arquivos::Recebido {
+            campo: "capa".into(),
+            acrescentar: false,
+            nome_original: "Foto.PNG".into(),
+            tipo: "image/png".into(),
+            bytes: b"png-ok".to_vec(),
+        }];
+        let reg = b
+            .criar_com_arquivos(&c, &Map::new(), &Contexto::default(), true, recebidos)
+            .await
+            .unwrap();
+        let nome = reg["capa"].as_str().unwrap();
+        assert!(nome.starts_with("foto_"), "{nome}");
+        assert!(nome.ends_with(".png"), "{nome}");
+        let caminho =
+            arquivos::caminho(dir.path(), &c.id, reg["id"].as_str().unwrap(), nome).unwrap();
+        assert_eq!(std::fs::read(&caminho).unwrap(), b"png-ok");
+
+        let grande = b
+            .criar_com_arquivos(
+                &c,
+                &Map::new(),
+                &Contexto::default(),
+                true,
+                vec![arquivos::Recebido {
+                    campo: "capa".into(),
+                    acrescentar: false,
+                    nome_original: "a.png".into(),
+                    tipo: "image/png".into(),
+                    bytes: b"123456789".to_vec(),
+                }],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(grande, Erro::Invalido { .. }));
+
+        let tipo = b
+            .criar_com_arquivos(
+                &c,
+                &Map::new(),
+                &Contexto::default(),
+                true,
+                vec![arquivos::Recebido {
+                    campo: "capa".into(),
+                    acrescentar: false,
+                    nome_original: "a.txt".into(),
+                    tipo: "text/plain".into(),
+                    bytes: b"oi".to_vec(),
+                }],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(tipo, Erro::Invalido { .. }));
+
+        let injeta = b
+            .criar(&c, json!({"capa": "../segredo"}).as_object().unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(injeta, Erro::Invalido { .. }));
+
+        b.apagar(&c, reg["id"].as_str().unwrap(), None)
+            .await
+            .unwrap();
+        assert!(!caminho.exists());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn lote_e_tudo_ou_nada_e_so_publica_no_commit() {
+        let b = Banco::sqlite_memoria().await.unwrap();
+        let c = b
+            .criar_colecao(base(
+                "notas",
+                json!([{"name": "t", "type": "text", "required": true}]),
+            ))
+            .await
+            .unwrap();
+        let obj = |t: &str| json!({"t": t}).as_object().unwrap().clone();
+        let b2 = b.clone();
+        let c2 = c.clone();
+        let mut rx = b.assinar();
+        let ruim = b
+            .em_transacao(async move {
+                b2.criar(&c2, &obj("fica")).await?;
+                b2.criar(&c2, &obj("")).await?;
+                Ok(())
+            })
+            .await;
+        assert!(ruim.is_err());
+        assert_eq!(
+            b.listar(&c, &Consulta::default())
+                .await
+                .unwrap()
+                .total_items,
+            0
+        );
+        assert!(rx.try_recv().is_err(), "rollback não publica");
+
+        let b2 = b.clone();
+        let c2 = c.clone();
+        b.em_transacao(async move {
+            b2.criar(&c2, &json!({"t": "a"}).as_object().unwrap().clone())
+                .await?;
+            b2.criar(&c2, &json!({"t": "b"}).as_object().unwrap().clone())
+                .await?;
+            Ok::<(), Erro>(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            b.listar(&c, &Consulta::default())
+                .await
+                .unwrap()
+                .total_items,
+            2
+        );
+        assert_eq!(rx.recv().await.unwrap().acao, Acao::Criar);
+        assert_eq!(rx.recv().await.unwrap().acao, Acao::Criar);
     }
 }
