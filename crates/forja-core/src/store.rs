@@ -1008,7 +1008,7 @@ impl Banco {
         ctx: &Contexto,
         privilegiado: bool,
     ) -> Resultado<(String, Vec<Valor>)> {
-        if let Some(f) = filtro_usuario.filter(|f| !privilegiado && filtro::macro_restrita(f)) {
+        if filtro_usuario.is_some_and(|f| !privilegiado && filtro::macro_restrita(f)) {
             return Err(Erro::Proibido(
                 "Only superusers can filter by @request and @collection.".into(),
             ));
@@ -3428,13 +3428,13 @@ mod tests {
             .unwrap();
         b.criar(
             &produtos,
-            &obj(json!({"nome": "Café", "preco": 32, "ativo": true})),
+            &mapa(json!({"nome": "Café", "preco": 32, "ativo": true})),
         )
         .await
         .unwrap();
         b.criar(
             &produtos,
-            &obj(json!({"nome": "Chá", "preco": 10, "ativo": false})),
+            &mapa(json!({"nome": "Chá", "preco": 10, "ativo": false})),
         )
         .await
         .unwrap();
@@ -3481,12 +3481,12 @@ mod tests {
             .unwrap();
         assert_eq!(filtrada.total_items, 1);
         assert!(
-            b.criar(&vista, &obj(json!({"nome": "X"}))).await.is_err(),
+            b.criar(&vista, &mapa(json!({"nome": "X"}))).await.is_err(),
             "view aceita escrita"
         );
         let id = l.items[0]["id"].as_str().unwrap();
         assert!(
-            b.atualizar(&vista, id, &obj(json!({"nome": "Y"})), None)
+            b.atualizar(&vista, id, &mapa(json!({"nome": "Y"})), None)
                 .await
                 .is_err()
         );
@@ -3565,22 +3565,22 @@ mod tests {
             .await
             .unwrap();
         let p1 = b
-            .criar(&posts, &obj(json!({"titulo": "Com ok"})))
+            .criar(&posts, &mapa(json!({"titulo": "Com ok"})))
             .await
             .unwrap();
         let p2 = b
-            .criar(&posts, &obj(json!({"titulo": "Sem ok"})))
+            .criar(&posts, &mapa(json!({"titulo": "Sem ok"})))
             .await
             .unwrap();
         b.criar(
             &comentarios,
-            &obj(json!({"post": p1["id"], "status": "ok"})),
+            &mapa(json!({"post": p1["id"], "status": "ok"})),
         )
         .await
         .unwrap();
         b.criar(
             &comentarios,
-            &obj(json!({"post": p2["id"], "status": "ruim"})),
+            &mapa(json!({"post": p2["id"], "status": "ruim"})),
         )
         .await
         .unwrap();
@@ -3647,6 +3647,10 @@ mod tests {
     }
 
     #[cfg(feature = "sqlite")]
+    fn mapa(v: Value) -> Map<String, Value> {
+        v.as_object().cloned().unwrap_or_default()
+    }
+
     fn base(nome: &str, campos: Value) -> Collection {
         serde_json::from_value(json!({
             "name": nome,

@@ -373,7 +373,7 @@ impl Escritor<'_> {
         let resolvido = (escopo.externa)(&citada, &campo)?;
         if !resolvido.eq_ignore_ascii_case(canon) {
             return Err(Erro::invalido(
-                "Invalid filter: a comparison cannot reference two collections".into(),
+                "Invalid filter: a comparison cannot reference two collections",
             ));
         }
         Ok(format!("\"{alias}\".\"{campo}\""))
@@ -448,7 +448,7 @@ impl Escritor<'_> {
             (Some((c1, _)), Some((c2, _))) if c1.eq_ignore_ascii_case(&c2) => c1,
             _ => {
                 return Err(Erro::invalido(
-                    "Invalid filter: a comparison cannot reference two collections".into(),
+                    "Invalid filter: a comparison cannot reference two collections",
                 ));
             }
         };
