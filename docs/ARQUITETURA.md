@@ -1,8 +1,10 @@
 # Arquitetura do Forja
 
-Este documento fixa as decisões estruturais. Onde ele contradiz o
-[PLANO](PLANO.md), vale este arquivo: as decisões 7, 8 e 9 do PLANO §4 estão
-superadas pelas decisões 1 e 14 abaixo.
+Este documento é o mapa de camadas e de ondas. As escolhas de stack (axum,
+SQLite, maud + htmx, API do PocketBase, SSE, WASM no processo, núcleo versus
+extensão) estão travadas no [ADR-001](arquitetura/ADR-001-um-binario.md). Onde
+este arquivo, o [PLANO](PLANO.md) ou a [PARIDADE](PARIDADE.md) divergirem do
+ADR, vale o ADR.
 
 ## 1. A decisão
 
@@ -16,16 +18,16 @@ e o Forja ainda não tem.
 | 1 | Banco | **SQLite**, um arquivo por projeto. Sem NoSQL. |
 | 2 | Modelo de dados | Uma **tabela física por coleção**, como no PocketBase. |
 | 3 | Contrato público | **API do PocketBase.** SDKs, tutoriais e migrações dele funcionam aqui. |
-| 4 | Appwrite | Fonte de **ideias de recurso**, nunca de compatibilidade de API. |
+| 4 | Appwrite e Supabase | Fonte de **ideias de recurso** (auth, dados, arquivo, tempo real, função). Nunca de API nem da arquitetura de serviços deles. |
 | 5 | Permissões | Um só sistema: **regras como filtros** + macros (`@request.auth.*`). Sem ACL paralela. |
-| 6 | Tempo real | **In-process + SSE**, com a regra de acesso avaliada por evento. |
-| 7 | Extensões | **WASM** (wasmtime) com ABI JSON. JS, se vier, é adaptador sobre a mesma ABI. |
+| 6 | Tempo real | **In-process + SSE** (protocolo do PocketBase). Sem WebSocket. |
+| 7 | Extensões | **WASM** (wasmtime) **no mesmo processo**, ABI JSON. Sem subprocesso e sem runtime JS. |
 | 8 | Vários projetos | Um **arquivo SQLite por projeto** + banco de controle. |
 | 9 | SDKs | **OpenAPI gerado** a partir dos handlers; até a 0.9 o SDK do PocketBase é o cliente de teste. |
-| 10 | Painel | **HTML gerado no servidor** (maud) + **htmx** embutido no binário, pelo mesmo processo e estado da API. Sem build de front-end. |
+| 10 | Painel | **maud + htmx** no mesmo processo. Cookie `httpOnly` só para o admin. Sem askama, sem SPA. |
 | 11 | Backups | Snapshot pela **API de backup online** + S3 + manifesto. Litestream é integração externa. |
 | 12 | Escala | **Nó único.** Escala vertical, não horizontal. |
-| 13 | Postgres e Turso | Ficam atrás de feature flag, **sem suporte** e sem CI. |
+| 13 | Postgres e Turso | Feature de compilação, **sem suporte** e sem CI. Postgres só se o operador já tem um Postgres e aceita sair do arquivo único; Turso só para abrir o mesmo arquivo com libSQL. Nenhum dos dois é caminho de compatibilidade com Supabase. Detalhe no ADR-001. |
 
 ## 2. Por que SQLite, e por que não NoSQL
 
@@ -124,8 +126,9 @@ console; o SMTP entra na onda 5, atrás do mesmo trait `Correio`.
 
 ## 5. O que fica de fora, por decisão
 
-Copiar a superfície do Appwrite destruiria a tese do produto. Ficam fora, sem
-arrependimento:
+Copiar a nuvem do Appwrite ou a fatia de serviços do Supabase destruiria a tese
+do produto. A lista fechada, com o corte núcleo/extensão, está no
+[ADR-001](arquitetura/ADR-001-um-binario.md). Ficam fora, sem arrependimento:
 
 - **Hospedagem de sites, domínios e firewall** (Sites, Domains, Firewall).
 - **Infraestrutura de mensageria** (SMS, push, filas). E-mail transacional fica,

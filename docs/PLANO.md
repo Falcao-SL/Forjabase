@@ -30,12 +30,13 @@ forjabase/
   sdks/            núcleo forja-sdk em Rust e as camadas por linguagem (futuro)
 ```
 
-- **Banco:** `store::Banco` tem toda a lógica (coleções, registros, regras,
-  validação) escrita uma vez, sobre um `motor::Executor` que só executa SQL.
-  Três executores: **SQLite** (rusqlite, `bundled`, WAL; o padrão),
-  **Turso** (Rust, mesmo arquivo) e **PostgreSQL/Supabase** (tokio-postgres +
-  deadpool, rustls, um esquema por projeto). O SQL sai sempre com `?`; o
-  executor do Postgres troca por `$n`. Decisões 7 e 8.
+- **Banco:** `store::Banco` concentra coleções, registros, regras e validação
+  sobre um `motor::Executor` que só executa SQL. O motor suportado é o
+  **SQLite** (rusqlite, `bundled`, WAL, um arquivo por projeto). Postgres e
+  Turso compilam com `--features postgres` / `--features turso` e não têm
+  suporte; quando cada um existe está no
+  [ADR-001](arquitetura/ADR-001-um-binario.md). O SQL sai com `?`; o executor
+  do Postgres, se compilado, troca por `$n`.
 - **Painel:** HTML gerado no servidor com `maud` e htmx embutido via
   `include_bytes!`, servido em `/_/` pelo mesmo processo e estado da API. Sem
   `trunk` e sem `wasm32` no painel; o WASM fica para as extensões.

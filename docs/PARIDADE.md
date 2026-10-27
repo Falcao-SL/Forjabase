@@ -9,7 +9,7 @@ serve de mapa entre o que eles têm, o que o Forja tem e o que fazer em seguida.
 
 | Papel | Produto | O que copiamos | O que não copiamos |
 |---|---|---|---|
-| **Contrato** | PocketBase | Rotas, JSON, códigos de erro, filtros, regras, nomes de campo, semântica de auth e de arquivos. Se o SDK oficial do PocketBase funciona, a compatibilidade é real. | Hooks em JavaScript, SQLite como única opção de escala, single-node obrigatório. |
+| **Contrato** | PocketBase | Rotas, JSON, códigos de erro, filtros, regras, nomes de campo, semântica de auth e de arquivos. Se o SDK oficial do PocketBase funciona, a compatibilidade é real. | Hooks em JavaScript (goja) e o painel em Svelte. Nó único e SQLite ficam: são a tese, não um limite a superar ([ADR-001](arquitetura/ADR-001-um-binario.md)). |
 | **Cardápio** | Appwrite | Funcionalidades que valem a pena (equipes/papéis, buckets, mensageria, sessões, magic URL, OTP por SMS), sempre traduzidas para o modelo do Forja. | A arquitetura (MariaDB + Redis + workers + muitos containers), GraphQL como API principal, funções em 10 runtimes. |
 
 Três consequências:

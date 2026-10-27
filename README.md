@@ -45,6 +45,8 @@ The complete list, with what is done and what is planned:
 How to use each part: [`docs/GUIA.md`](docs/GUIA.md).
 How we approach parity with PocketBase and Appwrite:
 [`docs/PARIDADE.md`](docs/PARIDADE.md).
+The architecture lock (one binary, what is in the core):
+[`docs/arquitetura/ADR-001-um-binario.md`](docs/arquitetura/ADR-001-um-binario.md).
 
 ## Quick start
 
