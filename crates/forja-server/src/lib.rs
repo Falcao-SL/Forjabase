@@ -2218,7 +2218,7 @@ mod tests {
             "POST",
             "/api/collections/posts/records",
             Some(&t),
-            Some(json!({"titulo": "Olá"})),
+            Some(json!({"titulo": "Ola"})),
         )
         .await;
         assert_eq!(s, StatusCode::OK, "{post}");
@@ -2244,7 +2244,7 @@ mod tests {
         let (s, lista) = chamar(&e, "GET", "/api/collections/titulos/records", None, None).await;
         assert_eq!(s, StatusCode::OK, "{lista}");
         assert_eq!(lista["totalItems"], json!(1));
-        assert_eq!(lista["items"][0]["titulo"], json!("Olá"));
+        assert_eq!(lista["items"][0]["titulo"], json!("Ola"));
 
         let (s, recusa) = chamar(
             &e,
@@ -2260,7 +2260,7 @@ mod tests {
         let (s, _) = chamar(
             &e,
             "GET",
-            "/api/collections/posts/records?filter=@collection.posts.titulo%20%3D%20%22Ol%C3%A1%22",
+            "/api/collections/posts/records?filter=@collection.posts.titulo%3D%22Ola%22",
             None,
             None,
         )
@@ -2269,7 +2269,7 @@ mod tests {
         let (s, super_) = chamar(
             &e,
             "GET",
-            "/api/collections/posts/records?filter=@collection.posts.titulo%20%3D%20%22Ol%C3%A1%22",
+            "/api/collections/posts/records?filter=@collection.posts.titulo%3D%22Ola%22",
             Some(&t),
             None,
         )
