@@ -1,9 +1,10 @@
 # Copiar para .github/workflows/deploy-site.yml de cada produto Falcao-SL.
 # Secrets da org (ou do repo):
 #   HOMELAB_DEPLOY_SSH_KEY  — privada (par de secrets/sites-deploy no Homelab)
-#   HOMELAB_DEPLOY_HOST     — opcional; padrão: homelab-main (MagicDNS) ou 192.168.1.112
+#   HOMELAB_DEPLOY_HOST     — opcional; no runner da VM: 127.0.0.1
 #
-# Ajuste SLUG abaixo (pasta em /data/sites/<slug>/).
+# Ajuste SLUG abaixo (pasta em /data/sites/<slug>/public/).
+# O edge é um Caddy só; o deploy é só rsync (sem compose por site).
 
 name: Deploy site
 
@@ -23,9 +24,6 @@ concurrency:
 jobs:
   deploy:
     runs-on: [self-hosted, Linux, homelab]
-    # Se o runner Linux ainda não estiver online, use ubuntu-latest + Tailscale
-    # (descomente e remova a linha runs-on acima):
-    # runs-on: ubuntu-latest
     env:
       SLUG: forja
       HOST: ${{ secrets.HOMELAB_DEPLOY_HOST || '127.0.0.1' }}
@@ -34,7 +32,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Sync site → Compose
+      - name: rsync site → /data/sites/<slug>/public
         env:
           SSH_KEY: ${{ secrets.HOMELAB_DEPLOY_SSH_KEY }}
         run: |
@@ -48,5 +46,3 @@ jobs:
           ssh_opts=(-i key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
           rsync -az --delete -e "ssh ${ssh_opts[*]}" \
             "$SRC"/ "${DEPLOY_USER}@${HOST}:${REMOTE}/${SLUG}/public/"
-          ssh "${ssh_opts[@]}" "${DEPLOY_USER}@${HOST}" \
-            "cd ${REMOTE}/${SLUG} && docker compose up -d"
