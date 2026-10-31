@@ -1,0 +1,52 @@
+# Copiar para .github/workflows/deploy-site.yml de cada produto Falcao-SL.
+# Secrets da org (ou do repo):
+#   HOMELAB_DEPLOY_SSH_KEY  — privada (par de secrets/sites-deploy no Homelab)
+#   HOMELAB_DEPLOY_HOST     — opcional; padrão: homelab-main (MagicDNS) ou 192.168.1.112
+#
+# Ajuste SLUG abaixo (pasta em /data/sites/<slug>/).
+
+name: Deploy site
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - "deploy/site/**"
+      - ".github/workflows/deploy-site.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-site-${{ github.repository }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, Linux, homelab]
+    # Se o runner Linux ainda não estiver online, use ubuntu-latest + Tailscale
+    # (descomente e remova a linha runs-on acima):
+    # runs-on: ubuntu-latest
+    env:
+      SLUG: forja
+      HOST: ${{ secrets.HOMELAB_DEPLOY_HOST || '127.0.0.1' }}
+      DEPLOY_USER: deploy
+      REMOTE: /data/sites
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync site → Compose
+        env:
+          SSH_KEY: ${{ secrets.HOMELAB_DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "${SSH_KEY:-}" || { echo "Falta secret HOMELAB_DEPLOY_SSH_KEY na org"; exit 1; }
+          SRC=site
+          [[ -d deploy/site ]] && SRC=deploy/site
+          [[ -d "$SRC" ]] || { echo "Sem pasta site/ nem deploy/site/"; exit 1; }
+          install -m 600 /dev/null key
+          printf '%s\n' "$SSH_KEY" > key
+          ssh_opts=(-i key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
+          rsync -az --delete -e "ssh ${ssh_opts[*]}" \
+            "$SRC"/ "${DEPLOY_USER}@${HOST}:${REMOTE}/${SLUG}/public/"
+          ssh "${ssh_opts[@]}" "${DEPLOY_USER}@${HOST}" \
+            "cd ${REMOTE}/${SLUG} && docker compose up -d"
