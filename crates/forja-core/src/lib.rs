@@ -253,6 +253,22 @@ pub fn agora() -> String {
     format!("{ano:04}-{mes:02}-{dia:02} {h:02}:{m:02}:{seg:02}.{ms:03}Z")
 }
 
+/// Converte segundos UNIX em string UTC no formato PocketBase.
+pub fn data_utc_de_epoch_s(s: i64) -> String {
+    let (dias, resto) = (s.div_euclid(86_400), s.rem_euclid(86_400));
+    let (h, m, seg) = (resto / 3600, resto % 3600 / 60, resto % 60);
+    let z = dias + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let dia = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let mes = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let ano = yoe + era * 400 + if mes <= 2 { 1 } else { 0 };
+    format!("{ano:04}-{mes:02}-{dia:02} {h:02}:{m:02}:{seg:02}.000Z")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

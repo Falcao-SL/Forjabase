@@ -187,15 +187,15 @@ com uma mensagem clara. "✅" quer dizer validado e guardado.
 
 | Funcionalidade | Estado |
 |---|---|
-| Nome, URL e cor do app; remetente dos e-mails | 📋 |
-| SMTP (com teste de envio) ou sendmail | 📋 |
-| Limite de requisições por rota e por tipo de usuário | 📋 |
+| Nome, URL e cor do app; remetente dos e-mails | ✅ |
+| SMTP (com teste de envio) | ✅ |
+| Limite de requisições por rota e por tipo de usuário | 🔨 (estrutura configurada em `settings`) |
 | Proxy confiável (cabeçalhos de IP real) | 📋 |
 | IPs permitidos para superusuários | 📋 |
-| Limite de tamanho de corpo, CORS e compressão gzip | 📋 |
-| **Backups**: criar, baixar, enviar, restaurar e apagar; agendados (cron) com retenção; em S3 | 📋 |
-| **Logs** de requisições: listar, estatísticas, retenção em dias, nível mínimo, IP e usuário opcionais | 📋 |
-| **Cron**: listar e executar tarefas agendadas pelo painel | 📋 |
+| Limite de tamanho de corpo, CORS e compressão gzip | 🔨 (limite de corpo ✅) |
+| **Backups**: criar, baixar, enviar, restaurar e apagar; agendados (cron) com retenção; em S3 | ✅ |
+| **Logs** de requisições: listar, estatísticas, retenção em dias, nível mínimo, IP e usuário opcionais | ✅ |
+| **Cron**: listar e executar tarefas agendadas pelo painel | ✅ |
 | `/api/health` | ✅ |
 
 ## 9. Painel administrativo (HTML no servidor + htmx)
@@ -213,8 +213,8 @@ superusuário. WASM fica reservado para as extensões (§11).
 | Navegador de registros com filtro e paginação (htmx) | ✅ |
 | Criar, editar e apagar registros pelo formulário, com erros por campo | ✅ |
 | Editor de coleções, campos, regras e índices | 🔨 (coleções, campos dinâmicos e regras ✅; índices ficam) |
-| Telas de configurações, backups, logs e cron | 📋 |
-| Visualização de logs com gráfico | 📋 |
+| Telas de configurações, backups, logs e cron | ✅ |
+| Visualização de logs com gráfico | ✅ |
 | Extensões de interface do painel | 📋 |
 | ➕ Seletor de projeto (§10) | 📋 |
 

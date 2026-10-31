@@ -4,17 +4,25 @@
 
 | Campo | Valor |
 |---|---|
-| **Estágio** | **Em desenvolvimento** — Marcos 0.1, 0.2 e 0.3 concluídos! Marco M1 entregue (barramento de escrita). Armazenamento em disco e S3 com miniaturas sob demanda, lote atômico, SSE, operadores `?=`, `fields`, macros de data e modificadores (`:lower`, `:length`, `:isset`). Marco 0.4 adiantado: gerenciamento completo de coleções no painel administrativo |
+| **Estágio** | **Em desenvolvimento** — Marcos 0.1, 0.2, 0.3, 0.4 e 0.5 concluídos! SMTP/e-mails com templates renderizáveis, agendador cron in-process, logs estruturados com agregações horárias, backups compactados em zip com restauração e upload, encerramento gracioso, e telas completas no painel administrativo |
 | **Plataformas** | Servidor: macOS, Linux, Windows (Rust); painel: navegador, HTML no servidor + htmx (sem build de front-end) |
 | **Stack** | Rust (axum; SQLite), maud + htmx, wasmtime in-process na 0.8. Decisão: [ADR-001](arquitetura/ADR-001-um-binario.md) |
 | **Site** | Landing em `site/` (inglês na raiz, português em `index.pt.html`). O host previsto é https://forja.falcaosl.com, no Coolify, com `deploy/site/Dockerfile`. O DNS ainda não existe; o endereço público segue o repositório. |
 | **Monetização** | Nenhuma: código aberto, MIT |
-| **Próximo marco** | Marco 0.5 (SMTP/e-mails, agendador cron, logs estruturados e backups) |
+| **Próximo marco** | Marco 0.6 (OAuth2, OTP e MFA) |
 | **Data-alvo** | A definir; 1.0.0 só quando estável (PLANO §6) |
 
 ## O que já está pronto
 
-- Workspace com 4 crates e 65 testes passando.
+- Workspace com 4 crates e 72 testes passando.
+- Operação e Configurações (Marco 0.5 completo):
+  - Suporte completo a SMTP (`SmtpCorreio` via `lettre`) com TLS, STARTTLS, PLAIN e LOGIN, e endpoint de teste `POST /api/settings/test/email`.
+  - Modelos de e-mail editáveis (`verificationTemplate`, `resetPasswordTemplate`, `confirmEmailChangeTemplate`) com placeholders (`{APP_NAME}`, `{APP_URL}`, `{TOKEN}`, `{ACTION_URL}`, `{RECORD:campo}`).
+  - Logs estruturados de requisições: tabela `_logs`, middleware assíncrono não-bloqueante para rotas `/api/...`, endpoints `GET /api/logs`, `GET /api/logs/{id}`, `GET /api/logs/stats` com agregação horária e limpeza automática por retenção em dias.
+  - Backups compactados em formato `.zip`: endpoints `GET /api/backups`, `POST /api/backups` (com checkpoint de WAL), `GET /api/backups/{key}` (download), `POST /api/backups/{key}/restore`, `DELETE /api/backups/{key}` e `POST /api/backups/upload`.
+  - Tarefas agendadas (Cron): agendador in-process, endpoints `GET /api/crons` e disparo manual via `POST /api/crons/{id}`, com tarefas do sistema pré-configuradas (`__pbLogsCleanup__` e `__pbBackupRun__`).
+  - Encerramento gracioso (*graceful shutdown*) no servidor HTTP com captura de `SIGINT` (Ctrl+C) e `SIGTERM`.
+  - Telas administrativas no painel para Configurações (`/_/settings`), Logs com gráfico horário (`/_/logs`), Tarefas Agendadas (`/_/crons`) e Backups (`/_/backups`).
 - Armazenamento em S3 compatível (`ProvedorStorage`, `DiscoLocal` e `S3Storage` com autenticação AWS SigV4 pura em Rust) com suporte a AWS S3, MinIO, Cloudflare R2, Wasabi, etc.
 - Endpoints de configurações (`GET` e `PATCH /api/settings`) e teste de conectividade S3 (`POST /api/settings/test/s3`), compatíveis com o formato do PocketBase.
 - Painel administrativo: gerenciador de coleções (`/_/new-collection`, `/_/collections/{nome}/settings`, `delete-collection`) com adição dinâmica de campos via htmx (`/_/htmx/campo-linha`), formulário de regras com suporte a superusuário, público e expressões personalizadas, e exclusão com diálogo de confirmação nativo.

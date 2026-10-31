@@ -44,11 +44,16 @@ pub fn rotas() -> Router<Estado> {
         .route("/_/collections/{nome}", get(colecao_pagina).post(criar))
         .route("/_/collections/{nome}/new", get(novo_form))
         .route("/_/collections/{nome}/tabela", get(tabela))
-        .route(
-            "/_/collections/{nome}/records/{id}",
-            get(editar_form).post(atualizar),
-        )
+        .route("/_/collections/{nome}/records/{id}", get(editar_form).post(atualizar))
         .route("/_/collections/{nome}/records/{id}/delete", post(apagar))
+        .route("/_/logs", get(logs_pagina))
+        .route("/_/crons", get(crons_pagina))
+        .route("/_/crons/{id}/run", post(cron_executar_painel))
+        .route("/_/backups", get(backups_pagina))
+        .route("/_/backups/new", post(backup_novo_painel))
+        .route("/_/backups/{key}/delete", post(backup_apagar_painel))
+        .route("/_/backups/{key}/restore", post(backup_restaurar_painel))
+        .route("/_/settings", get(settings_pagina).post(settings_salvar_painel))
 }
 
 // ── Sessão ───────────────────────────────────────────────────────────────
@@ -772,3 +777,216 @@ fn campos_do_form(pares: &[(String, String)]) -> Vec<Field> {
     }
     campos
 }
+
+// ── Handlers do Marco 0.5: Logs, Crons, Backups, Configurações ───────────
+
+async fn logs_pagina(
+    State(e): State<Estado>,
+    headers: HeaderMap,
+) -> Result<Html<String>, Redirect> {
+    if sessao(&e, &headers).await.is_none() {
+        return Err(Redirect::to("/_/login"));
+    }
+    let lista = e.banco.logs_listar(1, 100, None).await.unwrap_or(forja_core::store::PaginaLogs {
+        page: 1,
+        per_page: 100,
+        total_items: 0,
+        total_pages: 0,
+        items: Vec::new(),
+    });
+    let stats = e.banco.logs_stats(None).await.unwrap_or_default();
+    Ok(Html(admin::pagina_logs(&lista.items, &stats).into_string()))
+}
+
+async fn crons_pagina(
+    State(e): State<Estado>,
+    headers: HeaderMap,
+) -> Result<Html<String>, Redirect> {
+    if sessao(&e, &headers).await.is_none() {
+        return Err(Redirect::to("/_/login"));
+    }
+    let itens = e.banco.crons_listar().await.unwrap_or_default();
+    Ok(Html(admin::pagina_crons(&itens).into_string()))
+}
+
+async fn cron_executar_painel(
+    State(e): State<Estado>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Redirect, Redirect> {
+    if sessao(&e, &headers).await.is_none() {
+        return Err(Redirect::to("/_/login"));
+    }
+    let _ = e.banco.cron_executar(&id).await;
+    Ok(Redirect::to("/_/crons"))
+}
+
+async fn backups_pagina(
+    State(e): State<Estado>,
+    headers: HeaderMap,
+) -> Result<Html<String>, Redirect> {
+    if sessao(&e, &headers).await.is_none() {
+        return Err(Redirect::to("/_/login"));
+    }
+    let itens = e.banco.backups_listar().await.unwrap_or_default();
+    Ok(Html(admin::pagina_backups(&itens, None, None).into_string()))
+}
+
+async fn backup_novo_painel(
+    State(e): State<Estado>,
+    headers: HeaderMap,
+) -> Result<Redirect, Redirect> {
+    if sessao(&e, &headers).await.is_none() {
+        return Err(Redirect::to("/_/login"));
+    }
+    let _ = e.banco.backup_criar(None).await;
+    Ok(Redirect::to("/_/backups"))
+}
+
+async fn backup_apagar_painel(
+    State(e): State<Estado>,
+    headers: HeaderMap,
+    Path(key): Path<String>,
+) -> Result<Redirect, Redirect> {
+    if sessao(&e, &headers).await.is_none() {
+        return Err(Redirect::to("/_/login"));
+    }
+    let _ = e.banco.backup_apagar(&key).await;
+    Ok(Redirect::to("/_/backups"))
+}
+
+async fn backup_restaurar_painel(
+    State(e): State<Estado>,
+    headers: HeaderMap,
+    Path(key): Path<String>,
+) -> Result<Redirect, Redirect> {
+    if sessao(&e, &headers).await.is_none() {
+        return Err(Redirect::to("/_/login"));
+    }
+    let _ = e.banco.backup_restaurar(&key).await;
+    Ok(Redirect::to("/_/backups"))
+}
+
+async fn settings_pagina(
+    State(e): State<Estado>,
+    headers: HeaderMap,
+) -> Result<Html<String>, Redirect> {
+    if sessao(&e, &headers).await.is_none() {
+        return Err(Redirect::to("/_/login"));
+    }
+    let cfg = e.banco.configuracoes().await;
+    Ok(Html(admin::pagina_settings(&cfg, None, None).into_string()))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+struct FormSettings {
+    #[serde(default)]
+    app_name: String,
+    #[serde(default)]
+    app_url: String,
+    #[serde(default)]
+    sender_name: String,
+    #[serde(default)]
+    sender_address: String,
+    #[serde(default)]
+    smtp_enabled: Option<String>,
+    #[serde(default)]
+    smtp_host: String,
+    #[serde(default)]
+    smtp_port: Option<u16>,
+    #[serde(default)]
+    smtp_username: String,
+    #[serde(default)]
+    smtp_password: String,
+    #[serde(default)]
+    smtp_auth_method: String,
+    #[serde(default)]
+    smtp_local_name: String,
+    #[serde(default)]
+    smtp_tls: Option<String>,
+    #[serde(default)]
+    s3_enabled: Option<String>,
+    #[serde(default)]
+    s3_bucket: String,
+    #[serde(default)]
+    s3_region: String,
+    #[serde(default)]
+    s3_endpoint: String,
+    #[serde(default)]
+    s3_access_key: String,
+    #[serde(default)]
+    s3_secret: String,
+    #[serde(default)]
+    s3_force_path_style: Option<String>,
+    #[serde(default)]
+    backups_cron: String,
+    #[serde(default)]
+    backups_cron_max_keep: Option<i64>,
+    #[serde(default)]
+    logs_max_days: Option<i64>,
+}
+
+async fn settings_salvar_painel(
+    State(e): State<Estado>,
+    headers: HeaderMap,
+    Form(form): Form<FormSettings>,
+) -> Result<Html<String>, Redirect> {
+    if sessao(&e, &headers).await.is_none() {
+        return Err(Redirect::to("/_/login"));
+    }
+    let mut cfg = e.banco.configuracoes().await;
+
+    if !form.app_name.trim().is_empty() {
+        cfg.meta.app_name = form.app_name.trim().to_string();
+        cfg.app_name = cfg.meta.app_name.clone();
+    }
+    if !form.app_url.trim().is_empty() {
+        cfg.meta.app_url = form.app_url.trim().to_string();
+        cfg.app_url = cfg.meta.app_url.clone();
+    }
+    if !form.sender_name.trim().is_empty() {
+        cfg.meta.sender_name = form.sender_name.trim().to_string();
+    }
+    if !form.sender_address.trim().is_empty() {
+        cfg.meta.sender_address = form.sender_address.trim().to_string();
+    }
+
+    cfg.smtp.enabled = form.smtp_enabled.as_deref() == Some("true");
+    cfg.smtp.host = form.smtp_host.trim().to_string();
+    if let Some(port) = form.smtp_port {
+        cfg.smtp.port = port;
+    }
+    cfg.smtp.username = form.smtp_username.trim().to_string();
+    if !form.smtp_password.is_empty() {
+        cfg.smtp.password = form.smtp_password;
+    }
+    cfg.smtp.auth_method = form.smtp_auth_method.trim().to_string();
+    cfg.smtp.local_name = form.smtp_local_name.trim().to_string();
+    cfg.smtp.tls = form.smtp_tls.as_deref() == Some("true");
+
+    cfg.s3.enabled = form.s3_enabled.as_deref() == Some("true");
+    cfg.s3.bucket = form.s3_bucket.trim().to_string();
+    cfg.s3.region = form.s3_region.trim().to_string();
+    cfg.s3.endpoint = form.s3_endpoint.trim().to_string();
+    cfg.s3.access_key = form.s3_access_key.trim().to_string();
+    if !form.s3_secret.is_empty() {
+        cfg.s3.secret = form.s3_secret;
+    }
+    cfg.s3.force_path_style = form.s3_force_path_style.as_deref() == Some("true");
+
+    cfg.backups.cron = form.backups_cron.trim().to_string();
+    if let Some(k) = form.backups_cron_max_keep {
+        cfg.backups.cron_max_keep = k.max(1);
+    }
+    if let Some(d) = form.logs_max_days {
+        cfg.logs.max_days = d.max(1);
+    }
+
+    match e.banco.salvar_configuracoes(&cfg).await {
+        Ok(salva) => Ok(Html(admin::pagina_settings(&salva, None, Some("Configurações salvas com sucesso!")).into_string())),
+        Err(err) => Ok(Html(admin::pagina_settings(&cfg, Some(&err.to_string()), None).into_string())),
+    }
+}
+

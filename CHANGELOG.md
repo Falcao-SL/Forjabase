@@ -2,6 +2,14 @@
 
 ## Não lançado
 
+- **Marco 0.5 — Operação e Configurações**:
+  - **SMTP e Entrega de E-mails**: Implementado cliente SMTP em Rust assíncrono via `lettre` com suporte a TLS, STARTTLS, autenticação PLAIN e LOGIN, e endpoint `POST /api/settings/test/email`.
+  - **Modelos de E-mail Editáveis**: Suporte aos modelos `verificationTemplate`, `resetPasswordTemplate` e `confirmEmailChangeTemplate` em `Configuracoes.meta`, com substituição dinâmica de placeholders (`{APP_NAME}`, `{APP_URL}`, `{TOKEN}`, `{ACTION_URL}`, `{RECORD:campo}`).
+  - **Logs Estruturados de Requisições**: Tabela de sistema `_logs`, middleware Axum não-bloqueante gravando método, URL, código de status HTTP e tempo de execução (`execTime`), endpoints `GET /api/logs`, `GET /api/logs/{id}`, e agregações estatísticas horárias em `GET /api/logs/stats`, além de limpeza automática por retenção em dias.
+  - **Sistema de Backups**: Geração de snapshots completos em arquivo `.zip` com checkpoint seguro do SQLite WAL e arquivos locais, endpoints `GET /api/backups`, `POST /api/backups`, download com `Content-Disposition`, restauração atômica, exclusão e upload multipart em `POST /api/backups/upload`.
+  - **Agendador Cron In-Process**: Endpoints `GET /api/crons` e `POST /api/crons/{id}` com execução manual ou agendada para limpeza de logs (`__pbLogsCleanup__`) e backups recorrentes (`__pbBackupRun__`).
+  - **Encerramento Gracioso (*Graceful Shutdown*)**: Tratamento de sinais `SIGINT` (Ctrl+C) e `SIGTERM` no servidor HTTP permitindo finalizar requisições ativas antes do encerramento.
+  - **Telas do Painel Administrativo**: Adicionadas páginas completas no servidor (Maud + HTMX) para Visualização de Logs com gráfico de barras de volume por hora (`/_/logs`), Tarefas Agendadas com botão de execução manual (`/_/crons`), Gerenciamento de Backups com download e restauração (`/_/backups`), e Central de Configurações (`/_/settings`) com abas para Geral, Remetente, SMTP, S3, Backups e Logs.
 - Editor e gerenciamento de coleções no painel administrativo (`/_/new-collection`,
   `/_/collections/{nome}/settings` e `delete-collection`): criação e edição de
   coleções (base, auth, view), configuração de view queries, regras de acesso

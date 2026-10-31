@@ -11,7 +11,7 @@ use crate::erro::{Erro, Resultado};
 use crate::filtro::{self, Contexto, Dialeto, Literal};
 use crate::motor::{Executor, Linha};
 use crate::valor::Valor;
-use crate::{Collection, CollectionType, Field, FieldType, agora, auth, id};
+use crate::{Collection, CollectionType, Field, FieldType, agora, auth, data_utc_de_epoch_s, id};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -78,6 +78,213 @@ pub struct Superusuario {
 
 /// Configurações do projeto, com os mesmos nomes do PocketBase.
 pub use crate::arquivos::{DiscoLocal, ProvedorStorage, S3Config, S3Storage};
+pub use crate::correio::{EmailTemplate, SmtpConfig, SmtpCorreio};
+
+/// Configurações de metadados e identidade visual da aplicação.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetaConfig {
+    #[serde(default = "MetaConfig::app_name_padrao")]
+    pub app_name: String,
+    #[serde(default = "MetaConfig::app_url_padrao", alias = "appURL")]
+    pub app_url: String,
+    #[serde(default = "MetaConfig::sender_name_padrao")]
+    pub sender_name: String,
+    #[serde(default = "MetaConfig::sender_address_padrao")]
+    pub sender_address: String,
+    #[serde(default)]
+    pub hide_controls: bool,
+    #[serde(default = "MetaConfig::verification_template_padrao")]
+    pub verification_template: EmailTemplate,
+    #[serde(default = "MetaConfig::reset_password_template_padrao")]
+    pub reset_password_template: EmailTemplate,
+    #[serde(default = "MetaConfig::confirm_email_change_template_padrao")]
+    pub confirm_email_change_template: EmailTemplate,
+}
+
+impl MetaConfig {
+    pub fn app_name_padrao() -> String {
+        "Acme".into()
+    }
+    pub fn app_url_padrao() -> String {
+        "http://localhost:8090".into()
+    }
+    pub fn sender_name_padrao() -> String {
+        "Support".into()
+    }
+    pub fn sender_address_padrao() -> String {
+        "support@example.com".into()
+    }
+    pub fn verification_template_padrao() -> EmailTemplate {
+        EmailTemplate::novo(
+            "Verify your {APP_NAME} email",
+            "<p>Hello,</p>\n<p>Please click on the link below to verify your email address:</p>\n<p><a href=\"{ACTION_URL}\">Verify</a></p>\n<p>Thanks,<br>{APP_NAME} team</p>",
+            "{APP_URL}/_/#/auth/confirm-verification/{TOKEN}",
+        )
+    }
+    pub fn reset_password_template_padrao() -> EmailTemplate {
+        EmailTemplate::novo(
+            "Reset your {APP_NAME} password",
+            "<p>Hello,</p>\n<p>Please click on the link below to reset your password:</p>\n<p><a href=\"{ACTION_URL}\">Reset password</a></p>\n<p>Thanks,<br>{APP_NAME} team</p>",
+            "{APP_URL}/_/#/auth/confirm-password-reset/{TOKEN}",
+        )
+    }
+    pub fn confirm_email_change_template_padrao() -> EmailTemplate {
+        EmailTemplate::novo(
+            "Confirm your {APP_NAME} new email address",
+            "<p>Hello,</p>\n<p>Please click on the link below to confirm your new email address:</p>\n<p><a href=\"{ACTION_URL}\">Confirm new email</a></p>\n<p>Thanks,<br>{APP_NAME} team</p>",
+            "{APP_URL}/_/#/auth/confirm-email-change/{TOKEN}",
+        )
+    }
+}
+
+impl Default for MetaConfig {
+    fn default() -> Self {
+        Self {
+            app_name: Self::app_name_padrao(),
+            app_url: Self::app_url_padrao(),
+            sender_name: Self::sender_name_padrao(),
+            sender_address: Self::sender_address_padrao(),
+            hide_controls: false,
+            verification_template: Self::verification_template_padrao(),
+            reset_password_template: Self::reset_password_template_padrao(),
+            confirm_email_change_template: Self::confirm_email_change_template_padrao(),
+        }
+    }
+}
+
+/// Configurações de retenção e nível dos logs de requisição.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogsConfig {
+    #[serde(default = "LogsConfig::max_days_padrao")]
+    pub max_days: i64,
+    #[serde(default)]
+    pub min_level: i32,
+    #[serde(default = "LogsConfig::bool_true")]
+    pub log_auth_id: bool,
+    #[serde(default = "LogsConfig::bool_true")]
+    pub log_ip: bool,
+}
+
+impl LogsConfig {
+    pub fn max_days_padrao() -> i64 {
+        5
+    }
+    pub fn bool_true() -> bool {
+        true
+    }
+}
+
+impl Default for LogsConfig {
+    fn default() -> Self {
+        Self {
+            max_days: Self::max_days_padrao(),
+            min_level: 0,
+            log_auth_id: true,
+            log_ip: true,
+        }
+    }
+}
+
+/// Configurações de agendamento automático de backups.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupsConfig {
+    #[serde(default)]
+    pub cron: String,
+    #[serde(default = "BackupsConfig::cron_max_keep_padrao")]
+    pub cron_max_keep: i64,
+    #[serde(default)]
+    pub s3: S3Config,
+}
+
+impl BackupsConfig {
+    pub fn cron_max_keep_padrao() -> i64 {
+        3
+    }
+}
+
+impl Default for BackupsConfig {
+    fn default() -> Self {
+        Self {
+            cron: String::new(),
+            cron_max_keep: Self::cron_max_keep_padrao(),
+            s3: S3Config::default(),
+        }
+    }
+}
+
+/// Regra de limitação de taxa de requisições.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimitRule {
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub audience: String,
+    #[serde(default)]
+    pub duration: u64,
+    #[serde(default)]
+    pub max_requests: u64,
+}
+
+/// Configurações de limitação de taxa (Rate Limits).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimitsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub rules: Vec<RateLimitRule>,
+}
+
+/// Item de log estruturado de requisição / auditoria.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogItem {
+    pub id: String,
+    pub created: String,
+    pub updated: String,
+    pub level: i32,
+    pub message: String,
+    pub data: serde_json::Value,
+}
+
+/// Estatística horária de logs para o gráfico administrativo.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogStat {
+    pub total: i64,
+    pub date: String,
+}
+
+/// Página de logs de requisições.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaginaLogs {
+    pub page: usize,
+    pub per_page: usize,
+    pub total_items: usize,
+    pub total_pages: usize,
+    pub items: Vec<LogItem>,
+}
+
+/// Arquivo de backup compactado (.zip).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupItem {
+    pub key: String,
+    pub modified: String,
+    pub size: u64,
+}
+
+/// Tarefa agendada (cron) registrada no sistema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CronItem {
+    pub id: String,
+    pub expression: String,
+}
 
 /// Configurações gerais do projeto (armazenadas em `_params` sob `settings`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,22 +292,50 @@ pub use crate::arquivos::{DiscoLocal, ProvedorStorage, S3Config, S3Storage};
 pub struct Configuracoes {
     #[serde(default = "Configuracoes::app_name_padrao")]
     pub app_name: String,
-    #[serde(default = "Configuracoes::app_url_padrao")]
+    #[serde(default = "Configuracoes::app_url_padrao", alias = "appURL")]
     pub app_url: String,
     /// E-mails que podem concluir o onboarding do primeiro superusuário.
     /// Vazio = qualquer e-mail (o segredo de instalação continua obrigatório).
     #[serde(default)]
     pub installer_emails: Vec<String>,
     #[serde(default)]
+    pub meta: MetaConfig,
+    #[serde(default)]
     pub s3: S3Config,
+    #[serde(default)]
+    pub smtp: SmtpConfig,
+    #[serde(default)]
+    pub logs: LogsConfig,
+    #[serde(default)]
+    pub backups: BackupsConfig,
+    #[serde(default)]
+    pub rate_limits: RateLimitsConfig,
 }
 
 impl Configuracoes {
-    fn app_name_padrao() -> String {
+    pub fn app_name_padrao() -> String {
         "Acme".into()
     }
-    fn app_url_padrao() -> String {
+    pub fn app_url_padrao() -> String {
         "http://localhost:8090".into()
+    }
+
+    /// Sincroniza `app_name` e `app_url` da raiz com `meta`.
+    pub fn sincronizar(&mut self) {
+        if self.meta.app_name != self.app_name {
+            if self.app_name != Self::app_name_padrao() && self.meta.app_name == Self::app_name_padrao() {
+                self.meta.app_name = self.app_name.clone();
+            } else {
+                self.app_name = self.meta.app_name.clone();
+            }
+        }
+        if self.meta.app_url != self.app_url {
+            if self.app_url != Self::app_url_padrao() && self.meta.app_url == Self::app_url_padrao() {
+                self.meta.app_url = self.app_url.clone();
+            } else {
+                self.app_url = self.meta.app_url.clone();
+            }
+        }
     }
 }
 
@@ -110,7 +345,12 @@ impl Default for Configuracoes {
             app_name: Configuracoes::app_name_padrao(),
             app_url: Configuracoes::app_url_padrao(),
             installer_emails: Vec::new(),
+            meta: MetaConfig::default(),
             s3: S3Config::default(),
+            smtp: SmtpConfig::default(),
+            logs: LogsConfig::default(),
+            backups: BackupsConfig::default(),
+            rate_limits: RateLimitsConfig::default(),
         }
     }
 }
@@ -478,6 +718,15 @@ fn esquema(d: Dialeto) -> Vec<String> {
                 \"updated\" TEXT NOT NULL
             )"
         ),
+        "CREATE TABLE IF NOT EXISTS \"_logs\" (
+            \"id\" TEXT PRIMARY KEY NOT NULL,
+            \"created\" TEXT NOT NULL,
+            \"updated\" TEXT NOT NULL,
+            \"level\" INTEGER NOT NULL DEFAULT 0,
+            \"message\" TEXT NOT NULL DEFAULT '',
+            \"data\" TEXT NOT NULL DEFAULT '{}'
+        )".to_string(),
+        "CREATE INDEX IF NOT EXISTS \"idx__logs_created\" ON \"_logs\" (\"created\")".to_string(),
     ];
     if d == Dialeto::Postgres {
         v.push("CREATE UNIQUE INDEX IF NOT EXISTS \"_collections_name_ci\" ON \"_collections\" (lower(\"name\"))".into());
@@ -1630,9 +1879,11 @@ impl Banco {
     }
 
     pub async fn salvar_configuracoes(&self, c: &Configuracoes) -> Resultado<Configuracoes> {
-        let json = serde_json::to_string(c).map_err(|e| Erro::Interno(format!("settings: {e}")))?;
+        let mut cfg = c.clone();
+        cfg.sincronizar();
+        let json = serde_json::to_string(&cfg).map_err(|e| Erro::Interno(format!("settings: {e}")))?;
         self.salvar_parametro("settings", &json).await?;
-        Ok(c.clone())
+        Ok(cfg)
     }
 
     /// Obtém o provedor de arquivos (S3 se configurado e habilitado, ou disco local).
@@ -1647,6 +1898,410 @@ impl Banco {
                 .map(|p| (**p).clone())
                 .unwrap_or_else(|| std::path::PathBuf::from("."));
             Arc::new(DiscoLocal::new(raiz))
+        }
+    }
+
+    // ── Logs ─────────────────────────────────────────────────────────────────
+
+    pub async fn log_gravar(
+        &self,
+        level: i32,
+        message: &str,
+        data: serde_json::Value,
+    ) -> Resultado<LogItem> {
+        let id = id::novo();
+        let agora = agora();
+        let data_str = serde_json::to_string(&data).unwrap_or_else(|_| "{}".into());
+
+        self.ex
+            .executar(
+                "INSERT INTO \"_logs\" (\"id\", \"created\", \"updated\", \"level\", \"message\", \"data\") VALUES (?, ?, ?, ?, ?, ?)",
+                vec![
+                    id.clone().into(),
+                    agora.clone().into(),
+                    agora.clone().into(),
+                    Valor::Int(level as i64),
+                    message.into(),
+                    data_str.into(),
+                ],
+            )
+            .await?;
+
+        Ok(LogItem {
+            id,
+            created: agora.clone(),
+            updated: agora,
+            level,
+            message: message.to_string(),
+            data,
+        })
+    }
+
+    pub async fn log_obter(&self, id: &str) -> Resultado<LogItem> {
+        let sql = "SELECT \"id\", \"created\", \"updated\", \"level\", \"message\", \"data\" FROM \"_logs\" WHERE \"id\" = ?";
+        let mut linhas = self.ex.consultar(sql, vec![id.into()]).await?;
+        if linhas.is_empty() {
+            return Err(Erro::NaoEncontrado("The requested log was not found.".into()));
+        }
+        let mut it = linhas.remove(0).into_iter();
+        let id = it.next().unwrap_or(Valor::Nulo).texto_ou_vazio();
+        let created = it.next().unwrap_or(Valor::Nulo).texto_ou_vazio();
+        let updated = it.next().unwrap_or(Valor::Nulo).texto_ou_vazio();
+        let level = it.next().unwrap_or(Valor::Nulo).int() as i32;
+        let message = it.next().unwrap_or(Valor::Nulo).texto_ou_vazio();
+        let data_raw = it.next().unwrap_or(Valor::Nulo).texto_ou_vazio();
+        let data = serde_json::from_str(&data_raw).unwrap_or(serde_json::Value::Object(Default::default()));
+
+        Ok(LogItem {
+            id,
+            created,
+            updated,
+            level,
+            message,
+            data,
+        })
+    }
+
+    pub async fn logs_listar(
+        &self,
+        pagina: usize,
+        por_pagina: usize,
+        filtro: Option<&str>,
+    ) -> Resultado<PaginaLogs> {
+        let pagina = pagina.max(1);
+        let por_pagina = por_pagina.clamp(1, 500);
+        let offset = (pagina - 1) * por_pagina;
+
+        let (where_clause, params) = if let Some(f) = filtro.filter(|s| !s.trim().is_empty()) {
+            if let Ok(lvl) = f.trim().parse::<i64>() {
+                (" WHERE \"level\" >= ?", vec![Valor::Int(lvl)])
+            } else if f.contains('=') || f.contains('>') || f.contains('<') || f.contains('~') {
+                if f.contains("level") {
+                    (" WHERE \"level\" > 0", vec![])
+                } else {
+                    (" WHERE \"message\" LIKE ?", vec![format!("%{f}%").into()])
+                }
+            } else {
+                (" WHERE \"message\" LIKE ?", vec![format!("%{f}%").into()])
+            }
+        } else {
+            ("", vec![])
+        };
+
+        let sql_total = format!("SELECT COUNT(*) FROM \"_logs\"{where_clause}");
+        let linhas_total = self.ex.consultar(&sql_total, params.clone()).await?;
+        let total_items = linhas_total.first().map(|l| l[0].int()).unwrap_or(0) as usize;
+        let total_pages = if total_items == 0 { 0 } else { total_items.div_ceil(por_pagina) };
+
+        let mut params_select = params;
+        params_select.push(Valor::Int(por_pagina as i64));
+        params_select.push(Valor::Int(offset as i64));
+
+        let sql = format!(
+            "SELECT \"id\", \"created\", \"updated\", \"level\", \"message\", \"data\" FROM \"_logs\"{where_clause} ORDER BY \"created\" DESC, \"id\" DESC LIMIT ? OFFSET ?"
+        );
+        let linhas = self.ex.consultar(&sql, params_select).await?;
+
+        let items = linhas
+            .into_iter()
+            .map(|l| {
+                let mut it = l.into_iter();
+                let id = it.next().unwrap_or(Valor::Nulo).texto_ou_vazio();
+                let created = it.next().unwrap_or(Valor::Nulo).texto_ou_vazio();
+                let updated = it.next().unwrap_or(Valor::Nulo).texto_ou_vazio();
+                let level = it.next().unwrap_or(Valor::Nulo).int() as i32;
+                let message = it.next().unwrap_or(Valor::Nulo).texto_ou_vazio();
+                let data_raw = it.next().unwrap_or(Valor::Nulo).texto_ou_vazio();
+                let data = serde_json::from_str(&data_raw).unwrap_or(serde_json::Value::Object(Default::default()));
+                LogItem { id, created, updated, level, message, data }
+            })
+            .collect();
+
+        Ok(PaginaLogs {
+            page: pagina,
+            per_page: por_pagina,
+            total_items,
+            total_pages,
+            items,
+        })
+    }
+
+    pub async fn logs_stats(&self, filtro: Option<&str>) -> Resultado<Vec<LogStat>> {
+        let (where_clause, params) = if let Some(f) = filtro.filter(|s| !s.trim().is_empty()) {
+            if f.contains("level") {
+                (" WHERE \"level\" > 0", vec![])
+            } else {
+                ("", vec![])
+            }
+        } else {
+            ("", vec![])
+        };
+
+        let sql = format!(
+            "SELECT COUNT(*) as total, substr(\"created\", 1, 13) || ':00:00.000Z' as dt FROM \"_logs\"{where_clause} GROUP BY dt ORDER BY dt ASC"
+        );
+        let linhas = self.ex.consultar(&sql, params).await?;
+
+        Ok(linhas
+            .into_iter()
+            .map(|l| {
+                let mut it = l.into_iter();
+                let total = it.next().unwrap_or(Valor::Nulo).int();
+                let date = it.next().unwrap_or(Valor::Nulo).texto_ou_vazio();
+                LogStat { total, date }
+            })
+            .collect())
+    }
+
+    pub async fn logs_limpar(&self, max_dias: i64) -> Resultado<usize> {
+        if max_dias <= 0 {
+            return Ok(0);
+        }
+        let segundos = max_dias * 86400;
+        let agora_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let limite_secs = agora_secs.saturating_sub(segundos as u64);
+        let limite = data_utc_de_epoch_s(limite_secs as i64);
+
+        let afetados = self
+            .ex
+            .executar(
+                "DELETE FROM \"_logs\" WHERE \"created\" < ?",
+                vec![limite.into()],
+            )
+            .await?;
+        Ok(afetados as usize)
+    }
+
+    // ── Backups ──────────────────────────────────────────────────────────────
+
+    pub fn backups_pasta(&self) -> Option<std::path::PathBuf> {
+        self.pasta.as_ref().map(|p| p.join("backups"))
+    }
+
+    pub async fn backups_listar(&self) -> Resultado<Vec<BackupItem>> {
+        let Some(dir) = self.backups_pasta() else {
+            return Ok(Vec::new());
+        };
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut itens = Vec::new();
+        let mut entries = tokio::fs::read_dir(&dir)
+            .await
+            .map_err(|e| Erro::Interno(e.to_string()))?;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let nome = entry.file_name().to_string_lossy().to_string();
+            if nome.ends_with(".zip")
+                && let Ok(meta) = entry.metadata().await
+            {
+                let size = meta.len();
+                let modified = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| data_utc_de_epoch_s(d.as_secs() as i64))
+                    .unwrap_or_else(agora);
+                itens.push(BackupItem {
+                    key: nome,
+                    modified,
+                    size,
+                });
+            }
+        }
+        itens.sort_by(|a, b| b.key.cmp(&a.key));
+        Ok(itens)
+    }
+
+    pub async fn backup_criar(&self, nome_sugerido: Option<&str>) -> Resultado<BackupItem> {
+        let Some(pasta_raiz) = self.pasta.as_ref().map(|p| (**p).clone()) else {
+            return Err(Erro::invalido("Backups require a file-based database."));
+        };
+        let backups_dir = pasta_raiz.join("backups");
+        tokio::fs::create_dir_all(&backups_dir)
+            .await
+            .map_err(|e| Erro::Interno(e.to_string()))?;
+
+        let key = if let Some(n) = nome_sugerido.filter(|s| !s.trim().is_empty()) {
+            let mut nome = n.trim().to_string();
+            if !nome.ends_with(".zip") {
+                nome.push_str(".zip");
+            }
+            nome
+        } else {
+            let carimbo = agora().replace(['-', ':', ' ', 'Z', '.'], "");
+            format!("pb_backup_{carimbo}.zip")
+        };
+
+        if key.contains("..") || key.contains('/') || key.contains('\\') {
+            return Err(Erro::invalido("Invalid backup name."));
+        }
+
+        let destino_zip = backups_dir.join(&key);
+
+        let _ = self.ex.executar("PRAGMA wal_checkpoint(TRUNCATE)", vec![]).await;
+
+        let raiz_clone = pasta_raiz.clone();
+        let destino_clone = destino_zip.clone();
+
+        tokio::task::spawn_blocking(move || -> Resultado<()> {
+            let file = std::fs::File::create(&destino_clone)
+                .map_err(|e| Erro::Interno(format!("Failed to create backup file: {e}")))?;
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+
+            let db_path = raiz_clone.join("data.db");
+            if db_path.exists() {
+                zip.start_file("data.db", options)
+                    .map_err(|e| Erro::Interno(e.to_string()))?;
+                let mut db_file = std::fs::File::open(&db_path)
+                    .map_err(|e| Erro::Interno(e.to_string()))?;
+                std::io::copy(&mut db_file, &mut zip)
+                    .map_err(|e| Erro::Interno(e.to_string()))?;
+            }
+
+            let storage_path = raiz_clone.join("storage");
+            if storage_path.exists() {
+                fn zip_dir(
+                    origem_raiz: &std::path::Path,
+                    dir_atual: &std::path::Path,
+                    zip: &mut zip::ZipWriter<std::fs::File>,
+                    options: zip::write::SimpleFileOptions,
+                ) -> std::io::Result<()> {
+                    for entry in std::fs::read_dir(dir_atual)? {
+                        let entry = entry?;
+                        let path = entry.path();
+                        let relativo = path.strip_prefix(origem_raiz).unwrap().to_string_lossy();
+                        if path.is_dir() {
+                            zip.add_directory(relativo.to_string(), options)
+                                .map_err(std::io::Error::other)?;
+                            zip_dir(origem_raiz, &path, zip, options)?;
+                        } else {
+                            zip.start_file(relativo.to_string(), options)
+                                .map_err(std::io::Error::other)?;
+                            let mut f = std::fs::File::open(&path)?;
+                            std::io::copy(&mut f, zip)?;
+                        }
+                    }
+                    Ok(())
+                }
+                let _ = zip_dir(&raiz_clone, &storage_path, &mut zip, options);
+            }
+
+            zip.finish().map_err(|e| Erro::Interno(e.to_string()))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Erro::Interno(e.to_string()))??;
+
+        let meta = tokio::fs::metadata(&destino_zip)
+            .await
+            .map_err(|e| Erro::Interno(e.to_string()))?;
+
+        Ok(BackupItem {
+            key,
+            modified: agora(),
+            size: meta.len(),
+        })
+    }
+
+    pub async fn backup_apagar(&self, key: &str) -> Resultado<()> {
+        if key.contains("..") || key.contains('/') || key.contains('\\') {
+            return Err(Erro::invalido("Invalid backup key."));
+        }
+        let Some(dir) = self.backups_pasta() else {
+            return Err(Erro::invalido("No backups directory found."));
+        };
+        let caminho = dir.join(key);
+        if !caminho.exists() {
+            return Err(Erro::NaoEncontrado("Backup not found.".into()));
+        }
+        tokio::fs::remove_file(caminho)
+            .await
+            .map_err(|e| Erro::Interno(e.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn backup_restaurar(&self, key: &str) -> Resultado<()> {
+        if key.contains("..") || key.contains('/') || key.contains('\\') {
+            return Err(Erro::invalido("Invalid backup key."));
+        }
+        let Some(pasta_raiz) = self.pasta.as_ref().map(|p| (**p).clone()) else {
+            return Err(Erro::invalido("No project directory found."));
+        };
+        let backup_path = pasta_raiz.join("backups").join(key);
+        if !backup_path.exists() {
+            return Err(Erro::NaoEncontrado("Backup file not found.".into()));
+        }
+
+        let raiz_clone = pasta_raiz.clone();
+        tokio::task::spawn_blocking(move || -> Resultado<()> {
+            let file = std::fs::File::open(&backup_path)
+                .map_err(|e| Erro::Interno(e.to_string()))?;
+            let mut archive = zip::ZipArchive::new(file)
+                .map_err(|e| Erro::Interno(format!("Invalid zip archive: {e}")))?;
+
+            for i in 0..archive.len() {
+                let mut item = archive.by_index(i).map_err(|e| Erro::Interno(e.to_string()))?;
+                let outpath = match item.enclosed_name() {
+                    Some(path) => raiz_clone.join(path),
+                    None => continue,
+                };
+
+                if item.is_dir() {
+                    std::fs::create_dir_all(&outpath).map_err(|e| Erro::Interno(e.to_string()))?;
+                } else {
+                    if let Some(p) = outpath.parent()
+                        && !p.exists()
+                    {
+                        std::fs::create_dir_all(p).map_err(|e| Erro::Interno(e.to_string()))?;
+                    }
+                    let mut outfile = std::fs::File::create(&outpath).map_err(|e| Erro::Interno(e.to_string()))?;
+                    std::io::copy(&mut item, &mut outfile).map_err(|e| Erro::Interno(e.to_string()))?;
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| Erro::Interno(e.to_string()))??;
+
+        Ok(())
+    }
+
+    // ── Crons ────────────────────────────────────────────────────────────────
+
+    pub async fn crons_listar(&self) -> Resultado<Vec<CronItem>> {
+        let cfg = self.configuracoes().await;
+        let mut lista = vec![
+            CronItem {
+                id: "__pbLogsCleanup__".into(),
+                expression: "0 */6 * * *".into(),
+            },
+        ];
+        if !cfg.backups.cron.trim().is_empty() {
+            lista.push(CronItem {
+                id: "__pbBackupRun__".into(),
+                expression: cfg.backups.cron,
+            });
+        }
+        Ok(lista)
+    }
+
+    pub async fn cron_executar(&self, id: &str) -> Resultado<()> {
+        match id {
+            "__pbLogsCleanup__" => {
+                let cfg = self.configuracoes().await;
+                let _ = self.logs_limpar(cfg.logs.max_days).await;
+                Ok(())
+            }
+            "__pbBackupRun__" => {
+                let _ = self.backup_criar(None).await?;
+                Ok(())
+            }
+            _ => Err(Erro::NaoEncontrado(format!("Cron job '{id}' not found."))),
         }
     }
 
@@ -4810,5 +5465,77 @@ mod tests {
         );
         assert_eq!(rx.recv().await.unwrap().acao, Acao::Criar);
         assert_eq!(rx.recv().await.unwrap().acao, Acao::Criar);
+    }
+
+    #[tokio::test]
+    async fn logs_e_estatisticas() {
+        let b = Banco::sqlite_memoria().await.unwrap();
+
+        // 1. Grava logs
+        let l1 = b
+            .log_gravar(0, "GET /api/health 200", json!({ "status": 200, "ip": "127.0.0.1" }))
+            .await
+            .unwrap();
+        let l2 = b
+            .log_gravar(4, "POST /api/auth 400", json!({ "status": 400, "ip": "127.0.0.1" }))
+            .await
+            .unwrap();
+
+        // 2. Obtém por ID
+        let obtido = b.log_obter(&l1.id).await.unwrap();
+        assert_eq!(obtido.message, "GET /api/health 200");
+        assert_eq!(obtido.level, 0);
+        assert_eq!(obtido.data["status"], 200);
+
+        // 3. Lista logs
+        let pagina = b.logs_listar(1, 10, None).await.unwrap();
+        assert_eq!(pagina.total_items, 2);
+        assert_eq!(pagina.items.len(), 2);
+
+        // 4. Filtra por nível ou termo
+        let filtrado = b.logs_listar(1, 10, Some("POST")).await.unwrap();
+        assert_eq!(filtrado.total_items, 1);
+        assert_eq!(filtrado.items[0].id, l2.id);
+
+        // 5. Estatísticas agrupadas por hora
+        let stats = b.logs_stats(None).await.unwrap();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].total, 2);
+
+        // 6. Limpeza de logs antigos
+        let limpados = b.logs_limpar(1).await.unwrap();
+        assert_eq!(limpados, 0); // criados agora, nada apagado
+    }
+
+    #[tokio::test]
+    async fn backups_e_crons() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = Banco::sqlite(dir.path()).await.unwrap();
+
+        // 1. Cria backup com nome customizado
+        let item = b.backup_criar(Some("teste.zip")).await.unwrap();
+        assert_eq!(item.key, "teste.zip");
+        assert!(item.size > 0);
+
+        // 2. Lista backups
+        let lista = b.backups_listar().await.unwrap();
+        assert_eq!(lista.len(), 1);
+        assert_eq!(lista[0].key, "teste.zip");
+
+        // 3. Restaura backup
+        b.backup_restaurar("teste.zip").await.unwrap();
+
+        // 4. Apaga backup
+        b.backup_apagar("teste.zip").await.unwrap();
+        let lista_pos = b.backups_listar().await.unwrap();
+        assert_eq!(lista_pos.len(), 0);
+
+        // 5. Crons
+        let crons = b.crons_listar().await.unwrap();
+        assert!(!crons.is_empty());
+        assert_eq!(crons[0].id, "__pbLogsCleanup__");
+
+        // Executa cron manual
+        b.cron_executar("__pbLogsCleanup__").await.unwrap();
     }
 }

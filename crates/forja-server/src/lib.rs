@@ -5,11 +5,13 @@ mod lote;
 mod painel;
 mod realtime;
 
+use axum::body::Body;
 use axum::extract::{
     DefaultBodyLimit, FromRequest, FromRequestParts, Multipart, Path, Query, Request, State,
 };
 use axum::http::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE};
 use axum::http::{StatusCode, request::Parts};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -409,6 +411,261 @@ async fn settings_test_s3(
     };
     let s3 = forja_core::store::S3Storage::new(config);
     s3.testar_conexao().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BodyTestEmail {
+    email: String,
+    template: String,
+    #[allow(dead_code)]
+    #[serde(default)]
+    collection: Option<String>,
+}
+
+async fn settings_test_email(
+    State(e): State<Estado>,
+    quem: Chamador,
+    Json(body): Json<BodyTestEmail>,
+) -> Res<StatusCode> {
+    quem.exigir_superusuario()?;
+    if !email_valido(&body.email) {
+        return Err(ErroApi(Erro::campo(
+            "email",
+            "validation_is_email",
+            "Must be a valid email address.",
+        )));
+    }
+    let cfg = e.banco.configuracoes().await;
+    let tpl = match body.template.as_str() {
+        "verification" => &cfg.meta.verification_template,
+        "password-reset" => &cfg.meta.reset_password_template,
+        "email-change" => &cfg.meta.confirm_email_change_template,
+        _ => {
+            return Err(ErroApi(Erro::campo(
+                "template",
+                "validation_in_slice",
+                "Invalid email template.",
+            )));
+        }
+    };
+
+    let mut extras = std::collections::HashMap::new();
+    extras.insert("email".into(), body.email.clone());
+    let (assunto, corpo) = tpl.renderizar(
+        &cfg.meta.app_name,
+        &cfg.meta.app_url,
+        "test_token_1234567890",
+        &extras,
+    );
+
+    enviar_email(&e, &body.email, &assunto, corpo)
+        .await
+        .map_err(|err| ErroApi(Erro::invalido(format!("Failed to send email: {err}"))))?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ── Logs de Requisição ───────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QueryLogs {
+    #[serde(default = "QueryLogs::page_padrao")]
+    page: usize,
+    #[serde(default = "QueryLogs::per_page_padrao")]
+    per_page: usize,
+    #[serde(default)]
+    filter: Option<String>,
+}
+
+impl QueryLogs {
+    fn page_padrao() -> usize {
+        1
+    }
+    fn per_page_padrao() -> usize {
+        30
+    }
+}
+
+async fn logs_listar_api(
+    State(e): State<Estado>,
+    quem: Chamador,
+    Query(q): Query<QueryLogs>,
+) -> Res<Json<forja_core::store::PaginaLogs>> {
+    quem.exigir_superusuario()?;
+    let pagina = e
+        .banco
+        .logs_listar(q.page, q.per_page, q.filter.as_deref())
+        .await?;
+    Ok(Json(pagina))
+}
+
+async fn logs_obter_api(
+    State(e): State<Estado>,
+    quem: Chamador,
+    Path(id): Path<String>,
+) -> Res<Json<forja_core::store::LogItem>> {
+    quem.exigir_superusuario()?;
+    let item = e.banco.log_obter(&id).await?;
+    Ok(Json(item))
+}
+
+#[derive(Deserialize)]
+struct QueryStats {
+    #[serde(default)]
+    filter: Option<String>,
+}
+
+async fn logs_stats_api(
+    State(e): State<Estado>,
+    quem: Chamador,
+    Query(q): Query<QueryStats>,
+) -> Res<Json<Vec<forja_core::store::LogStat>>> {
+    quem.exigir_superusuario()?;
+    let stats = e.banco.logs_stats(q.filter.as_deref()).await?;
+    Ok(Json(stats))
+}
+
+// ── Backups ──────────────────────────────────────────────────────────────
+
+async fn backups_listar_api(
+    State(e): State<Estado>,
+    quem: Chamador,
+) -> Res<Json<Vec<forja_core::store::BackupItem>>> {
+    quem.exigir_superusuario()?;
+    let itens = e.banco.backups_listar().await?;
+    Ok(Json(itens))
+}
+
+#[derive(Deserialize)]
+struct BodyCriarBackup {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+async fn backups_criar_api(
+    State(e): State<Estado>,
+    quem: Chamador,
+    body: Option<Json<BodyCriarBackup>>,
+) -> Res<StatusCode> {
+    quem.exigir_superusuario()?;
+    let nome = body.and_then(|b| b.0.name);
+    e.banco.backup_criar(nome.as_deref()).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn backups_baixar_api(
+    State(e): State<Estado>,
+    quem: Chamador,
+    Path(key): Path<String>,
+) -> Res<Response> {
+    quem.exigir_superusuario()?;
+    let dir = e
+        .banco
+        .backups_pasta()
+        .ok_or_else(|| ErroApi(Erro::invalido("No backups folder.")))?;
+    let caminho = dir.join(&key);
+    if !caminho.exists() {
+        return Err(ErroApi(Erro::NaoEncontrado("Backup not found.".into())));
+    }
+    let bytes = tokio::fs::read(&caminho)
+        .await
+        .map_err(|err| ErroApi(Erro::Interno(err.to_string())))?;
+
+    let res = Response::builder()
+        .header(CONTENT_TYPE, "application/zip")
+        .header(
+            CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{key}\""),
+        )
+        .body(Body::from(bytes))
+        .map_err(|err| ErroApi(Erro::Interno(err.to_string())))?;
+
+    Ok(res)
+}
+
+async fn backups_apagar_api(
+    State(e): State<Estado>,
+    quem: Chamador,
+    Path(key): Path<String>,
+) -> Res<StatusCode> {
+    quem.exigir_superusuario()?;
+    e.banco.backup_apagar(&key).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn backups_restaurar_api(
+    State(e): State<Estado>,
+    quem: Chamador,
+    Path(key): Path<String>,
+) -> Res<StatusCode> {
+    quem.exigir_superusuario()?;
+    e.banco.backup_restaurar(&key).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn backups_upload_api(
+    State(e): State<Estado>,
+    quem: Chamador,
+    mut multipart: axum::extract::Multipart,
+) -> Res<StatusCode> {
+    quem.exigir_superusuario()?;
+    let dir = e
+        .banco
+        .backups_pasta()
+        .ok_or_else(|| ErroApi(Erro::invalido("No backups folder.")))?;
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|err| ErroApi(Erro::Interno(err.to_string())))?;
+
+    let mut gravou = false;
+    if let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|err| ErroApi(Erro::invalido(err.to_string())))?
+    {
+        let nome_arquivo = field.file_name().unwrap_or("backup.zip").to_string();
+        if !nome_arquivo.ends_with(".zip")
+            || nome_arquivo.contains("..")
+            || nome_arquivo.contains('/')
+        {
+            return Err(ErroApi(Erro::invalido("Invalid backup zip file.")));
+        }
+        let data = field
+            .bytes()
+            .await
+            .map_err(|err| ErroApi(Erro::invalido(err.to_string())))?;
+        tokio::fs::write(dir.join(nome_arquivo), data)
+            .await
+            .map_err(|err| ErroApi(Erro::Interno(err.to_string())))?;
+        gravou = true;
+    }
+    if !gravou {
+        return Err(ErroApi(Erro::invalido("No file provided.")));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ── Crons ────────────────────────────────────────────────────────────────
+
+async fn crons_listar_api(
+    State(e): State<Estado>,
+    quem: Chamador,
+) -> Res<Json<Vec<forja_core::store::CronItem>>> {
+    quem.exigir_superusuario()?;
+    let itens = e.banco.crons_listar().await?;
+    Ok(Json(itens))
+}
+
+async fn cron_executar_api(
+    State(e): State<Estado>,
+    quem: Chamador,
+    Path(id): Path<String>,
+) -> Res<StatusCode> {
+    quem.exigir_superusuario()?;
+    e.banco.cron_executar(&id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1029,12 +1286,31 @@ fn link(colecao: &str, acao: &str, token: &str) -> String {
     format!("/api/collections/{colecao}/{acao}?token={token}")
 }
 
-fn enviar(e: &Estado, para: &str, assunto: &str, corpo: String) {
-    e.correio.enviar(&Mensagem {
-        para: para.into(),
-        assunto: assunto.into(),
+async fn enviar_email(
+    e: &Estado,
+    para: &str,
+    assunto: &str,
+    corpo: String,
+) -> Result<(), Erro> {
+    let cfg = e.banco.configuracoes().await;
+    let msg = Mensagem::com_remetente(
+        para,
+        assunto,
         corpo,
-    });
+        Some(cfg.meta.sender_name),
+        Some(cfg.meta.sender_address),
+    );
+    if cfg.smtp.enabled && !cfg.smtp.host.is_empty() {
+        let smtp = forja_core::correio::SmtpCorreio::new(cfg.smtp);
+        smtp.enviar(&msg).await?;
+    } else {
+        e.correio.enviar(&msg).await?;
+    }
+    Ok(())
+}
+
+async fn enviar(e: &Estado, para: &str, assunto: &str, corpo: String) {
+    let _ = enviar_email(e, para, assunto, corpo).await;
 }
 
 fn email_valido(s: &str) -> bool {
@@ -1137,7 +1413,8 @@ async fn pedir_verificacao(
             &cred.email,
             "Verifique seu e-mail",
             link(&c.name, "confirm-verification", &token),
-        );
+        )
+        .await;
     }
     // Sempre 204: não se revela se o e-mail existe.
     Ok(StatusCode::NO_CONTENT)
@@ -1184,7 +1461,8 @@ async fn pedir_redefinicao(
             &cred.email,
             "Redefinição de senha",
             link(&c.name, "confirm-password-reset", &token),
-        );
+        )
+        .await;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1279,7 +1557,8 @@ async fn pedir_troca_email(
         &novo,
         "Confirme seu novo e-mail",
         link(&c.name, "confirm-email-change", &token),
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1569,6 +1848,44 @@ async fn health() -> Json<Value> {
     Json(json!({ "code": 200, "message": "API is healthy.", "data": {} }))
 }
 
+async fn log_middleware(
+    State(e): State<Estado>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let method = req.method().to_string();
+    let uri = req.uri().to_string();
+    let inicio = std::time::Instant::now();
+
+    let res = next.run(req).await;
+
+    let duracao = inicio.elapsed().as_secs_f64();
+    let status = res.status().as_u16();
+
+    if uri.starts_with("/api/") && !uri.starts_with("/api/logs") {
+        let level = if status >= 500 {
+            8
+        } else if status >= 400 {
+            4
+        } else {
+            0
+        };
+        let banco = e.banco.clone();
+        let msg = format!("{method} {uri} {status}");
+        tokio::spawn(async move {
+            let data = json!({
+                "url": uri,
+                "method": method,
+                "status": status,
+                "execTime": duracao,
+            });
+            let _ = banco.log_gravar(level, &msg, data).await;
+        });
+    }
+
+    res
+}
+
 /// As rotas do Forja.
 pub fn router(e: Estado) -> Router {
     Router::new()
@@ -1660,9 +1977,48 @@ pub fn router(e: Estado) -> Router {
             get(settings_obter).patch(settings_atualizar),
         )
         .route("/api/settings/test/s3", post(settings_test_s3))
+        .route("/api/settings/test/email", post(settings_test_email))
+        .route("/api/logs", get(logs_listar_api))
+        .route("/api/logs/stats", get(logs_stats_api))
+        .route("/api/logs/{id}", get(logs_obter_api))
+        .route("/api/backups", get(backups_listar_api).post(backups_criar_api))
+        .route("/api/backups/upload", post(backups_upload_api))
+        .route(
+            "/api/backups/{key}",
+            get(backups_baixar_api).delete(backups_apagar_api),
+        )
+        .route("/api/backups/{key}/restore", post(backups_restaurar_api))
+        .route("/api/crons", get(crons_listar_api))
+        .route("/api/crons/{id}", post(cron_executar_api))
         .merge(painel::rotas())
+        .layer(middleware::from_fn_with_state(e.clone(), log_middleware))
         .layer(DefaultBodyLimit::max(MAX_CORPO))
         .with_state(e)
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut sig) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            sig.recv().await;
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }
 
 /// Abre o projeto padrão no motor escolhido e atende até o processo terminar.
@@ -1687,7 +2043,9 @@ pub async fn serve(
         forja_core::VERSION,
         pasta.display()
     );
-    axum::serve(listener, router(estado)).await
+    axum::serve(listener, router(estado))
+        .with_graceful_shutdown(shutdown_signal())
+        .await
 }
 
 #[cfg(test)]
@@ -3720,5 +4078,218 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
         assert!(resp["message"].as_str().unwrap().contains("Failed to connect"));
+    }
+
+    #[tokio::test]
+    async fn api_settings_test_email() {
+        let (e, memoria) = estado_com_memoria().await;
+        let admin = login(&e).await;
+
+        // 1. Visitante sem token recebe 403
+        let (s, _) = chamar(
+            &e,
+            "POST",
+            "/api/settings/test/email",
+            None,
+            Some(json!({ "email": "test@example.com", "template": "verification" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+
+        // 2. Email inválido
+        let (s, _) = chamar(
+            &e,
+            "POST",
+            "/api/settings/test/email",
+            Some(&admin),
+            Some(json!({ "email": "invalido", "template": "verification" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+
+        // 3. Template desconhecido
+        let (s, _) = chamar(
+            &e,
+            "POST",
+            "/api/settings/test/email",
+            Some(&admin),
+            Some(json!({ "email": "test@example.com", "template": "desconhecido" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+
+        // 4. Envio bem-sucedido via Memoria
+        let (s, _) = chamar(
+            &e,
+            "POST",
+            "/api/settings/test/email",
+            Some(&admin),
+            Some(json!({ "email": "destinatario@exemplo.com", "template": "verification" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+
+        let m = memoria.ultima().expect("email deveria ter sido enviado");
+        assert_eq!(m.para, "destinatario@exemplo.com");
+        assert!(m.assunto.contains("Acme"));
+        assert!(m.corpo.contains("test_token_1234567890"));
+    }
+
+    #[tokio::test]
+    async fn api_logs_e_stats() {
+        let e = estado().await;
+        let admin = login(&e).await;
+
+        // Gera alguns logs na API
+        let _ = chamar(&e, "GET", "/api/health", None, None).await;
+        let _ = chamar(&e, "GET", "/api/collections", Some(&admin), None).await;
+
+        // Permite o processamento assíncrono do log_middleware
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // 1. Visitante é barrado
+        let (s, _) = chamar(&e, "GET", "/api/logs", None, None).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+
+        // 2. Superusuário lista logs
+        let (s, lista) = chamar(&e, "GET", "/api/logs", Some(&admin), None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(lista["totalItems"].as_u64().unwrap() >= 2);
+        let primeiro = &lista["items"][0];
+        let id_log = primeiro["id"].as_str().unwrap();
+
+        // 3. Superusuário obtém log por ID
+        let (s, item) = chamar(&e, "GET", &format!("/api/logs/{id_log}"), Some(&admin), None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(item["id"], id_log);
+        assert!(item["data"]["status"].as_u64().is_some());
+
+        // 4. Estatísticas horárias
+        let (s, stats) = chamar(&e, "GET", "/api/logs/stats", Some(&admin), None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(!stats.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn api_backups_e_crons() {
+        let dir = tempfile::tempdir().unwrap();
+        let banco = Banco::sqlite(dir.path()).await.unwrap();
+        let e = Estado::novo(banco).await.unwrap();
+        let admin = login(&e).await;
+
+        // 1. Visitante é barrado
+        let (s, _) = chamar(&e, "GET", "/api/backups", None, None).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+
+        let (s, _) = chamar(&e, "GET", "/api/crons", None, None).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+
+        // 2. Superusuário cria backup
+        let (s, _) = chamar(
+            &e,
+            "POST",
+            "/api/backups",
+            Some(&admin),
+            Some(json!({ "name": "backup_teste.zip" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+
+        // 3. Superusuário lista backups
+        let (s, lista) = chamar(&e, "GET", "/api/backups", Some(&admin), None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(lista[0]["key"], "backup_teste.zip");
+
+        // 4. Baixar backup
+        let (s, _) = chamar(&e, "GET", "/api/backups/backup_teste.zip", Some(&admin), None).await;
+        assert_eq!(s, StatusCode::OK);
+
+        // 5. Restaurar backup
+        let (s, _) = chamar(
+            &e,
+            "POST",
+            "/api/backups/backup_teste.zip/restore",
+            Some(&admin),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+
+        // 6. Apagar backup
+        let (s, _) = chamar(
+            &e,
+            "DELETE",
+            "/api/backups/backup_teste.zip",
+            Some(&admin),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+
+        // 7. Crons
+        let (s, crons) = chamar(&e, "GET", "/api/crons", Some(&admin), None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(!crons.as_array().unwrap().is_empty());
+
+        let (s, _) = chamar(&e, "POST", "/api/crons/__pbLogsCleanup__", Some(&admin), None).await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn painel_marco_0_5_paginas() {
+        let e = estado().await;
+        login(&e).await;
+        let cookie = entrar_no_painel(&e).await;
+
+        // 1. Logs
+        let (s, _, corpo) = pedir(&e, "GET", "/_/logs", &[("cookie", cookie.as_str())], "").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(corpo.contains("Logs de Requisições"), "{corpo}");
+
+        // 2. Crons
+        let (s, _, corpo) = pedir(&e, "GET", "/_/crons", &[("cookie", cookie.as_str())], "").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(corpo.contains("Tarefas Agendadas"), "{corpo}");
+
+        // Executar cron pelo painel
+        let (s, h, _) = form_post(&e, "/_/crons/__pbLogsCleanup__/run", Some(&cookie), &[]).await;
+        assert_eq!(s, StatusCode::SEE_OTHER);
+        assert_eq!(h["location"], "/_/crons");
+
+        // 3. Backups
+        let (s, _, corpo) = pedir(&e, "GET", "/_/backups", &[("cookie", cookie.as_str())], "").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(corpo.contains("Backups"), "{corpo}");
+
+        // 4. Configurações
+        let (s, _, corpo) = pedir(&e, "GET", "/_/settings", &[("cookie", cookie.as_str())], "").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(corpo.contains("Configurações da Aplicação"), "{corpo}");
+
+        // Salvar configurações pelo painel
+        let (s, _, corpo) = form_post(
+            &e,
+            "/_/settings",
+            Some(&cookie),
+            &[
+                ("appName", "Forjabase Prod"),
+                ("appUrl", "https://forja.exemplo.com"),
+                ("senderName", "Equipe Suporte"),
+                ("senderAddress", "suporte@exemplo.com"),
+                ("smtpEnabled", "true"),
+                ("smtpHost", "smtp.sendgrid.net"),
+                ("smtpPort", "587"),
+            ],
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(corpo.contains("Configurações salvas com sucesso!"), "{corpo}");
+
+        // Confere que persistiu no banco
+        let cfg = e.banco.configuracoes().await;
+        assert_eq!(cfg.app_name, "Forjabase Prod");
+        assert_eq!(cfg.meta.sender_name, "Equipe Suporte");
+        assert!(cfg.smtp.enabled);
+        assert_eq!(cfg.smtp.host, "smtp.sendgrid.net");
     }
 }
