@@ -73,6 +73,11 @@ td.direita, th.direita { text-align:right; white-space:nowrap; }
 .cartao .ajuda { color:var(--fraco); font-size:14px; margin:0 0 20px; }
 .cartao .campo input { font-size:15px; }
 .cartao button { width:100%; margin-top:6px; }
+.linha-campo { display:flex; gap:10px; margin-bottom:10px; align-items:center; }
+.linha-campo input, .linha-campo select { padding:6px 10px; border:1px solid var(--linha); border-radius:8px; font:inherit; background:#fff; }
+.zona-perigo { margin-top:32px; padding:20px; border:1px solid #fecaca; border-radius:10px; background:#fff5f5; max-width:640px; }
+.zona-perigo h3 { margin:0 0 8px; color:#b91c1c; font-size:16px; }
+.zona-perigo p { margin:0 0 14px; font-size:13px; color:var(--fraco); }
 "#;
 
 /// Tela de onboarding do primeiro superusuário (o "usuário mestre").
@@ -197,6 +202,9 @@ pub fn colecoes(itens: &[Collection]) -> Markup {
         div .cabecalho {
             h1 { "Coleções" }
             span .contagem { (itens.len()) " no projeto" }
+            div .acoes {
+                a .botao.solido href="/_/new-collection" { "+ Nova coleção" }
+            }
         }
         @if itens.is_empty() {
             p .vazio { "Nenhuma coleção ainda. Crie uma pela API ou pela CLI." }
@@ -237,6 +245,7 @@ pub fn colecao(c: &Collection, lista: &Lista, filtro: &str) -> Markup {
             h1 { (c.name) }
             span .contagem { (tipo_nome(c.kind)) " · " (lista.total_items) " registros" }
             div .acoes {
+                a .botao href=(format!("/_/collections/{}/settings", c.name)) { "Configurações" }
                 @if c.kind == CollectionType::View {
                     span .etiqueta { "somente leitura" }
                 } @else {
@@ -376,6 +385,208 @@ pub fn nao_encontrado(mensagem: &str) -> Markup {
     }
 }
 
+/// Fragmento de linha para adicionar um campo novo via htmx.
+pub fn linha_campo() -> Markup {
+    html! {
+        div .linha-campo {
+            input type="text" name="field_name" placeholder="Nome do campo (ex: titulo)" required style="flex:2;";
+            select name="field_type" style="flex:1.5;" {
+                option value="text" { "text" }
+                option value="number" { "number" }
+                option value="bool" { "bool" }
+                option value="editor" { "editor" }
+                option value="email" { "email" }
+                option value="url" { "url" }
+                option value="date" { "date" }
+                option value="select" { "select" }
+                option value="file" { "file" }
+                option value="relation" { "relation" }
+                option value="json" { "json" }
+            }
+            select name="field_required" style="flex:1;" {
+                option value="false" { "Opcional" }
+                option value="true" { "Obrigatório" }
+            }
+            button .botao.perigo type="button" onclick="this.closest('.linha-campo').remove()" title="Remover campo" { "✕" }
+        }
+    }
+}
+
+fn campo_regra(rotulo: &str, nome: &str, valor_atual: Option<&str>) -> Markup {
+    let (tipo, expr) = match valor_atual {
+        None => ("super", ""),
+        Some("") => ("public", ""),
+        Some(s) => ("custom", s),
+    };
+    html! {
+        div .campo {
+            label { (rotulo) }
+            div style="display:flex; gap:8px;" {
+                select name=(format!("{nome}_tipo")) style="flex:1;" {
+                    option value="super" selected[tipo == "super"] { "Apenas Superusuário" }
+                    option value="public" selected[tipo == "public"] { "Público (aberto a todos)" }
+                    option value="custom" selected[tipo == "custom"] { "Expressão personalizada" }
+                }
+                input type="text" name=(format!("{nome}_expr")) value=(expr)
+                      placeholder="ex: @request.auth.id != ''" style="flex:2;";
+            }
+        }
+    }
+}
+
+/// Tela para criar uma nova coleção.
+pub fn pagina_nova_colecao(erro: Option<&str>) -> Markup {
+    html! {
+        div .cabecalho {
+            h1 { "Nova Coleção" }
+            div .acoes {
+                a .botao href="/_/" { "Voltar" }
+            }
+        }
+        @if let Some(m) = erro {
+            div .global { (m) }
+        }
+        form .formulario method="post" action="/_/new-collection" {
+            div .campo {
+                label for="name" { "Nome da coleção" span .obrigatorio { " *" } }
+                input type="text" id="name" name="name" required placeholder="ex: artigos, categorias";
+                p .dica { "Apenas letras minúsculas, números e sublinhados." }
+            }
+            div .campo {
+                label for="type" { "Tipo de coleção" }
+                select id="type" name="type" onchange="document.getElementById('bloco-view').style.display = this.value === 'view' ? 'block' : 'none'; document.getElementById('bloco-campos').style.display = this.value === 'view' ? 'none' : 'block';" {
+                    option value="base" selected { "Base (registros normais)" }
+                    option value="auth" { "Auth (usuários com senha/autenticação)" }
+                    option value="view" { "View (consulta SQL somente leitura)" }
+                }
+            }
+            div id="bloco-view" .campo style="display:none;" {
+                label for="view_query" { "Consulta SQL da View (viewQuery)" span .obrigatorio { " *" } }
+                textarea id="view_query" name="view_query" placeholder="SELECT id, nome, preco FROM produtos WHERE ativo = 1" {}
+                p .dica { "A consulta precisa incluir obrigatoriamente a coluna 'id'." }
+            }
+            h2 style="font-size:16px; margin:24px 0 12px;" { "Regras de Acesso" }
+            (campo_regra("Listar registros (listRule)", "list_rule", None))
+            (campo_regra("Visualizar registro (viewRule)", "view_rule", None))
+            (campo_regra("Criar registro (createRule)", "create_rule", None))
+            (campo_regra("Atualizar registro (updateRule)", "update_rule", None))
+            (campo_regra("Apagar registro (deleteRule)", "delete_rule", None))
+
+            div id="bloco-campos" {
+                div style="display:flex; justify-content:space-between; align-items:center; margin:24px 0 12px;" {
+                    h2 style="font-size:16px; margin:0;" { "Campos Personalizados" }
+                    button .botao type="button"
+                           hx-get="/_/htmx/campo-linha"
+                           hx-target="#campos"
+                           hx-swap="beforeend" { "+ Adicionar campo" }
+                }
+                div id="campos" {
+                    (linha_campo())
+                }
+            }
+            div style="margin-top:24px;" {
+                button .botao.solido type="submit" { "Criar coleção" }
+            }
+        }
+    }
+}
+
+/// Tela para editar configurações, regras e adicionar campos a uma coleção existente.
+pub fn pagina_editar_colecao(c: &Collection, erro: Option<&str>) -> Markup {
+    html! {
+        div .cabecalho {
+            h1 { "Configurações: " (c.name) }
+            div .acoes {
+                a .botao href=(format!("/_/collections/{}", c.name)) { "Voltar para registros" }
+            }
+        }
+        @if let Some(m) = erro {
+            div .global { (m) }
+        }
+        form .formulario method="post" action=(format!("/_/collections/{}/settings", c.name)) {
+            div .campo {
+                label for="name" { "Nome da coleção" span .obrigatorio { " *" } }
+                @if c.system {
+                    input type="text" id="name" name="name" value=(c.name) readonly;
+                    p .dica { "O nome de coleções de sistema não pode ser alterado." }
+                } @else {
+                    input type="text" id="name" name="name" value=(c.name) required;
+                }
+            }
+            div .campo {
+                label { "Tipo de coleção" }
+                input type="text" value=(tipo_nome(c.kind)) disabled;
+            }
+            @if c.kind == CollectionType::View {
+                div .campo {
+                    label for="view_query" { "Consulta SQL da View (viewQuery)" span .obrigatorio { " *" } }
+                    textarea id="view_query" name="view_query" required { (c.view_query.as_deref().unwrap_or_default()) }
+                    p .dica { "A consulta precisa incluir obrigatoriamente a coluna 'id'." }
+                }
+            }
+
+            h2 style="font-size:16px; margin:24px 0 12px;" { "Regras de Acesso" }
+            (campo_regra("Listar registros (listRule)", "list_rule", c.list_rule.as_deref()))
+            (campo_regra("Visualizar registro (viewRule)", "view_rule", c.view_rule.as_deref()))
+            @if c.kind != CollectionType::View {
+                (campo_regra("Criar registro (createRule)", "create_rule", c.create_rule.as_deref()))
+                (campo_regra("Atualizar registro (updateRule)", "update_rule", c.update_rule.as_deref()))
+                (campo_regra("Apagar registro (deleteRule)", "delete_rule", c.delete_rule.as_deref()))
+            }
+
+            @if c.kind != CollectionType::View {
+                h2 style="font-size:16px; margin:24px 0 12px;" { "Campos Existentes" }
+                table style="margin-bottom:18px;" {
+                    thead {
+                        tr {
+                            th { "Nome" }
+                            th { "Tipo" }
+                            th { "Obrigatório" }
+                            th { "Origem" }
+                        }
+                    }
+                    tbody {
+                        @for f in &c.fields {
+                            tr {
+                                td { code { (f.name) } }
+                                td { span .etiqueta { (tipo_campo_nome(f.kind)) } }
+                                td { @if f.required { "Sim" } @else { "Não" } }
+                                td { @if f.system { span .etiqueta { "sistema" } } @else { "usuário" } }
+                            }
+                        }
+                    }
+                }
+
+                div style="display:flex; justify-content:space-between; align-items:center; margin:24px 0 12px;" {
+                    h2 style="font-size:16px; margin:0;" { "Adicionar Novos Campos" }
+                    button .botao type="button"
+                           hx-get="/_/htmx/campo-linha"
+                           hx-target="#campos"
+                           hx-swap="beforeend" { "+ Adicionar campo" }
+                }
+                div id="campos" {}
+            }
+
+            div style="margin-top:24px;" {
+                button .botao.solido type="submit" { "Salvar alterações" }
+            }
+        }
+
+        @if !c.system {
+            div .zona-perigo {
+                h3 { "Zona de Perigo" }
+                p { "Excluir esta coleção apagará permanentemente a tabela e todos os registros associados." }
+                form method="post" action=(format!("/_/collections/{}/delete-collection", c.name)) {
+                    button .botao.perigo type="submit"
+                           hx-confirm=(format!("Tem certeza que deseja apagar a coleção '{}' e todos os dados? Esta ação não pode ser desfeita.", c.name)) {
+                        "Excluir coleção"
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ── Auxiliares ───────────────────────────────────────────────────────────
 
 fn tipo_nome(k: CollectionType) -> &'static str {
@@ -383,6 +594,25 @@ fn tipo_nome(k: CollectionType) -> &'static str {
         CollectionType::Base => "base",
         CollectionType::Auth => "auth",
         CollectionType::View => "view",
+    }
+}
+
+fn tipo_campo_nome(k: FieldType) -> &'static str {
+    match k {
+        FieldType::Text => "text",
+        FieldType::Editor => "editor",
+        FieldType::Number => "number",
+        FieldType::Bool => "bool",
+        FieldType::Email => "email",
+        FieldType::Url => "url",
+        FieldType::Date => "date",
+        FieldType::Autodate => "autodate",
+        FieldType::Select => "select",
+        FieldType::File => "file",
+        FieldType::Relation => "relation",
+        FieldType::Json => "json",
+        FieldType::Password => "password",
+        FieldType::GeoPoint => "geoPoint",
     }
 }
 

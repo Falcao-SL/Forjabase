@@ -52,6 +52,14 @@ pub enum Op {
     MenorIgual,
     Contem,
     NaoContem,
+    AlgumIgual,
+    AlgumDiferente,
+    AlgumMaior,
+    AlgumMaiorIgual,
+    AlgumMenor,
+    AlgumMenorIgual,
+    AlgumContem,
+    AlgumNaoContem,
 }
 
 /// Como escrever o SQL: o SQLite usa `?` e `LIKE`; o PostgreSQL, `$1` e `ILIKE`.
@@ -125,6 +133,40 @@ fn tokens(s: &str) -> Resultado<Vec<Token>> {
             '~' => {
                 out.push(Token::Op(Op::Contem));
                 i += 1;
+            }
+            '?' => {
+                let p2 = c.get(i + 2).copied();
+                if prox == Some('=') {
+                    out.push(Token::Op(Op::AlgumIgual));
+                    i += 2;
+                } else if prox == Some('~') {
+                    out.push(Token::Op(Op::AlgumContem));
+                    i += 2;
+                } else if prox == Some('!') && p2 == Some('=') {
+                    out.push(Token::Op(Op::AlgumDiferente));
+                    i += 3;
+                } else if prox == Some('!') && p2 == Some('~') {
+                    out.push(Token::Op(Op::AlgumNaoContem));
+                    i += 3;
+                } else if prox == Some('>') {
+                    let igual = p2 == Some('=');
+                    out.push(Token::Op(if igual {
+                        Op::AlgumMaiorIgual
+                    } else {
+                        Op::AlgumMaior
+                    }));
+                    i += if igual { 3 } else { 2 };
+                } else if prox == Some('<') {
+                    let igual = p2 == Some('=');
+                    out.push(Token::Op(if igual {
+                        Op::AlgumMenorIgual
+                    } else {
+                        Op::AlgumMenor
+                    }));
+                    i += if igual { 3 } else { 2 };
+                } else {
+                    return Err(erro(&format!("unexpected character '{ch}'")));
+                }
             }
             '>' | '<' => {
                 let igual = prox == Some('=');
@@ -271,6 +313,26 @@ pub fn analisar(s: &str) -> Resultado<Expr> {
 // ── SQL ──────────────────────────────────────────────────────────────────
 
 fn coluna(nome: &str, valido: &dyn Fn(&str) -> bool) -> Resultado<String> {
+    if let Some((campo, modif)) = nome.split_once(':') {
+        if campo.contains(['@', '.']) {
+            return Err(Erro::invalido(format!(
+                "Invalid filter: '{nome}' is not supported"
+            )));
+        }
+        if !valido(campo) {
+            return Err(Erro::invalido(format!(
+                "Invalid filter: unknown field '{campo}'"
+            )));
+        }
+        return match modif {
+            "lower" => Ok(format!("LOWER(\"{campo}\")")),
+            "length" => Ok(format!("LENGTH(\"{campo}\")")),
+            "isset" => Ok(format!("\"{campo}\"")),
+            _ => Err(Erro::invalido(format!(
+                "Invalid filter: unknown modifier ':{modif}'"
+            ))),
+        };
+    }
     if nome.contains(['@', '.', ':']) {
         return Err(Erro::invalido(format!(
             "Invalid filter: '{nome}' is not supported yet (macros, relations and modifiers come later)"
@@ -284,6 +346,32 @@ fn coluna(nome: &str, valido: &dyn Fn(&str) -> bool) -> Resultado<String> {
     Ok(format!("\"{nome}\""))
 }
 
+fn civil_a_partir_de_secs(s: i64) -> (i64, u32, u32, u32, u32, u32) {
+    let (dias, resto) = (s.div_euclid(86_400), s.rem_euclid(86_400));
+    let (h, m, seg) = (resto / 3600, resto % 3600 / 60, resto % 60);
+    let z = dias + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let dia = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let mes = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let ano = yoe + era * 400 + if mes <= 2 { 1 } else { 0 };
+    (ano, mes, dia, h as u32, m as u32, seg as u32)
+}
+
+fn dias_no_mes(ano: i64, mes: u32) -> u32 {
+    match mes {
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let bissexto = (ano % 4 == 0 && ano % 100 != 0) || (ano % 400 == 0);
+            if bissexto { 29 } else { 28 }
+        }
+        _ => 31,
+    }
+}
+
 /// Valores que as macros de um filtro podem ler. Sem contexto, a macro vale
 /// vazio — é o caso dos visitantes, como no PocketBase.
 #[derive(Debug, Clone, Default)]
@@ -294,20 +382,70 @@ pub struct Contexto {
 
 impl Contexto {
     fn resolver(&self, nome: &str) -> Resultado<Literal> {
-        let Some(campo) = nome.strip_prefix("@request.auth.") else {
-            return Err(Erro::invalido(format!(
+        if let Some(campo) = nome.strip_prefix("@request.auth.") {
+            let Some(auth) = self.auth.as_ref() else {
+                return Ok(Literal::Texto(String::new()));
+            };
+            return Ok(match auth.get(campo) {
+                Some(serde_json::Value::String(s)) => Literal::Texto(s.clone()),
+                Some(serde_json::Value::Bool(b)) => Literal::Bool(*b),
+                Some(serde_json::Value::Number(n)) => Literal::Numero(n.as_f64().unwrap_or(0.0)),
+                _ => Literal::Texto(String::new()),
+            });
+        }
+
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let d = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let s = d.as_secs() as i64;
+        let ms = d.subsec_millis();
+        let (ano, mes, dia, h, m, seg, _, weekday) = crate::tempo_utc();
+
+        match nome {
+            "@now" => Ok(Literal::Texto(format!(
+                "{ano:04}-{mes:02}-{dia:02} {h:02}:{m:02}:{seg:02}.{ms:03}Z"
+            ))),
+            "@yesterday" => {
+                let (y_ano, y_mes, y_dia, y_h, y_m, y_seg) = civil_a_partir_de_secs(s - 86_400);
+                Ok(Literal::Texto(format!(
+                    "{y_ano:04}-{y_mes:02}-{y_dia:02} {y_h:02}:{y_m:02}:{y_seg:02}.{ms:03}Z"
+                )))
+            }
+            "@tomorrow" => {
+                let (t_ano, t_mes, t_dia, t_h, t_m, t_seg) = civil_a_partir_de_secs(s + 86_400);
+                Ok(Literal::Texto(format!(
+                    "{t_ano:04}-{t_mes:02}-{t_dia:02} {t_h:02}:{t_m:02}:{t_seg:02}.{ms:03}Z"
+                )))
+            }
+            "@todayStart" => Ok(Literal::Texto(format!(
+                "{ano:04}-{mes:02}-{dia:02} 00:00:00.000Z"
+            ))),
+            "@todayEnd" => Ok(Literal::Texto(format!(
+                "{ano:04}-{mes:02}-{dia:02} 23:59:59.999Z"
+            ))),
+            "@monthStart" => Ok(Literal::Texto(format!(
+                "{ano:04}-{mes:02}-01 00:00:00.000Z"
+            ))),
+            "@monthEnd" => {
+                let ld = dias_no_mes(ano, mes);
+                Ok(Literal::Texto(format!(
+                    "{ano:04}-{mes:02}-{ld:02} 23:59:59.999Z"
+                )))
+            }
+            "@yearStart" => Ok(Literal::Texto(format!("{ano:04}-01-01 00:00:00.000Z"))),
+            "@yearEnd" => Ok(Literal::Texto(format!("{ano:04}-12-31 23:59:59.999Z"))),
+            "@second" => Ok(Literal::Numero(seg as f64)),
+            "@minute" => Ok(Literal::Numero(m as f64)),
+            "@hour" => Ok(Literal::Numero(h as f64)),
+            "@day" => Ok(Literal::Numero(dia as f64)),
+            "@month" => Ok(Literal::Numero(mes as f64)),
+            "@year" => Ok(Literal::Numero(ano as f64)),
+            "@weekday" => Ok(Literal::Numero(weekday as f64)),
+            _ => Err(Erro::invalido(format!(
                 "Invalid filter: macro '{nome}' is not supported yet"
-            )));
-        };
-        let Some(auth) = self.auth.as_ref() else {
-            return Ok(Literal::Texto(String::new()));
-        };
-        Ok(match auth.get(campo) {
-            Some(serde_json::Value::String(s)) => Literal::Texto(s.clone()),
-            Some(serde_json::Value::Bool(b)) => Literal::Bool(*b),
-            Some(serde_json::Value::Number(n)) => Literal::Numero(n.as_f64().unwrap_or(0.0)),
-            _ => Literal::Texto(String::new()),
-        })
+            ))),
+        }
     }
 }
 
@@ -346,7 +484,15 @@ impl Escritor<'_> {
                 let col = coluna(n, self.valido)?;
                 if self.qualificar {
                     let tabela = self.escopo.map(|e| e.tabela).unwrap_or("");
-                    Ok(format!("\"{tabela}\".{col}"))
+                    if let Some((campo, modif)) = n.split_once(':') {
+                        match modif {
+                            "lower" => Ok(format!("LOWER(\"{tabela}\".\"{campo}\")")),
+                            "length" => Ok(format!("LENGTH(\"{tabela}\".\"{campo}\")")),
+                            _ => Ok(format!("\"{tabela}\".{col}")),
+                        }
+                    } else {
+                        Ok(format!("\"{tabela}\".{col}"))
+                    }
                 } else {
                     Ok(col)
                 }
@@ -502,6 +648,57 @@ impl Escritor<'_> {
     }
 
     fn comparacao(&mut self, esq: &Operando, op: Op, dir: &Operando) -> Resultado<String> {
+        if let Operando::Campo(n) = esq
+            && let Some((campo, "isset")) = n.split_once(':')
+        {
+                if !(self.valido)(campo) {
+                    return Err(Erro::invalido(format!(
+                        "Invalid filter: unknown field '{campo}'"
+                    )));
+                }
+                let bool_val = match dir {
+                    Operando::Valor(Literal::Bool(b)) => *b,
+                    Operando::Valor(Literal::Texto(s)) if s == "true" => true,
+                    Operando::Valor(Literal::Texto(s)) if s == "false" => false,
+                    _ => {
+                        return Err(Erro::invalido(
+                            "Invalid filter: ':isset' modifier expects a boolean",
+                        ));
+                    }
+                };
+                let quer_definido = match op {
+                    Op::Igual => bool_val,
+                    Op::Diferente => !bool_val,
+                    _ => {
+                        return Err(Erro::invalido(
+                            "Invalid filter: ':isset' modifier only supports '=' and '!='",
+                        ));
+                    }
+                };
+                let col = if self.qualificar {
+                    let tabela = self.escopo.map(|e| e.tabela).unwrap_or("");
+                    format!("\"{tabela}\".\"{campo}\"")
+                } else {
+                    format!("\"{campo}\"")
+                };
+                return Ok(match self.dialeto {
+                    Dialeto::Sqlite => {
+                        if quer_definido {
+                            format!("({col} IS NOT NULL AND {col} != '')")
+                        } else {
+                            format!("({col} IS NULL OR {col} = '')")
+                        }
+                    }
+                    Dialeto::Postgres => {
+                        if quer_definido {
+                            format!("({col} IS NOT NULL AND {col}::text != '')")
+                        } else {
+                            format!("({col} IS NULL OR {col}::text = '')")
+                        }
+                    }
+                });
+            }
+
         // `campo = null` vale para vazio também, como no PocketBase.
         let nulo = |o: &Operando| matches!(o, Operando::Valor(Literal::Nulo));
         if matches!(op, Op::Igual | Op::Diferente) && (nulo(esq) || nulo(dir)) {
@@ -541,6 +738,73 @@ impl Escritor<'_> {
             let nao = if op == Op::NaoContem { "NOT " } else { "" };
             return Ok(format!("{col} {nao}{like} {m} ESCAPE '\\'"));
         }
+        if matches!(op, Op::AlgumContem | Op::AlgumNaoContem) {
+            let col = self.operando(esq)?;
+            let padrao = match dir {
+                Operando::Valor(Literal::Texto(t)) if t.contains('%') => t.clone(),
+                Operando::Valor(Literal::Texto(t)) => {
+                    format!(
+                        "%{}%",
+                        t.replace('\\', "\\\\")
+                            .replace('%', "\\%")
+                            .replace('_', "\\_")
+                    )
+                }
+                Operando::Valor(Literal::Numero(n)) => format!("%{n}%"),
+                _ => return Err(Erro::invalido("Invalid filter: '?~' needs a text value")),
+            };
+            let like = match self.dialeto {
+                Dialeto::Sqlite => "LIKE",
+                Dialeto::Postgres => "ILIKE",
+            };
+            let nao = if op == Op::AlgumNaoContem { "NOT " } else { "" };
+            return Ok(match self.dialeto {
+                Dialeto::Sqlite => {
+                    let m1 = self.marcador(Literal::Texto(padrao.clone()));
+                    let m2 = self.marcador(Literal::Texto(padrao));
+                    format!(
+                        "(CASE WHEN json_valid({col}) THEN EXISTS (SELECT 1 FROM json_each({col}) WHERE json_each.value {nao}{like} {m1} ESCAPE '\\') ELSE {col} {nao}{like} {m2} ESCAPE '\\' END)"
+                    )
+                }
+                Dialeto::Postgres => {
+                    let m = self.marcador(Literal::Texto(padrao));
+                    format!("{col}::text {nao}{like} {m} ESCAPE '\\'")
+                }
+            });
+        }
+        if matches!(
+            op,
+            Op::AlgumIgual
+                | Op::AlgumDiferente
+                | Op::AlgumMaior
+                | Op::AlgumMaiorIgual
+                | Op::AlgumMenor
+                | Op::AlgumMenorIgual
+        ) {
+            let simbolo = match op {
+                Op::AlgumIgual => "=",
+                Op::AlgumDiferente => "!=",
+                Op::AlgumMaior => ">",
+                Op::AlgumMaiorIgual => ">=",
+                Op::AlgumMenor => "<",
+                Op::AlgumMenorIgual => "<=",
+                _ => unreachable!(),
+            };
+            let col = self.operando(esq)?;
+            return Ok(match self.dialeto {
+                Dialeto::Sqlite => {
+                    let val1 = self.operando(dir)?;
+                    let val2 = self.operando(dir)?;
+                    format!(
+                        "(CASE WHEN json_valid({col}) THEN EXISTS (SELECT 1 FROM json_each({col}) WHERE json_each.value {simbolo} {val1}) ELSE {col} {simbolo} {val2} END)"
+                    )
+                }
+                Dialeto::Postgres => {
+                    let val = self.operando(dir)?;
+                    format!("{col}::text {simbolo} {val}")
+                }
+            });
+        }
         let simbolo = match op {
             Op::Igual => "=",
             Op::Diferente => "!=",
@@ -548,7 +812,7 @@ impl Escritor<'_> {
             Op::MaiorIgual => ">=",
             Op::Menor => "<",
             Op::MenorIgual => "<=",
-            Op::Contem | Op::NaoContem => unreachable!(),
+            _ => unreachable!(),
         };
         Ok(format!(
             "{} {simbolo} {}",
@@ -932,5 +1196,67 @@ mod tests {
         );
         assert!(e.is_err());
         assert!(para_sql("@collection.comentarios.id = id", &campos, Dialeto::Sqlite).is_err());
+    }
+
+    #[test]
+    fn operadores_algum_item_para_arrays_e_escalares() {
+        let campos_ext = |c: &str| matches!(c, "id" | "nome" | "tags" | "idade");
+        let s = para_sql("tags ?= 'rust'", &campos_ext, Dialeto::Sqlite).unwrap();
+        assert!(s.texto.contains("json_valid(\"tags\")"));
+        assert!(s.texto.contains("json_each.value = ?"));
+        assert_eq!(s.params, vec![Literal::Texto("rust".into()), Literal::Texto("rust".into())]);
+
+        let s_contem = para_sql("tags ?~ 'rus'", &campos_ext, Dialeto::Sqlite).unwrap();
+        assert!(s_contem.texto.contains("json_each.value LIKE ?"));
+        assert_eq!(s_contem.params, vec![Literal::Texto("%rus%".into()), Literal::Texto("%rus%".into())]);
+
+        let s_maior = para_sql("idade ?> 18", &campos_ext, Dialeto::Sqlite).unwrap();
+        assert!(s_maior.texto.contains("json_each.value > ?"));
+        assert_eq!(s_maior.params, vec![Literal::Numero(18.0), Literal::Numero(18.0)]);
+    }
+
+    #[test]
+    fn macros_de_data_e_modificadores() {
+        // 1. Modificadores :lower e :length
+        let s_lower = sql("nome:lower = 'ana'");
+        assert_eq!(s_lower.texto, "LOWER(\"nome\") = ?");
+        assert_eq!(s_lower.params, vec![Literal::Texto("ana".into())]);
+
+        let s_len = sql("nome:length > 5");
+        assert_eq!(s_len.texto, "LENGTH(\"nome\") > ?");
+        assert_eq!(s_len.params, vec![Literal::Numero(5.0)]);
+
+        // 2. Modificador :isset
+        let s_isset_t = sql("nome:isset = true");
+        assert_eq!(s_isset_t.texto, "(\"nome\" IS NOT NULL AND \"nome\" != '')");
+
+        let s_isset_f = sql("nome:isset = false");
+        assert_eq!(s_isset_f.texto, "(\"nome\" IS NULL OR \"nome\" = '')");
+
+        let s_isset_diff = sql("nome:isset != true");
+        assert_eq!(s_isset_diff.texto, "(\"nome\" IS NULL OR \"nome\" = '')");
+
+        // 3. Macros de data
+        let s_now = sql("nome >= @now");
+        assert_eq!(s_now.texto, "\"nome\" >= ?");
+        assert!(matches!(s_now.params.first(), Some(Literal::Texto(s)) if s.ends_with('Z')));
+
+        let s_start = sql("nome >= @todayStart");
+        assert_eq!(s_start.texto, "\"nome\" >= ?");
+        assert!(matches!(s_start.params.first(), Some(Literal::Texto(s)) if s.ends_with(" 00:00:00.000Z")));
+
+        let s_end = sql("nome <= @todayEnd");
+        assert_eq!(s_end.texto, "\"nome\" <= ?");
+        assert!(matches!(s_end.params.first(), Some(Literal::Texto(s)) if s.ends_with(" 23:59:59.999Z")));
+
+        let s_mstart = sql("nome >= @monthStart");
+        assert!(matches!(s_mstart.params.first(), Some(Literal::Texto(s)) if s.ends_with("-01 00:00:00.000Z")));
+
+        let s_mend = sql("nome <= @monthEnd");
+        assert!(matches!(s_mend.params.first(), Some(Literal::Texto(s)) if s.ends_with(" 23:59:59.999Z")));
+
+        let s_yr = sql("@year >= 2026");
+        assert_eq!(s_yr.texto, "? >= ?");
+        assert_eq!(s_yr.params, vec![Literal::Numero(2026.0), Literal::Numero(2026.0)]);
     }
 }

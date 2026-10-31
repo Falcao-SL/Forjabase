@@ -98,6 +98,8 @@ struct Inscricao {
     /// `None` é a coleção inteira (`nome` ou `nome/*`).
     id: Option<String>,
     filtro: Option<String>,
+    expand: Option<String>,
+    fields: Option<String>,
     bruto: String,
 }
 
@@ -137,6 +139,8 @@ impl Hub {
                                 colecao: i.colecao.clone(),
                                 id: i.id.clone(),
                                 filtro: i.filtro.clone(),
+                                expand: i.expand.clone(),
+                                fields: i.fields.clone(),
                                 bruto: i.bruto.clone(),
                             })
                             .collect(),
@@ -176,7 +180,24 @@ impl Hub {
                         Err(_) => continue,
                     }
                 };
-                let registro = esconder(&colecao, &sessao.chamador(), bruto);
+                let mut registro = bruto;
+                if let Some(exp) = ins.expand.as_deref().filter(|s| !s.trim().is_empty()) {
+                    let mut itens = vec![registro];
+                    let _ = banco
+                        .expandir(
+                            &colecao,
+                            &mut itens,
+                            exp,
+                            sessao.superusuario.is_some(),
+                            &sessao.contexto(),
+                        )
+                        .await;
+                    registro = itens.pop().unwrap_or(Value::Null);
+                }
+                let mut registro = esconder(&colecao, &sessao.chamador(), registro);
+                if let Some(fields) = ins.fields.as_deref().filter(|s| !s.trim().is_empty()) {
+                    registro = super::filtrar_campos(registro, fields);
+                }
                 let data = json!({
                     "action": acao_nome(ev.acao),
                     "record": registro,
@@ -392,7 +413,7 @@ fn analisar(bruto: &str) -> Result<Inscricao, String> {
         return Err("Invalid subscription.".into());
     }
     let (caminho, query) = bruto.split_once('?').unwrap_or((bruto, ""));
-    let filtro = filtro_de_opcoes(query)?;
+    let (filtro, expand, fields) = opcoes_de_query(query)?;
     let mut partes = caminho.split('/');
     let colecao = partes.next().unwrap_or("");
     if !nome_colecao(colecao) {
@@ -410,29 +431,53 @@ fn analisar(bruto: &str) -> Result<Inscricao, String> {
         colecao: colecao.to_string(),
         id,
         filtro,
+        expand,
+        fields,
         bruto: bruto.to_string(),
     })
 }
 
-fn filtro_de_opcoes(query: &str) -> Result<Option<String>, String> {
+type QueryOpcoes = (Option<String>, Option<String>, Option<String>);
+
+fn opcoes_de_query(
+    query: &str,
+) -> Result<QueryOpcoes, String> {
     if query.is_empty() {
-        return Ok(None);
+        return Ok((None, None, None));
     }
     let mut filtro = None;
+    let mut expand = None;
+    let mut fields = None;
     for (k, v) in form_urlencoded::parse(query.as_bytes()) {
-        if k != "options" {
-            continue;
+        if k == "options" {
+            let valor: Value =
+                serde_json::from_str(&v).map_err(|_| "Invalid subscription.".to_string())?;
+            if let Some(q) = valor.get("query") {
+                filtro = q
+                    .get("filter")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .filter(|s| !s.trim().is_empty());
+                expand = q
+                    .get("expand")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .filter(|s| !s.trim().is_empty());
+                fields = q
+                    .get("fields")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .filter(|s| !s.trim().is_empty());
+            }
+        } else if k == "filter" {
+            filtro = Some(v.into_owned()).filter(|s| !s.trim().is_empty());
+        } else if k == "expand" {
+            expand = Some(v.into_owned()).filter(|s| !s.trim().is_empty());
+        } else if k == "fields" {
+            fields = Some(v.into_owned()).filter(|s| !s.trim().is_empty());
         }
-        let valor: Value =
-            serde_json::from_str(&v).map_err(|_| "Invalid subscription.".to_string())?;
-        filtro = valor
-            .get("query")
-            .and_then(|q| q.get("filter"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .filter(|s| !s.trim().is_empty());
     }
-    Ok(filtro)
+    Ok((filtro, expand, fields))
 }
 
 fn nome_colecao(n: &str) -> bool {

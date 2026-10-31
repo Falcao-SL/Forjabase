@@ -77,10 +77,10 @@ pub struct Superusuario {
 }
 
 /// Configurações do projeto, com os mesmos nomes do PocketBase.
-///
-/// Ficam em `_params` (linha `settings`), como no PocketBase, e não carregam
-/// segredos: SMTP e S3 chegam nas ondas seguintes, quando existirem.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub use crate::arquivos::{DiscoLocal, ProvedorStorage, S3Config, S3Storage};
+
+/// Configurações gerais do projeto (armazenadas em `_params` sob `settings`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Configuracoes {
     #[serde(default = "Configuracoes::app_name_padrao")]
@@ -91,6 +91,8 @@ pub struct Configuracoes {
     /// Vazio = qualquer e-mail (o segredo de instalação continua obrigatório).
     #[serde(default)]
     pub installer_emails: Vec<String>,
+    #[serde(default)]
+    pub s3: S3Config,
 }
 
 impl Configuracoes {
@@ -108,6 +110,7 @@ impl Default for Configuracoes {
             app_name: Configuracoes::app_name_padrao(),
             app_url: Configuracoes::app_url_padrao(),
             installer_emails: Vec::new(),
+            s3: S3Config::default(),
         }
     }
 }
@@ -406,20 +409,13 @@ impl Banco {
         if gravar.is_empty() {
             return Ok(());
         }
-        let Some(pasta) = self.pasta.clone() else {
-            return Err(Erro::invalido("File storage is not available."));
-        };
-        let gravar = gravar.to_vec();
-        let colecao = colecao.to_string();
-        let registro = registro.to_string();
-        tokio::task::spawn_blocking(move || {
-            for g in gravar {
-                arquivos::gravar(&pasta, &colecao, &registro, &g.nome, &g.bytes)?;
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|e| Erro::Interno(e.to_string()))?
+        let storage = self.storage().await;
+        for g in gravar {
+            storage
+                .gravar(colecao, registro, &g.nome, &g.bytes, "")
+                .await?;
+        }
+        Ok(())
     }
 
     fn esquecer_nomes(&self, colecao: &str, registro: &str, nomes: &[String]) {
@@ -1413,8 +1409,14 @@ impl Banco {
         }
     }
 
+    /// Testa a consulta de uma view sem persistir (dry-run-view).
+    pub async fn dry_run_view(&self, query: &str) -> Resultado<Vec<Field>> {
+        let q = crate::view::normalizar_consulta(query)?;
+        self.campos_da_consulta(&q).await
+    }
+
     /// Cria uma view temporária, lê as colunas e apaga. O `id` é obrigatório.
-    async fn campos_da_consulta(&self, query: &str) -> Resultado<Vec<Field>> {
+    pub async fn campos_da_consulta(&self, query: &str) -> Resultado<Vec<Field>> {
         let temp = format!("_forja_probe_{}", id::aleatorio(12));
         if let Err(e) = self
             .ex
@@ -1633,6 +1635,21 @@ impl Banco {
         Ok(c.clone())
     }
 
+    /// Obtém o provedor de arquivos (S3 se configurado e habilitado, ou disco local).
+    pub async fn storage(&self) -> Arc<dyn ProvedorStorage> {
+        let cfg = self.configuracoes().await;
+        if cfg.s3.enabled && !cfg.s3.bucket.is_empty() {
+            Arc::new(S3Storage::new(cfg.s3))
+        } else {
+            let raiz = self
+                .pasta
+                .as_ref()
+                .map(|p| (**p).clone())
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            Arc::new(DiscoLocal::new(raiz))
+        }
+    }
+
     pub async fn colecoes(&self) -> Resultado<Vec<Collection>> {
         let l = self
             .ex
@@ -1829,6 +1846,128 @@ impl Banco {
             self.agendar_diretorio(arquivos::pasta_colecao(pasta, &c.id));
         }
         Ok(())
+    }
+
+    pub async fn atualizar_colecao(
+        &self,
+        id_ou_nome: &str,
+        mut c: Collection,
+    ) -> Resultado<Collection> {
+        let antiga = self.colecao(id_ou_nome).await?;
+        let d = self.dialeto();
+        c.id = antiga.id.clone();
+        c.system = antiga.system;
+        if antiga.system && c.name != antiga.name {
+            return Err(Erro::invalido("System collection name cannot be changed."));
+        }
+        if c.kind != antiga.kind {
+            return Err(Erro::invalido("Collection type cannot be changed."));
+        }
+        if c.kind == CollectionType::Auth {
+            c.fields = injetar_campos_auth(c.fields);
+        }
+        if c.kind == CollectionType::View {
+            let q = match c.view_query.as_deref().or(antiga.view_query.as_deref()) {
+                Some(q) => crate::view::normalizar_consulta(q)?,
+                None => {
+                    return Err(crate::view::erro_consulta(
+                        "validation_required",
+                        "Cannot be blank.".into(),
+                    ));
+                }
+            };
+            c.fields = self.campos_da_consulta(&q).await?;
+            c.view_query = Some(q);
+            c.create_rule = None;
+            c.update_rule = None;
+            c.delete_rule = None;
+            c.indexes.clear();
+        } else {
+            c.view_query = None;
+        }
+        validar_colecao(&c)?;
+        for f in &mut c.fields {
+            if f.id.is_empty() {
+                let tipo = serde_json::to_value(f.kind)
+                    .ok()
+                    .and_then(|v| v.as_str().map(String::from))
+                    .unwrap_or_default();
+                f.id = format!("{tipo}{}", id::aleatorio(10));
+            }
+        }
+        self.normalizar_relacoes(&mut c).await?;
+        self.validar_regras(&c).await?;
+
+        if !c.name.eq_ignore_ascii_case(&antiga.name) {
+            let existe = self
+                .contar(
+                    "SELECT COUNT(*) FROM \"_collections\" WHERE lower(\"name\") = lower(?) AND \"id\" != ?",
+                    vec![c.name.clone().into(), c.id.clone().into()],
+                )
+                .await?;
+            if existe > 0 {
+                let mut erros = Map::new();
+                erro_campo(
+                    &mut erros,
+                    "name",
+                    "validation_collection_name_exists",
+                    "Collection name must be unique (case insensitive).".into(),
+                );
+                return Err(invalido("Failed to update collection.", erros));
+            }
+        }
+
+        let mut comandos = Vec::new();
+        if c.name != antiga.name {
+            if c.kind == CollectionType::View {
+                comandos.push((format!("DROP VIEW IF EXISTS \"{}\"", antiga.name), vec![]));
+                let q = c.view_query.clone().unwrap_or_default();
+                comandos.push((format!("CREATE VIEW \"{}\" AS {q}", c.name), vec![]));
+            } else {
+                comandos.push((
+                    format!("ALTER TABLE \"{}\" RENAME TO \"{}\"", antiga.name, c.name),
+                    vec![],
+                ));
+            }
+        } else if c.kind == CollectionType::View && c.view_query != antiga.view_query {
+            comandos.push((format!("DROP VIEW IF EXISTS \"{}\"", antiga.name), vec![]));
+            let q = c.view_query.clone().unwrap_or_default();
+            comandos.push((format!("CREATE VIEW \"{}\" AS {q}", c.name), vec![]));
+        }
+
+        if c.kind != CollectionType::View {
+            let tabela = if c.name != antiga.name { &c.name } else { &antiga.name };
+            for f in &c.fields {
+                if !antiga.fields.iter().any(|old| old.name.eq_ignore_ascii_case(&f.name)) {
+                    comandos.push((
+                        format!("ALTER TABLE \"{tabela}\" ADD COLUMN \"{}\" {}", f.name, tipo_sql(f, d)),
+                        vec![],
+                    ));
+                }
+            }
+        }
+
+        c.created = antiga.created;
+        c.updated = agora();
+        comandos.push((
+            "UPDATE \"_collections\" SET \"name\" = ?, \"fields\" = ?, \"listRule\" = ?, \"viewRule\" = ?, \"createRule\" = ?, \"updateRule\" = ?, \"deleteRule\" = ?, \"indexes\" = ?, \"updated\" = ?, \"viewQuery\" = ? WHERE \"id\" = ?".into(),
+            vec![
+                c.name.clone().into(),
+                serde_json::to_string(&c.fields).unwrap_or_else(|_| "[]".into()).into(),
+                c.list_rule.clone().into(),
+                c.view_rule.clone().into(),
+                c.create_rule.clone().into(),
+                c.update_rule.clone().into(),
+                c.delete_rule.clone().into(),
+                serde_json::to_string(&c.indexes).unwrap_or_else(|_| "[]".into()).into(),
+                c.updated.clone().into(),
+                c.view_query.clone().into(),
+                c.id.clone().into(),
+            ],
+        ));
+
+        self.ex.lote(comandos).await?;
+        Ok(c)
     }
 
     pub async fn listar(&self, c: &Collection, q: &Consulta) -> Resultado<Lista> {
@@ -3694,6 +3833,69 @@ mod tests {
         );
         assert!(!c.coluna_valida("password"));
         assert!(!c.coluna_valida("tokenKey"));
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn colecao_produtos() -> Collection {
+        serde_json::from_value(json!({
+            "name": "produtos",
+            "type": "base",
+            "fields": [
+                { "name": "nome", "type": "text" },
+                { "name": "preco", "type": "number" }
+            ]
+        }))
+        .unwrap()
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn atualizar_colecao_renomeia_e_adiciona_colunas() {
+        let b = Banco::sqlite_memoria().await.unwrap();
+        let mut c = b.criar_colecao(colecao_produtos()).await.unwrap();
+        assert_eq!(c.name, "produtos");
+
+        // Altera nome da coleção e acrescenta uma coluna 'estoque'
+        c.name = "itens".into();
+        c.fields.push(Field {
+            id: String::new(),
+            name: "estoque".into(),
+            kind: FieldType::Number,
+            required: false,
+            hidden: false,
+            system: false,
+            options: Map::new(),
+        });
+        let id = c.id.clone();
+        let atualizada = b.atualizar_colecao(&id, c).await.unwrap();
+        assert_eq!(atualizada.name, "itens");
+        assert!(atualizada.campo("estoque").is_some());
+
+        // Cria registro na tabela renomeada com a nova coluna
+        let r = b
+            .criar(
+                &atualizada,
+                json!({ "nome": "Teclado", "preco": 150.0, "estoque": 10 })
+                    .as_object()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.get("estoque").and_then(Value::as_f64), Some(10.0));
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn dry_run_view_valida_consulta() {
+        let b = Banco::sqlite_memoria().await.unwrap();
+        b.criar_colecao(colecao_produtos()).await.unwrap();
+
+        // Consulta válida retorna os campos inferidos (sem o 'id' que é coluna primária implícita)
+        let campos = b.dry_run_view("SELECT id, nome FROM produtos").await.unwrap();
+        assert!(campos.iter().any(|f| f.name == "nome"));
+
+        // Consulta sem id falha com erro de validação
+        assert!(b.dry_run_view("SELECT nome FROM produtos").await.is_err());
     }
 
     #[cfg(feature = "sqlite")]

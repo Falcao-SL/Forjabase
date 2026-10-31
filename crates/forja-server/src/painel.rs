@@ -14,7 +14,7 @@ use axum::{Form, Router};
 use forja_admin as admin;
 use forja_core::auth::{self, COLECAO_SUPERUSERS, TIPO_AUTH, VALIDADE_SUPERUSER};
 use forja_core::store::{Consulta, Lista, Superusuario};
-use forja_core::{Collection, CollectionType, Erro, FieldType};
+use forja_core::{Collection, CollectionType, Erro, Field, FieldType};
 use maud::Markup;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -28,6 +28,19 @@ pub fn rotas() -> Router<Estado> {
         .route("/_/login", get(login_form).post(login))
         .route("/_/logout", post(logout))
         .route("/_/htmx.min.js", get(htmx))
+        .route("/_/htmx/campo-linha", get(htmx_campo_linha))
+        .route(
+            "/_/new-collection",
+            get(nova_colecao_form).post(nova_colecao_criar),
+        )
+        .route(
+            "/_/collections/{nome}/settings",
+            get(colecao_settings_form).post(colecao_settings_salvar),
+        )
+        .route(
+            "/_/collections/{nome}/delete-collection",
+            post(colecao_apagar),
+        )
         .route("/_/collections/{nome}", get(colecao_pagina).post(criar))
         .route("/_/collections/{nome}/new", get(novo_form))
         .route("/_/collections/{nome}/tabela", get(tabela))
@@ -140,6 +153,249 @@ async fn htmx() -> Response {
         Body::from(admin::HTMX),
     )
         .into_response()
+}
+
+async fn htmx_campo_linha(State(e): State<Estado>, headers: HeaderMap) -> Response {
+    if sessao(&e, &headers).await.is_none() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    Html(admin::linha_campo().into_string()).into_response()
+}
+
+async fn nova_colecao_form(State(e): State<Estado>, headers: HeaderMap) -> Response {
+    if sessao(&e, &headers).await.is_none() {
+        return entrar();
+    }
+    html(admin::pagina("Nova Coleção", admin::pagina_nova_colecao(None)))
+}
+
+async fn nova_colecao_criar(
+    State(e): State<Estado>,
+    headers: HeaderMap,
+    corpo: Bytes,
+) -> Response {
+    if sessao(&e, &headers).await.is_none() {
+        return entrar();
+    }
+    let p = pares(&corpo);
+    let nome = p
+        .iter()
+        .find(|(k, _)| k == "name")
+        .map(|(_, v)| v.trim())
+        .unwrap_or("");
+    if nome.is_empty() {
+        return html(admin::pagina(
+            "Nova Coleção",
+            admin::pagina_nova_colecao(Some("O nome da coleção é obrigatório.")),
+        ));
+    }
+    let tipo_str = p
+        .iter()
+        .find(|(k, _)| k == "type")
+        .map(|(_, v)| v.trim())
+        .unwrap_or("base");
+    let kind = match tipo_str {
+        "auth" => CollectionType::Auth,
+        "view" => CollectionType::View,
+        _ => CollectionType::Base,
+    };
+    let view_query = p
+        .iter()
+        .find(|(k, _)| k == "view_query")
+        .map(|(_, v)| v.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let list_rule = regra_do_form(
+        p.iter().find(|(k, _)| k == "list_rule_tipo").map(|(_, v)| v.as_str()),
+        p.iter().find(|(k, _)| k == "list_rule_expr").map(|(_, v)| v.as_str()),
+    );
+    let view_rule = regra_do_form(
+        p.iter().find(|(k, _)| k == "view_rule_tipo").map(|(_, v)| v.as_str()),
+        p.iter().find(|(k, _)| k == "view_rule_expr").map(|(_, v)| v.as_str()),
+    );
+    let create_rule = if kind == CollectionType::View {
+        None
+    } else {
+        regra_do_form(
+            p.iter().find(|(k, _)| k == "create_rule_tipo").map(|(_, v)| v.as_str()),
+            p.iter().find(|(k, _)| k == "create_rule_expr").map(|(_, v)| v.as_str()),
+        )
+    };
+    let update_rule = if kind == CollectionType::View {
+        None
+    } else {
+        regra_do_form(
+            p.iter().find(|(k, _)| k == "update_rule_tipo").map(|(_, v)| v.as_str()),
+            p.iter().find(|(k, _)| k == "update_rule_expr").map(|(_, v)| v.as_str()),
+        )
+    };
+    let delete_rule = if kind == CollectionType::View {
+        None
+    } else {
+        regra_do_form(
+            p.iter().find(|(k, _)| k == "delete_rule_tipo").map(|(_, v)| v.as_str()),
+            p.iter().find(|(k, _)| k == "delete_rule_expr").map(|(_, v)| v.as_str()),
+        )
+    };
+
+    let fields = if kind == CollectionType::View {
+        Vec::new()
+    } else {
+        campos_do_form(&p)
+    };
+
+    let col = Collection {
+        id: String::new(),
+        name: nome.to_string(),
+        kind,
+        system: false,
+        fields,
+        list_rule,
+        view_rule,
+        create_rule,
+        update_rule,
+        delete_rule,
+        indexes: Vec::new(),
+        view_query,
+        created: String::new(),
+        updated: String::new(),
+    };
+
+    match e.banco.criar_colecao(col).await {
+        Ok(criada) => Redirect::to(&format!("/_/collections/{}", criada.name)).into_response(),
+        Err(erro) => html(admin::pagina(
+            "Nova Coleção",
+            admin::pagina_nova_colecao(Some(&erro.to_string())),
+        )),
+    }
+}
+
+async fn colecao_settings_form(
+    State(e): State<Estado>,
+    headers: HeaderMap,
+    Path(nome): Path<String>,
+) -> Response {
+    if sessao(&e, &headers).await.is_none() {
+        return entrar();
+    }
+    let Ok(c) = e.banco.colecao(&nome).await else {
+        return pagina_erro(Erro::NaoEncontrado(format!("A coleção '{nome}' não existe.")));
+    };
+    html(admin::pagina(
+        &format!("Configurações: {}", c.name),
+        admin::pagina_editar_colecao(&c, None),
+    ))
+}
+
+async fn colecao_settings_salvar(
+    State(e): State<Estado>,
+    headers: HeaderMap,
+    Path(nome): Path<String>,
+    corpo: Bytes,
+) -> Response {
+    if sessao(&e, &headers).await.is_none() {
+        return entrar();
+    }
+    let Ok(antiga) = e.banco.colecao(&nome).await else {
+        return pagina_erro(Erro::NaoEncontrado(format!("A coleção '{nome}' não existe.")));
+    };
+    let p = pares(&corpo);
+    let novo_nome = if antiga.system {
+        antiga.name.clone()
+    } else {
+        p.iter()
+            .find(|(k, _)| k == "name")
+            .map(|(_, v)| v.trim())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&antiga.name)
+            .to_string()
+    };
+
+    let view_query = if antiga.kind == CollectionType::View {
+        p.iter()
+            .find(|(k, _)| k == "view_query")
+            .map(|(_, v)| v.trim().to_string())
+            .filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+
+    let list_rule = regra_do_form(
+        p.iter().find(|(k, _)| k == "list_rule_tipo").map(|(_, v)| v.as_str()),
+        p.iter().find(|(k, _)| k == "list_rule_expr").map(|(_, v)| v.as_str()),
+    );
+    let view_rule = regra_do_form(
+        p.iter().find(|(k, _)| k == "view_rule_tipo").map(|(_, v)| v.as_str()),
+        p.iter().find(|(k, _)| k == "view_rule_expr").map(|(_, v)| v.as_str()),
+    );
+    let create_rule = if antiga.kind == CollectionType::View {
+        None
+    } else {
+        regra_do_form(
+            p.iter().find(|(k, _)| k == "create_rule_tipo").map(|(_, v)| v.as_str()),
+            p.iter().find(|(k, _)| k == "create_rule_expr").map(|(_, v)| v.as_str()),
+        )
+    };
+    let update_rule = if antiga.kind == CollectionType::View {
+        None
+    } else {
+        regra_do_form(
+            p.iter().find(|(k, _)| k == "update_rule_tipo").map(|(_, v)| v.as_str()),
+            p.iter().find(|(k, _)| k == "update_rule_expr").map(|(_, v)| v.as_str()),
+        )
+    };
+    let delete_rule = if antiga.kind == CollectionType::View {
+        None
+    } else {
+        regra_do_form(
+            p.iter().find(|(k, _)| k == "delete_rule_tipo").map(|(_, v)| v.as_str()),
+            p.iter().find(|(k, _)| k == "delete_rule_expr").map(|(_, v)| v.as_str()),
+        )
+    };
+
+    let mut fields = antiga.fields.clone();
+    if antiga.kind != CollectionType::View {
+        let novos_campos = campos_do_form(&p);
+        for novo_f in novos_campos {
+            if !fields.iter().any(|f| f.name.eq_ignore_ascii_case(&novo_f.name)) {
+                fields.push(novo_f);
+            }
+        }
+    }
+
+    let mut nova = antiga.clone();
+    nova.name = novo_nome;
+    nova.view_query = view_query;
+    nova.list_rule = list_rule;
+    nova.view_rule = view_rule;
+    nova.create_rule = create_rule;
+    nova.update_rule = update_rule;
+    nova.delete_rule = delete_rule;
+    nova.fields = fields;
+
+    match e.banco.atualizar_colecao(&antiga.name, nova).await {
+        Ok(atualizada) => {
+            Redirect::to(&format!("/_/collections/{}", atualizada.name)).into_response()
+        }
+        Err(erro) => html(admin::pagina(
+            &format!("Configurações: {}", antiga.name),
+            admin::pagina_editar_colecao(&antiga, Some(&erro.to_string())),
+        )),
+    }
+}
+
+async fn colecao_apagar(
+    State(e): State<Estado>,
+    headers: HeaderMap,
+    Path(nome): Path<String>,
+) -> Response {
+    if sessao(&e, &headers).await.is_none() {
+        return entrar();
+    }
+    match e.banco.apagar_colecao(&nome).await {
+        Ok(()) => Redirect::to("/_/").into_response(),
+        Err(erro) => pagina_erro(erro),
+    }
 }
 
 #[derive(Deserialize)]
@@ -441,4 +697,78 @@ fn dados_do_form(c: &Collection, pares: &[(String, String)]) -> Map<String, Valu
         dados.insert(f.name.clone(), valor);
     }
     dados
+}
+
+fn regra_do_form(tipo: Option<&str>, expr: Option<&str>) -> Option<String> {
+    let expr_trim = expr.unwrap_or("").trim();
+    match tipo.unwrap_or("super") {
+        "public" => Some(String::new()),
+        "custom" => {
+            if expr_trim.is_empty() {
+                None
+            } else {
+                Some(expr_trim.to_string())
+            }
+        }
+        "super" => {
+            if !expr_trim.is_empty() {
+                Some(expr_trim.to_string())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn campos_do_form(pares: &[(String, String)]) -> Vec<Field> {
+    let names: Vec<&str> = pares
+        .iter()
+        .filter(|(k, _)| k == "field_name")
+        .map(|(_, v)| v.trim())
+        .collect();
+    let types: Vec<&str> = pares
+        .iter()
+        .filter(|(k, _)| k == "field_type")
+        .map(|(_, v)| v.trim())
+        .collect();
+    let reqs: Vec<&str> = pares
+        .iter()
+        .filter(|(k, _)| k == "field_required")
+        .map(|(_, v)| v.trim())
+        .collect();
+
+    let mut campos = Vec::new();
+    for (i, name) in names.into_iter().enumerate() {
+        if name.is_empty() {
+            continue;
+        }
+        let tipo_str = types.get(i).copied().unwrap_or("text");
+        let kind = match tipo_str {
+            "number" => FieldType::Number,
+            "bool" => FieldType::Bool,
+            "editor" => FieldType::Editor,
+            "email" => FieldType::Email,
+            "url" => FieldType::Url,
+            "date" => FieldType::Date,
+            "select" => FieldType::Select,
+            "file" => FieldType::File,
+            "relation" => FieldType::Relation,
+            "json" => FieldType::Json,
+            "password" => FieldType::Password,
+            "geoPoint" => FieldType::GeoPoint,
+            _ => FieldType::Text,
+        };
+        let required = reqs.get(i).map(|s| *s == "true").unwrap_or(false);
+        campos.push(Field {
+            id: String::new(),
+            name: name.to_string(),
+            kind,
+            required,
+            hidden: false,
+            system: false,
+            options: Map::new(),
+        });
+    }
+    campos
 }

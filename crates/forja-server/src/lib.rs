@@ -345,6 +345,73 @@ async fn colecoes_apagar(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn colecoes_atualizar(
+    State(e): State<Estado>,
+    quem: Chamador,
+    Path(nome): Path<String>,
+    Json(c): Json<Collection>,
+) -> Res<Json<Collection>> {
+    quem.exigir_superusuario()?;
+    Ok(Json(e.banco.atualizar_colecao(&nome, c).await?))
+}
+
+#[derive(Deserialize)]
+struct BodyDryRunView {
+    #[serde(default)]
+    query: String,
+}
+
+async fn colecoes_dry_run_view(
+    State(e): State<Estado>,
+    quem: Chamador,
+    Json(body): Json<BodyDryRunView>,
+) -> Res<Json<Value>> {
+    quem.exigir_superusuario()?;
+    let fields = e.banco.dry_run_view(&body.query).await?;
+    Ok(Json(json!({ "fields": fields })))
+}
+
+async fn settings_obter(
+    State(e): State<Estado>,
+    quem: Chamador,
+) -> Res<Json<forja_core::store::Configuracoes>> {
+    quem.exigir_superusuario()?;
+    Ok(Json(e.banco.configuracoes().await))
+}
+
+async fn settings_atualizar(
+    State(e): State<Estado>,
+    quem: Chamador,
+    Json(novo): Json<forja_core::store::Configuracoes>,
+) -> Res<Json<forja_core::store::Configuracoes>> {
+    quem.exigir_superusuario()?;
+    let salva = e.banco.salvar_configuracoes(&novo).await?;
+    Ok(Json(salva))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BodyTestS3 {
+    #[serde(default)]
+    s3: Option<forja_core::store::S3Config>,
+}
+
+async fn settings_test_s3(
+    State(e): State<Estado>,
+    quem: Chamador,
+    Json(body): Json<BodyTestS3>,
+) -> Res<StatusCode> {
+    quem.exigir_superusuario()?;
+    let config = if let Some(cfg) = body.s3 {
+        cfg
+    } else {
+        e.banco.configuracoes().await.s3
+    };
+    let s3 = forja_core::store::S3Storage::new(config);
+    s3.testar_conexao().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ── Registros ────────────────────────────────────────────────────────────
 
 /// A regra que vale para quem chama. `Ok(None)` = sem restrição (superusuário
@@ -456,6 +523,86 @@ fn apresentar_qualquer<'a>(
     })
 }
 
+pub(crate) fn filtrar_campos(mut reg: Value, fields_param: &str) -> Value {
+    let campos: Vec<&str> = fields_param
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if campos.is_empty() || campos.contains(&"*") {
+        return reg;
+    }
+    let Value::Object(ref mut mapa) = reg else {
+        return reg;
+    };
+
+    let mut novo = Map::new();
+    let mut expand_seletores: Vec<(&str, &str)> = Vec::new();
+
+    for seletor in campos {
+        let (nome_puro, modifier) = match seletor.split_once(':') {
+            Some((n, m)) => (n.trim(), Some(m.trim())),
+            None => (seletor, None),
+        };
+
+        if let Some(resto) = nome_puro.strip_prefix("expand.") {
+            if let Some((sub_exp, campo_exp)) = resto.split_once('.') {
+                expand_seletores.push((sub_exp, campo_exp));
+            } else {
+                expand_seletores.push((resto, "*"));
+            }
+            continue;
+        }
+
+        if let Some(val) = mapa.get(nome_puro) {
+            let mut val_final = val.clone();
+            if let Some(mod_str) = modifier
+                && let Some(dentro) = mod_str.strip_prefix("excerpt(").and_then(|s| s.strip_suffix(')'))
+            {
+                let len = dentro
+                    .split(',')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .parse::<usize>()
+                    .unwrap_or(100);
+                if let Value::String(ref s) = val_final
+                    && s.chars().count() > len
+                {
+                    let cortado: String = s.chars().take(len).collect();
+                    val_final = Value::String(format!("{cortado}..."));
+                }
+            }
+            novo.insert(nome_puro.to_string(), val_final);
+        }
+    }
+
+    if !expand_seletores.is_empty()
+        && let Some(Value::Object(exp_mapa)) = mapa.get("expand")
+    {
+        let mut novo_exp = Map::new();
+            for (sub, campo) in expand_seletores {
+                if let Some(sub_val) = exp_mapa.get(sub) {
+                    if campo == "*" {
+                        novo_exp.insert(sub.to_string(), sub_val.clone());
+                    } else if let Value::Object(sub_obj) = sub_val {
+                        let mut sub_novo = match novo_exp.remove(sub) {
+                            Some(Value::Object(m)) => m,
+                            _ => Map::new(),
+                        };
+                        if let Some(v) = sub_obj.get(campo) {
+                            sub_novo.insert(campo.to_string(), v.clone());
+                        }
+                        novo_exp.insert(sub.to_string(), Value::Object(sub_novo));
+                    }
+                }
+            }
+            novo.insert("expand".to_string(), Value::Object(novo_exp));
+    }
+
+    Value::Object(novo)
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ParamsLista {
@@ -465,11 +612,13 @@ struct ParamsLista {
     filter: Option<String>,
     skip_total: Option<bool>,
     expand: Option<String>,
+    fields: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
 struct ParamsExpand {
     expand: Option<String>,
+    fields: Option<String>,
 }
 
 async fn colecao_de(e: &Estado, nome: String) -> Res<Collection> {
@@ -491,6 +640,7 @@ async fn registros_listar(
         p.skip_total
             .map(|b| ("skipTotal".to_string(), b.to_string())),
         p.expand.map(|s| ("expand".to_string(), s)),
+        p.fields.map(|s| ("fields".to_string(), s)),
     ]
     .into_iter()
     .flatten()
@@ -529,9 +679,14 @@ async fn listar_registro(
             )
             .await?;
     }
+    let fields_opt = par(pares, "fields").filter(|s| !s.trim().is_empty());
     let mut items = Vec::with_capacity(lista.items.len());
     for v in lista.items {
-        items.push(apresentar(e, quem, c, v).await);
+        let mut apresentada = apresentar(e, quem, c, v).await;
+        if let Some(f) = fields_opt {
+            apresentada = filtrar_campos(apresentada, f);
+        }
+        items.push(apresentada);
     }
     lista.items = items;
     Ok(serde_json::to_value(lista).unwrap_or_default())
@@ -544,7 +699,11 @@ async fn registros_ver(
     Query(p): Query<ParamsExpand>,
 ) -> Res<Json<Value>> {
     let c = colecao_de(&e, nome).await?;
-    Ok(Json(ver_registro(&e, &quem, &c, &id, p.expand).await?))
+    let mut out = ver_registro(&e, &quem, &c, &id, p.expand).await?;
+    if let Some(f) = p.fields.as_deref().filter(|s| !s.trim().is_empty()) {
+        out = filtrar_campos(out, f);
+    }
+    Ok(Json(out))
 }
 
 async fn ver_registro(
@@ -578,9 +737,11 @@ async fn registros_criar(
 ) -> Res<Json<Value>> {
     let c = colecao_de(&e, nome).await?;
     let (dados, arquivos) = ler_corpo(req, &c).await?;
-    Ok(Json(
-        criar_registro(&e, &quem, &c, dados, arquivos, p.expand).await?,
-    ))
+    let mut out = criar_registro(&e, &quem, &c, dados, arquivos, p.expand).await?;
+    if let Some(f) = p.fields.as_deref().filter(|s| !s.trim().is_empty()) {
+        out = filtrar_campos(out, f);
+    }
+    Ok(Json(out))
 }
 
 async fn criar_registro(
@@ -633,9 +794,11 @@ async fn registros_atualizar(
 ) -> Res<Json<Value>> {
     let c = colecao_de(&e, nome).await?;
     let (dados, arquivos) = ler_corpo(req, &c).await?;
-    Ok(Json(
-        atualizar_registro(&e, &quem, &c, &id, dados, arquivos, p.expand).await?,
-    ))
+    let mut out = atualizar_registro(&e, &quem, &c, &id, dados, arquivos, p.expand).await?;
+    if let Some(f) = p.fields.as_deref().filter(|s| !s.trim().is_empty()) {
+        out = filtrar_campos(out, f);
+    }
+    Ok(Json(out))
 }
 
 async fn atualizar_registro(
@@ -1278,15 +1441,36 @@ async fn arquivo_baixar(
             return arquivo_ausente();
         }
     }
-    let Some(pasta) = e.banco.pasta() else {
-        return arquivo_ausente();
-    };
-    let Ok(caminho) = arquivos::caminho(&pasta, &c.id, &id, &arquivo) else {
-        return arquivo_ausente();
-    };
-    let bytes = match tokio::task::spawn_blocking(move || std::fs::read(caminho)).await {
-        Ok(Ok(b)) => b,
-        _ => return arquivo_ausente(),
+    let storage = e.banco.storage().await;
+    let thumb_param = p.thumb.clone();
+    let colecao_id = c.id.clone();
+    let id_reg = id.clone();
+    let nome_arq = arquivo.clone();
+
+    let bytes = if let Some(t) = thumb_param.as_deref().filter(|s| !s.is_empty())
+        && let Some(spec) = arquivos::ThumbSpec::parse(t)
+    {
+        if let Some(cached) = storage.ler_thumb(&colecao_id, &id_reg, &nome_arq, t).await {
+            cached
+        } else {
+            let Ok(orig_bytes) = storage.ler(&colecao_id, &id_reg, &nome_arq).await else {
+                return arquivo_ausente();
+            };
+            let ext = nome_arq.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+            if let Some(thumb_bytes) = arquivos::gerar_thumb(&orig_bytes, &spec, ext) {
+                let _ = storage
+                    .gravar_thumb(&colecao_id, &id_reg, &nome_arq, t, &thumb_bytes)
+                    .await;
+                thumb_bytes
+            } else {
+                orig_bytes
+            }
+        }
+    } else {
+        let Ok(b) = storage.ler(&colecao_id, &id_reg, &nome_arq).await else {
+            return arquivo_ausente();
+        };
+        b
     };
     let faixa = req
         .headers()
@@ -1398,12 +1582,22 @@ pub fn router(e: Estado) -> Router {
             post(superuser_refresh),
         )
         .route(
+            "/api/collections/meta/dry-run-view",
+            post(colecoes_dry_run_view),
+        )
+        .route(
+            "/api/collections/dry-run-view",
+            post(colecoes_dry_run_view),
+        )
+        .route(
             "/api/collections",
             get(colecoes_listar).post(colecoes_criar),
         )
         .route(
             "/api/collections/{colecao}",
-            get(colecoes_ver).delete(colecoes_apagar),
+            get(colecoes_ver)
+                .patch(colecoes_atualizar)
+                .delete(colecoes_apagar),
         )
         .route(
             "/api/collections/{colecao}/records",
@@ -1461,6 +1655,11 @@ pub fn router(e: Estado) -> Router {
             "/api/files/{colecao}/{id}/{arquivo}",
             get(arquivo_baixar).head(arquivo_baixar),
         )
+        .route(
+            "/api/settings",
+            get(settings_obter).patch(settings_atualizar),
+        )
+        .route("/api/settings/test/s3", post(settings_test_s3))
         .merge(painel::rotas())
         .layer(DefaultBodyLimit::max(MAX_CORPO))
         .with_state(e)
@@ -2258,7 +2457,9 @@ mod tests {
         // Sem cookie, tudo manda para o login.
         for uri in [
             "/_/",
+            "/_/new-collection",
             "/_/collections/qualquer",
+            "/_/collections/qualquer/settings",
             "/_/collections/qualquer/new",
             "/_/collections/qualquer/tabela",
         ] {
@@ -3071,5 +3272,453 @@ mod tests {
             visita.is_err(),
             "visitante recebeu evento com listRule fechada"
         );
+    }
+
+    #[tokio::test]
+    async fn patch_colecao_dry_run_view_e_filtro_algum_item() {
+        let e = estado().await;
+        let t = login(&e).await;
+
+        // 1. Criar coleção com campo multi-select / json
+        let (s, c) = chamar(
+            &e,
+            "POST",
+            "/api/collections",
+            Some(&t),
+            Some(json!({
+                "name": "artigos",
+                "type": "base",
+                "listRule": "",
+                "viewRule": "",
+                "fields": [
+                    { "name": "titulo", "type": "text" },
+                    { "name": "tags", "type": "select", "maxSelect": 5, "values": ["rust", "go", "web"] }
+                ]
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{c}");
+
+        // 2. dry-run-view
+        let (s, dry) = chamar(
+            &e,
+            "POST",
+            "/api/collections/meta/dry-run-view",
+            Some(&t),
+            Some(json!({ "query": "SELECT id, titulo FROM artigos" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{dry}");
+        assert!(dry["fields"].as_array().unwrap().iter().any(|f| f["name"] == "titulo"));
+
+        // 3. PATCH /api/collections/artigos (adicionar campo 'resumo')
+        let mut patch_c = c.clone();
+        patch_c["fields"].as_array_mut().unwrap().push(json!({
+            "name": "resumo",
+            "type": "text"
+        }));
+        let (s, atualizada) = chamar(
+            &e,
+            "PATCH",
+            "/api/collections/artigos",
+            Some(&t),
+            Some(patch_c),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{atualizada}");
+        assert!(atualizada["fields"].as_array().unwrap().iter().any(|f| f["name"] == "resumo"));
+
+        // 4. Criar registros com tags
+        let (s, _) = chamar(
+            &e,
+            "POST",
+            "/api/collections/artigos/records",
+            Some(&t),
+            Some(json!({
+                "titulo": "Artigo 1",
+                "tags": ["rust", "web"],
+                "resumo": "Primeiro resumo"
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+
+        let (s, _) = chamar(
+            &e,
+            "POST",
+            "/api/collections/artigos/records",
+            Some(&t),
+            Some(json!({
+                "titulo": "Artigo 2",
+                "tags": ["go"],
+                "resumo": "Segundo resumo"
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+
+        // 5. Filtro com ?= (algum item é 'rust')
+        let (s, lista) = chamar(
+            &e,
+            "GET",
+            "/api/collections/artigos/records?filter=tags%20%3F%3D%20%27rust%27",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{lista}");
+        let items = lista["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["titulo"], "Artigo 1");
+    }
+
+    #[tokio::test]
+    async fn fields_e_excerpt_e_realtime_expand_fields() {
+        let e = estado().await;
+        let t = login(&e).await;
+
+        let (s, _) = chamar(
+            &e,
+            "POST",
+            "/api/collections",
+            Some(&t),
+            Some(json!({
+                "name": "noticias",
+                "type": "base",
+                "listRule": "",
+                "viewRule": "",
+                "fields": [
+                    { "name": "titulo", "type": "text" },
+                    { "name": "conteudo", "type": "text" }
+                ]
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+
+        let (s, criado) = chamar(
+            &e,
+            "POST",
+            "/api/collections/noticias/records",
+            Some(&t),
+            Some(json!({
+                "titulo": "Post Longo",
+                "conteudo": "Este é um conteúdo muito longo para testar o excerpt."
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let id = criado["id"].as_str().unwrap();
+
+        // 1. GET lista com fields e excerpt
+        let (s, lista) = chamar(
+            &e,
+            "GET",
+            "/api/collections/noticias/records?fields=id,titulo,conteudo:excerpt(10)",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let item = &lista["items"][0];
+        assert_eq!(item["titulo"], "Post Longo");
+        assert_eq!(item["conteudo"], "Este é um ...");
+        assert!(item.get("created").is_none());
+
+        // 2. GET registro individual com fields
+        let (s, reg) = chamar(
+            &e,
+            "GET",
+            &format!("/api/collections/noticias/records/{id}?fields=titulo"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(reg["titulo"], "Post Longo");
+        assert!(reg.get("id").is_none());
+        assert!(reg.get("conteudo").is_none());
+    }
+
+    #[tokio::test]
+    async fn painel_gerencia_colecoes() {
+        let e = estado().await;
+        login(&e).await;
+        let cookie = entrar_no_painel(&e).await;
+
+        // 1. Tela de nova coleção
+        let (s, _, corpo) = pedir(&e, "GET", "/_/new-collection", &[("cookie", cookie.as_str())], "").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(corpo.contains("Nova Coleção"), "{corpo}");
+
+        // 2. Fragmento htmx de linha de campo
+        let (s, _, fragmento) = pedir(&e, "GET", "/_/htmx/campo-linha", &[("cookie", cookie.as_str())], "").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(fragmento.contains("linha-campo"), "{fragmento}");
+
+        // 3. Criar coleção 'tarefas' via form
+        let (s, h, _) = form_post(
+            &e,
+            "/_/new-collection",
+            Some(&cookie),
+            &[
+                ("name", "tarefas"),
+                ("type", "base"),
+                ("list_rule_tipo", "public"),
+                ("view_rule_tipo", "super"),
+                ("field_name", "titulo"),
+                ("field_type", "text"),
+                ("field_required", "true"),
+                ("field_name", "concluida"),
+                ("field_type", "bool"),
+                ("field_required", "false"),
+            ],
+        )
+        .await;
+        assert_eq!(s, StatusCode::SEE_OTHER);
+        assert_eq!(h.get("location").unwrap(), "/_/collections/tarefas");
+
+        // Verifica no banco
+        let col = e.banco.colecao("tarefas").await.unwrap();
+        assert_eq!(col.name, "tarefas");
+        assert_eq!(col.list_rule, Some(String::new()));
+        assert_eq!(col.view_rule, None);
+        assert!(col.fields.iter().any(|f| f.name == "titulo" && f.required));
+        assert!(col.fields.iter().any(|f| f.name == "concluida" && !f.required));
+
+        // 4. Tela de configurações
+        let (s, _, corpo) = pedir(&e, "GET", "/_/collections/tarefas/settings", &[("cookie", cookie.as_str())], "").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(corpo.contains("Configurações: tarefas"), "{corpo}");
+
+        // 5. Salvar configurações: renomear para 'afazeres' e adicionar campo 'prazo'
+        let (s, h, _) = form_post(
+            &e,
+            "/_/collections/tarefas/settings",
+            Some(&cookie),
+            &[
+                ("name", "afazeres"),
+                ("list_rule_tipo", "custom"),
+                ("list_rule_expr", "@request.auth.id != ''"),
+                ("view_rule_tipo", "public"),
+                ("field_name", "prazo"),
+                ("field_type", "date"),
+                ("field_required", "false"),
+            ],
+        )
+        .await;
+        assert_eq!(s, StatusCode::SEE_OTHER);
+        assert_eq!(h.get("location").unwrap(), "/_/collections/afazeres");
+
+        let col_atualizada = e.banco.colecao("afazeres").await.unwrap();
+        assert_eq!(col_atualizada.name, "afazeres");
+        assert_eq!(col_atualizada.list_rule, Some("@request.auth.id != ''".to_string()));
+        assert_eq!(col_atualizada.view_rule, Some(String::new()));
+        assert!(col_atualizada.fields.iter().any(|f| f.name == "prazo"));
+
+        // 6. Excluir coleção
+        let (s, h, _) = form_post(
+            &e,
+            "/_/collections/afazeres/delete-collection",
+            Some(&cookie),
+            &[],
+        )
+        .await;
+        assert_eq!(s, StatusCode::SEE_OTHER);
+        assert_eq!(h.get("location").unwrap(), "/_/");
+
+        assert!(e.banco.colecao("afazeres").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn api_filtro_macros_de_data_e_modificadores() {
+        let e = estado().await;
+        let admin = login(&e).await;
+
+        let (s, _) = chamar(
+            &e,
+            "POST",
+            "/api/collections",
+            Some(&admin),
+            Some(json!({
+                "name": "artigos",
+                "type": "base",
+                "listRule": "",
+                "fields": [
+                    { "name": "titulo", "type": "text" },
+                    { "name": "resumo", "type": "text" }
+                ]
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+
+        // Cria 2 registros
+        let (s, _) = chamar(
+            &e,
+            "POST",
+            "/api/collections/artigos/records",
+            Some(&admin),
+            Some(json!({ "titulo": "Rust No Servidor", "resumo": "Excelente guia." })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+
+        let (s, _) = chamar(
+            &e,
+            "POST",
+            "/api/collections/artigos/records",
+            Some(&admin),
+            Some(json!({ "titulo": "GO EM PRODUÇÃO" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+
+        // 1. Filtro com :lower
+        let (s, lista) = chamar(
+            &e,
+            "GET",
+            "/api/collections/artigos/records?filter=titulo:lower%20%3D%20%27rust%20no%20servidor%27",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(lista["totalItems"], 1);
+        assert_eq!(lista["items"][0]["titulo"], "Rust No Servidor");
+
+        // 2. Filtro com :isset
+        let (s, lista) = chamar(
+            &e,
+            "GET",
+            "/api/collections/artigos/records?filter=resumo:isset%20%3D%20true",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(lista["totalItems"], 1);
+        assert_eq!(lista["items"][0]["titulo"], "Rust No Servidor");
+
+        let (s, lista) = chamar(
+            &e,
+            "GET",
+            "/api/collections/artigos/records?filter=resumo:isset%20%3D%20false",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(lista["totalItems"], 1);
+        assert_eq!(lista["items"][0]["titulo"], "GO EM PRODUÇÃO");
+
+        // 3. Filtro com macro de data @todayStart
+        let (s, lista) = chamar(
+            &e,
+            "GET",
+            "/api/collections/artigos/records?filter=created%20%3E%3D%20%40todayStart",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(lista["totalItems"], 2);
+    }
+
+    #[tokio::test]
+    async fn api_settings_e_s3_storage() {
+        let e = estado().await;
+        let admin = login(&e).await;
+
+        // 1. Visitante sem token não pode ler ou alterar configurações
+        let (s, _) = chamar(&e, "GET", "/api/settings", None, None).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+
+        let (s, _) = chamar(
+            &e,
+            "PATCH",
+            "/api/settings",
+            None,
+            Some(json!({ "appName": "Hacker" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+
+        // 2. Superusuário lê configurações padrão
+        let (s, cfg) = chamar(&e, "GET", "/api/settings", Some(&admin), None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(cfg["appName"], "Acme");
+        assert_eq!(cfg["s3"]["enabled"], false);
+
+        // 3. Superusuário atualiza configurações para habilitar S3
+        let (s, cfg_atualizada) = chamar(
+            &e,
+            "PATCH",
+            "/api/settings",
+            Some(&admin),
+            Some(json!({
+                "appName": "Forjabase Prod",
+                "appUrl": "https://forja.exemplo.com",
+                "s3": {
+                    "enabled": true,
+                    "bucket": "meu-bucket",
+                    "region": "sa-east-1",
+                    "endpoint": "http://127.0.0.1:9000",
+                    "accessKey": "key123",
+                    "secret": "secret123",
+                    "forcePathStyle": true
+                }
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(cfg_atualizada["appName"], "Forjabase Prod");
+        assert_eq!(cfg_atualizada["s3"]["enabled"], true);
+        assert_eq!(cfg_atualizada["s3"]["bucket"], "meu-bucket");
+
+        // Verifica que persistiu no banco
+        let salva = e.banco.configuracoes().await;
+        assert_eq!(salva.app_name, "Forjabase Prod");
+        assert!(salva.s3.enabled);
+        assert_eq!(salva.s3.bucket, "meu-bucket");
+
+        // 4. Teste de conexão S3 com validação de campos vazios
+        let (s, _) = chamar(
+            &e,
+            "POST",
+            "/api/settings/test/s3",
+            Some(&admin),
+            Some(json!({
+                "s3": {
+                    "enabled": true,
+                    "bucket": "",
+                    "accessKey": "key",
+                    "secret": "secret"
+                }
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+
+        // 5. Teste de conexão S3 com endpoint inacessível devolve erro claro
+        let (s, resp) = chamar(
+            &e,
+            "POST",
+            "/api/settings/test/s3",
+            Some(&admin),
+            Some(json!({
+                "s3": {
+                    "enabled": true,
+                    "bucket": "b",
+                    "region": "us-east-1",
+                    "endpoint": "http://127.0.0.1:59999",
+                    "accessKey": "key",
+                    "secret": "secret"
+                }
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(resp["message"].as_str().unwrap().contains("Failed to connect"));
     }
 }

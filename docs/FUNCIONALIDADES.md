@@ -78,13 +78,13 @@ Versão atual: **0.0.2**. O Forja só vira **1.0.0** quando estiver estável
 | Tipo **auth** (campos de sistema, e-mail único sem diferenciar maiúsculas e senha em Argon2id) | ✅ |
 | Tipo **view** (consulta SQL somente leitura) | ✅ |
 | Listar, criar, ver e apagar coleções (`/api/collections`) | ✅ |
-| Atualizar coleção (`PATCH`, com mudança de campos) | 📋 |
+| Atualizar coleção (`PATCH`, com mudança de campos) | ✅ |
 | Importar coleções em lote (`PUT /api/collections/import`) | 📋 |
 | Esvaziar coleção (`DELETE /api/collections/{c}/truncate`) | 📋 |
 | Modelos prontos de coleção (`/api/collections/meta/scaffolds`) | 📋 |
-| Testar a consulta de uma view antes de salvar (`dry-run-view`) | 📋 |
+| Testar a consulta de uma view antes de salvar (`dry-run-view`) | ✅ |
 | Coleções de sistema: `_superusers`, `_externalAuths`, `_mfas`, `_otps`, `_authOrigins` | 📋 |
-| Renomear campos e coleções sem perder dados | 📋 |
+| Renomear campos e coleções sem perder dados | ✅ (renomear coleção e adicionar colunas) |
 
 ### 3.1 Tipos de campo
 
@@ -127,14 +127,14 @@ com uma mensagem clara. "✅" quer dizer validado e guardado.
 | Listar com paginação (`page`, `perPage`, `skipTotal`) | ✅ |
 | Ver, criar, atualizar e apagar registros (JSON) | ✅ |
 | **Filtros** com `=`, `!=`, `>`, `>=`, `<`, `<=`, `~` (contém), `!~`, `&&`, `||`, parênteses, textos, números, `true`, `false` e `null`, sempre como parâmetros de SQL | ✅ |
-| Operadores "algum item" (`?=`, `?!=`, `?>`, `?~`…) | 📋 |
-| Macros de data (`@now`, `@yesterday`, `@todayStart`, `@monthEnd`…) | 📋 |
-| Modificadores `:isset`, `:changed`, `:length`, `:each`, `:lower` | 📋 |
+| Operadores "algum item" (`?=`, `?!=`, `?>`, `?~`…) | ✅ |
+| Macros de data (`@now`, `@yesterday`, `@todayStart`, `@monthEnd`…) | ✅ |
+| Modificadores `:isset`, `:changed`, `:length`, `:each`, `:lower` | 🔨 (`:isset`, `:lower` e `:length` ✅; `:changed` e `:each` ficam) |
 | Funções `geoDistance()` e `strftime()` | 📋 |
 | Ordenação (`sort`, com `-` e `@random`) | ✅ |
 | Ordenação por `@rowid` | 📋 |
 | Expandir relações (`expand`, inclusive aninhadas e reversas `coleção_via_campo`) | ✅ |
-| Escolher campos (`fields`, com `:excerpt`) | 📋 |
+| Escolher campos (`fields`, com `:excerpt`) | ✅ |
 | Modificadores de valor no envio (`campo+`, `+campo`, `campo-`) | 🔨 (`campo+` e `campo-` no `file`; `+campo` nos outros tipos fica) |
 | Upload de arquivos em `multipart/form-data` | ✅ (API; o painel só exibe o nome) |
 | **Lote** (`/api/batch`): várias operações numa transação | 🔨 (JSON de registro, até 50, tudo ou nada; sem arquivo) |
@@ -168,8 +168,8 @@ com uma mensagem clara. "✅" quer dizer validado e guardado.
 | Funcionalidade | Estado |
 |---|---|
 | Armazenamento local ou em S3 compatível (AWS, MinIO, R2…) | 🔨 (disco local; S3 fica) |
-| Servir arquivos (`/api/files/{coleção}/{registro}/{arquivo}`) | ✅ (`Range` simples; `?thumb=` devolve o original) |
-| Miniaturas sob demanda (`?thumb=100x100`, com corte e ajuste) | 📋 |
+| Servir arquivos (`/api/files/{coleção}/{registro}/{arquivo}`) | ✅ (`Range` simples e miniaturas em cache) |
+| Miniaturas sob demanda (`?thumb=100x100`, com corte e ajuste) | ✅ |
 | Arquivos protegidos com token de arquivo de curta duração | ✅ (3 minutos, e a `viewRule`) |
 | Download forçado (`?download=1`) | ✅ |
 | Testar a conexão S3 pelo painel | 📋 |
@@ -181,7 +181,7 @@ com uma mensagem clara. "✅" quer dizer validado e guardado.
 | Server-Sent Events (`/api/realtime`) | ✅ (`PB_CONNECT`; ocioso 5 min, teto 30 min) |
 | Assinar uma coleção inteira ou um registro | ✅ |
 | Eventos de criação, atualização e exclusão, respeitando as regras de acesso | ✅ |
-| Opções por assinatura (filtro, expand, fields) | 🔨 (filtro; `expand` e `fields` ficam) |
+| Opções por assinatura (filtro, expand, fields) | ✅ |
 
 ## 8. Configurações e operação
 
@@ -212,7 +212,7 @@ superusuário. WASM fica reservado para as extensões (§11).
 | Lista de coleções | ✅ |
 | Navegador de registros com filtro e paginação (htmx) | ✅ |
 | Criar, editar e apagar registros pelo formulário, com erros por campo | ✅ |
-| Editor de coleções, campos, regras e índices | 📋 |
+| Editor de coleções, campos, regras e índices | 🔨 (coleções, campos dinâmicos e regras ✅; índices ficam) |
 | Telas de configurações, backups, logs e cron | 📋 |
 | Visualização de logs com gráfico | 📋 |
 | Extensões de interface do painel | 📋 |

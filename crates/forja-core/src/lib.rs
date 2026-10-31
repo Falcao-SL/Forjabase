@@ -225,8 +225,8 @@ impl Collection {
     }
 }
 
-/// Agora em UTC, no formato do PocketBase (`2026-10-21 14:05:09.123Z`).
-pub fn agora() -> String {
+/// Componentes de tempo UTC: (ano, mes, dia, hora, minuto, segundo, milissegundo, weekday)
+pub fn tempo_utc() -> (i64, u32, u32, u32, u32, u32, u32, u32) {
     use std::time::{SystemTime, UNIX_EPOCH};
     let d = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -234,16 +234,22 @@ pub fn agora() -> String {
     let (s, ms) = (d.as_secs() as i64, d.subsec_millis());
     let (dias, resto) = (s.div_euclid(86_400), s.rem_euclid(86_400));
     let (h, m, seg) = (resto / 3600, resto % 3600 / 60, resto % 60);
-    // Data civil a partir de dias desde 1970 (algoritmo de Howard Hinnant).
+    let weekday = ((dias + 4).rem_euclid(7)) as u32;
     let z = dias + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
-    let dia = doy - (153 * mp + 2) / 5 + 1;
-    let mes = if mp < 10 { mp + 3 } else { mp - 9 };
+    let dia = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let mes = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
     let ano = yoe + era * 400 + if mes <= 2 { 1 } else { 0 };
+    (ano, mes, dia, h as u32, m as u32, seg as u32, ms, weekday)
+}
+
+/// Agora em UTC, no formato do PocketBase (`2026-10-21 14:05:09.123Z`).
+pub fn agora() -> String {
+    let (ano, mes, dia, h, m, seg, ms, _) = tempo_utc();
     format!("{ano:04}-{mes:02}-{dia:02} {h:02}:{m:02}:{seg:02}.{ms:03}Z")
 }
 

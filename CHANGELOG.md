@@ -2,6 +2,33 @@
 
 ## Não lançado
 
+- Editor e gerenciamento de coleções no painel administrativo (`/_/new-collection`,
+  `/_/collections/{nome}/settings` e `delete-collection`): criação e edição de
+  coleções (base, auth, view), configuração de view queries, regras de acesso
+  (superusuário, público ou expressões) e adição interativa de campos customizados
+  via HTMX sem recarregar a página e sem build de front-end.
+- Macros de data e hora nos filtros: `@now`, `@yesterday`, `@tomorrow`, `@todayStart`,
+  `@todayEnd`, `@monthStart`, `@monthEnd`, `@yearStart`, `@yearEnd`, `@second`,
+  `@minute`, `@hour`, `@day`, `@month`, `@year`, `@weekday`. Todos convertidos
+  para strings de timestamp UTC no formato do PocketBase e amarrados por parâmetros SQLite.
+- Modificadores de filtro nos campos: `:lower` (`LOWER("campo")`), `:length` (`LENGTH("campo")`)
+  e `:isset` (`campo IS NOT NULL AND campo != ''` ou `IS NULL OR = ''`).
+- Seletor de campos (`fields`, com suporte a `:excerpt(n)`) e suporte em tempo real
+  (SSE) a `expand` e `fields` por assinatura no evento de broadcast.
+- Miniaturas sob demanda no campo `file`: `?thumb=WxH` com suporte a corte
+  central, topo (`t`), base (`b`), ajuste proporcional (`f`) e dimensões
+  proporcionais `0xH` e `Wx0`. Miniaturas geradas e armazenadas em cache local em
+  `storage/{colecao}/{registro}/thumbs_{arquivo}/{thumb}_{arquivo}`, com
+  remoção automática na exclusão do arquivo.
+- Operadores "algum item" nos filtros: `?=`, `?!=`, `?>`, `?>=`, `?<`, `?<=`, `?~`, `?!~`.
+  Em SQLite, compilados dinamicamente para `json_valid` e `json_each`, funcionando
+  tanto para arrays JSON e multi-select/relations quanto para valores escalares.
+- `PATCH /api/collections/{colecao}`: suporte completo para alteração de esquema
+  de coleções em tempo de execução, incluindo renomeação de tabelas e views no SQLite,
+  adição de novas colunas via `ADD COLUMN` e reconfiguração de regras de acesso.
+- `POST /api/collections/meta/dry-run-view` (e `/api/collections/dry-run-view`):
+  inspeção prévia e teste de consultas SQL para coleções do tipo `view`, validando
+  a coluna primária `id` e inferindo tipos de campos antes da criação.
 - Campo `file` em disco local. O multipart do criar e do atualizar grava em
   `storage/{colecaoId}/{registroId}/{arquivo}`, com nome normalizado. Valem
   `maxSelect`, `maxSize` (0 = 5 MiB) e `mimeTypes`. `campo+` acrescenta e

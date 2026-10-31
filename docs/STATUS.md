@@ -1,20 +1,36 @@
 # Status — Forja
 
-> Atualizado em **2026-10-27**. Este arquivo é a fonte única de "em que pé está".
+> Atualizado em **2026-10-31**. Este arquivo é a fonte única de "em que pé está".
 
 | Campo | Valor |
 |---|---|
-| **Estágio** | **Em desenvolvimento** — 0.1 e 0.2 entregues. Marco M1 entregue (barramento de escrita). Relações, `expand`, coleções `view` e `@collection.*` estão no núcleo. A 0.3 tem a primeira fatia: arquivo em disco, lote e SSE |
+| **Estágio** | **Em desenvolvimento** — Marcos 0.1, 0.2 e 0.3 concluídos! Marco M1 entregue (barramento de escrita). Armazenamento em disco e S3 com miniaturas sob demanda, lote atômico, SSE, operadores `?=`, `fields`, macros de data e modificadores (`:lower`, `:length`, `:isset`). Marco 0.4 adiantado: gerenciamento completo de coleções no painel administrativo |
 | **Plataformas** | Servidor: macOS, Linux, Windows (Rust); painel: navegador, HTML no servidor + htmx (sem build de front-end) |
 | **Stack** | Rust (axum; SQLite), maud + htmx, wasmtime in-process na 0.8. Decisão: [ADR-001](arquitetura/ADR-001-um-binario.md) |
 | **Site** | Landing em `site/` (inglês na raiz, português em `index.pt.html`). O host previsto é https://forja.falcaosl.com, no Coolify, com `deploy/site/Dockerfile`. O DNS ainda não existe; o endereço público segue o repositório. |
 | **Monetização** | Nenhuma: código aberto, MIT |
-| **Próximo marco** | Fechar a 0.3: miniatura (`?thumb=` hoje devolve o original) e armazenamento S3. Ainda na fila, sem fechar versão: operadores `?=`, `dry-run-view` e `PATCH` de coleção |
+| **Próximo marco** | Marco 0.5 (SMTP/e-mails, agendador cron, logs estruturados e backups) |
 | **Data-alvo** | A definir; 1.0.0 só quando estável (PLANO §6) |
 
 ## O que já está pronto
 
-- Workspace com 4 crates e 54 testes passando.
+- Workspace com 4 crates e 65 testes passando.
+- Armazenamento em S3 compatível (`ProvedorStorage`, `DiscoLocal` e `S3Storage` com autenticação AWS SigV4 pura em Rust) com suporte a AWS S3, MinIO, Cloudflare R2, Wasabi, etc.
+- Endpoints de configurações (`GET` e `PATCH /api/settings`) e teste de conectividade S3 (`POST /api/settings/test/s3`), compatíveis com o formato do PocketBase.
+- Painel administrativo: gerenciador de coleções (`/_/new-collection`, `/_/collections/{nome}/settings`, `delete-collection`) com adição dinâmica de campos via htmx (`/_/htmx/campo-linha`), formulário de regras com suporte a superusuário, público e expressões personalizadas, e exclusão com diálogo de confirmação nativo.
+- Macros de data e hora nos filtros (`@now`, `@yesterday`, `@tomorrow`, `@todayStart`, `@todayEnd`, `@monthStart`, `@monthEnd`, `@yearStart`, `@yearEnd`, `@second`, `@minute`, `@hour`, `@day`, `@month`, `@year`, `@weekday`) resolvidos em UTC para comparação cronológica como no PocketBase.
+- Modificadores de filtro nos campos: `:lower` (`LOWER("campo")`), `:length` (`LENGTH("campo")`) e `:isset` (`campo IS NOT NULL AND campo != ''`).
+- Seletor de campos (`fields`, inclusive com modificador `:excerpt(n)`) e suporte em tempo real (SSE) a `expand` e `fields` por assinatura.
+- Operadores "algum item" (`?=`, `?!=`, `?>`, `?>=`, `?<`, `?<=`, `?~`, `?!~`)
+  nos filtros, suportando arrays JSON, relações múltiplas, select múltiplo e
+  valores escalares via `json_valid` e `json_each`.
+- `PATCH /api/collections/{colecao}`: atualização de esquema em tempo de execução
+  (renomeia tabelas SQLite, views, adiciona colunas `ADD COLUMN`, valida e atualiza regras).
+- `POST /api/collections/meta/dry-run-view`: testa a consulta SQL de uma view,
+  garante a presença da coluna `id` e devolve os campos inferidos sem persistir.
+- Miniaturas sob demanda no campo `file`: `?thumb=WxH` (com corte central, topo `t`,
+  base `b`, ajuste proporcional `f`, ou proporções `0xH`, `Wx0`), com cache em disco em
+  `storage/{colecao}/{registro}/thumbs_{arquivo}/{thumb}_{arquivo}` e exclusão automática.
 - Barramento in-process (M1): `criar`, `atualizar` e `apagar` — inclusive senha,
   verificação, superusuário e cada registro da cascata — publicam
   `Evento { colecao, acao, id, registro }` em `tokio::broadcast` depois do commit.
@@ -23,8 +39,7 @@
   multipart no criar e no atualizar, `maxSelect`, `maxSize` (0 = 5 MiB),
   `mimeTypes`, `protected`. `GET /api/files/...` com `?download=1` e `Range`.
   Arquivo protegido pede `POST /api/files/token` (3 minutos) e a `viewRule`.
-  `?thumb=` é aceito e devolve o original. O painel só mostra o nome; o envio
-  é pela API.
+  O painel só mostra o nome; o envio é pela API.
 - `POST /api/batch`: até 50 operações de registro em JSON, na mesma transação
   SQLite. Se uma falha, as outras desfazem e a resposta é o erro dessa operação.
 - SSE no protocolo do PocketBase (`GET` + `POST /api/realtime`): `PB_CONNECT`,
