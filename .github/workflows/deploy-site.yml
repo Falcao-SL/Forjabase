@@ -5,6 +5,12 @@
 #
 # Ajuste SLUG abaixo (pasta em /data/sites/<slug>/public/).
 # O edge é um Caddy só; o deploy é só rsync (sem compose por site).
+#
+# Fonte (nessa ordem):
+#   1. site/index.html
+#   2. index.html na raiz do repo (hub FalcaoSL)
+#   3. deploy/site/index.html (legado)
+# Nunca use deploy/site só com Dockerfile/nginx — isso não é o site.
 
 name: Deploy site
 
@@ -14,6 +20,10 @@ on:
     paths:
       - "site/**"
       - "deploy/site/**"
+      - "index.html"
+      - "css/**"
+      - "js/**"
+      - "assets/**"
       - ".github/workflows/deploy-site.yml"
   workflow_dispatch:
 
@@ -30,7 +40,7 @@ jobs:
       DEPLOY_USER: deploy
       REMOTE: /data/sites
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: rsync site → /data/sites/<slug>/public
         env:
@@ -38,11 +48,32 @@ jobs:
         run: |
           set -euo pipefail
           test -n "${SSH_KEY:-}" || { echo "Falta secret HOMELAB_DEPLOY_SSH_KEY na org"; exit 1; }
-          SRC=site
-          [[ -d deploy/site ]] && SRC=deploy/site
-          [[ -d "$SRC" ]] || { echo "Sem pasta site/ nem deploy/site/"; exit 1; }
+
+          if [[ -f site/index.html ]]; then
+            SRC=site
+            RSYNC_EXCLUDES=()
+          elif [[ -f index.html ]]; then
+            SRC=.
+            RSYNC_EXCLUDES=(
+              --exclude '.git/'
+              --exclude '.github/'
+              --exclude 'deploy/'
+              --exclude 'docs/'
+              --exclude 'scripts/'
+              --exclude '.gitignore'
+              --exclude '*.md'
+            )
+          elif [[ -f deploy/site/index.html ]]; then
+            SRC=deploy/site
+            RSYNC_EXCLUDES=()
+          else
+            echo "Sem site/index.html, index.html na raiz, nem deploy/site/index.html"
+            exit 1
+          fi
+          echo "SRC=$SRC"
+
           install -m 600 /dev/null key
           printf '%s\n' "$SSH_KEY" > key
           ssh_opts=(-i key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
-          rsync -az --delete -e "ssh ${ssh_opts[*]}" \
+          rsync -az --delete "${RSYNC_EXCLUDES[@]}" -e "ssh ${ssh_opts[*]}" \
             "$SRC"/ "${DEPLOY_USER}@${HOST}:${REMOTE}/${SLUG}/public/"
