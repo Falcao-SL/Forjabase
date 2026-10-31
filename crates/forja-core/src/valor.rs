@@ -68,3 +68,9 @@ impl From<bool> for Valor {
         Valor::Bool(b)
     }
 }
+
+impl From<i64> for Valor {
+    fn from(i: i64) -> Valor {
+        Valor::Int(i)
+    }
+}

@@ -14,12 +14,19 @@ pub mod erro;
 pub mod filtro;
 pub mod id;
 pub mod motor;
+pub mod oauth2;
 mod relacao;
 pub mod store;
 pub mod valor;
 mod view;
 
 pub use erro::Erro;
+pub use oauth2::{
+    AuthAlertConfig, AuthMethodsResponse, AuthProviderInfo, MfaConfig, OAuth2Config,
+    OAuth2MappedFields, OAuth2PerfilUsuario, OAuth2ProviderConfig, OAuth2TokenResponse, OtpConfig,
+    PasswordAuthConfig, TokenConfig,
+};
+pub use store::{ExternalAuthRegistro, MfaRegistro, OtpRegistro};
 
 /// Versão do Forja (a mesma do workspace).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -169,7 +176,7 @@ impl Field {
 }
 
 /// Uma coleção. `None` numa regra = só superusuário; `Some("")` = público.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Collection {
     #[serde(default)]
@@ -200,9 +207,49 @@ pub struct Collection {
     pub created: String,
     #[serde(default)]
     pub updated: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_rule: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manage_rule: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_alert: Option<AuthAlertConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth2: Option<OAuth2Config>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_auth: Option<PasswordAuthConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mfa: Option<MfaConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otp: Option<OtpConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<TokenConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_reset_token: Option<TokenConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email_change_token: Option<TokenConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_token: Option<TokenConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_token: Option<TokenConfig>,
 }
 
 impl Collection {
+    pub fn oauth2_config(&self) -> OAuth2Config {
+        self.oauth2.clone().unwrap_or_default()
+    }
+
+    pub fn otp_config(&self) -> OtpConfig {
+        self.otp.clone().unwrap_or_default()
+    }
+
+    pub fn mfa_config(&self) -> MfaConfig {
+        self.mfa.clone().unwrap_or_default()
+    }
+
+    pub fn password_auth_config(&self) -> PasswordAuthConfig {
+        self.password_auth.clone().unwrap_or_default()
+    }
+
     pub fn campo(&self, nome: &str) -> Option<&Field> {
         self.fields.iter().find(|f| f.name == nome)
     }
@@ -269,6 +316,38 @@ pub fn data_utc_de_epoch_s(s: i64) -> String {
     format!("{ano:04}-{mes:02}-{dia:02} {h:02}:{m:02}:{seg:02}.000Z")
 }
 
+/// Converte uma data UTC no formato PocketBase (`2026-10-21 14:05:09.123Z`) de volta em segundos UNIX.
+pub fn epoch_s_de_data_utc(s: &str) -> Option<i64> {
+    if s.len() < 19 {
+        return None;
+    }
+    let ano: i64 = s[0..4].parse().ok()?;
+    let mes: u32 = s[5..7].parse().ok()?;
+    let dia: u32 = s[8..10].parse().ok()?;
+    let h: i64 = s[11..13].parse().ok()?;
+    let m: i64 = s[14..16].parse().ok()?;
+    let seg: i64 = s[17..19].parse().ok()?;
+
+    let y = if mes <= 2 { ano - 1 } else { ano };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let m_adj = if mes <= 2 { mes + 9 } else { mes - 3 };
+    let doy = (153 * m_adj + 2) / 5 + dia - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + (doy as i64);
+    let dias = era * 146_097 + doe - 719_468;
+
+    Some(dias * 86_400 + h * 3600 + m * 60 + seg)
+}
+
+/// Retorna os segundos atuais desde a época UNIX.
+pub fn agora_epoch_s() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,6 +389,11 @@ mod tests {
             a.ends_with('Z') && &a[4..5] == "-" && &a[10..11] == " ",
             "{a}"
         );
+
+        let agora_s = agora_epoch_s();
+        let formatted = data_utc_de_epoch_s(agora_s);
+        let parsed = epoch_s_de_data_utc(&formatted).expect("parsed date");
+        assert_eq!(agora_s, parsed);
     }
 
     #[test]

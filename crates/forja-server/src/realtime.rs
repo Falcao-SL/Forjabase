@@ -439,9 +439,7 @@ fn analisar(bruto: &str) -> Result<Inscricao, String> {
 
 type QueryOpcoes = (Option<String>, Option<String>, Option<String>);
 
-fn opcoes_de_query(
-    query: &str,
-) -> Result<QueryOpcoes, String> {
+fn opcoes_de_query(query: &str) -> Result<QueryOpcoes, String> {
     if query.is_empty() {
         return Ok((None, None, None));
     }

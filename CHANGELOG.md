@@ -2,6 +2,12 @@
 
 ## Não lançado
 
+- **Marco 0.6 — OAuth2, OTP e Autenticação Multifator (MFA)**:
+  - **OAuth2**: Suporte a autenticação com provedores externos (Google, GitHub, GitLab, Discord, Microsoft, genéricos OIDC, etc.) com geração automática de PKCE (S256) e State, troca de código de autorização e busca de perfil normalizado. Endpoints `POST /api/collections/{colecao}/auth-with-oauth2`, `GET /api/collections/{colecao}/records/{id}/external-auths`, `DELETE /api/collections/{colecao}/records/{id}/external-auths/{provider}` e página de retorno de popup compatível com SDKs do PocketBase em `GET /api/oauth2-redirect` (via `postMessage`).
+  - **OTP (One-Time Password)**: Emissão e envio de senhas numéricas descartáveis por e-mail com tempo de expiração configurável, proteção contra enumeração de usuários, uso único e auto-verificação de e-mail (`verified = true`). Endpoints `POST /api/collections/{colecao}/request-otp` e `POST /api/collections/{colecao}/auth-with-otp`.
+  - **MFA (Autenticação Multifator)**: Fluxo de autenticação em dois passos distintos (senha + OTP, OAuth2 + OTP, etc.) com emissão de desafio HTTP 401 Unauthorized contendo `{"mfaId": "..."}`, expiração temporal de sessão e validação de fatores distintos.
+  - **Métodos de Autenticação (`auth-methods`)**: Endpoint público `GET /api/collections/{colecao}/auth-methods` expondo as opções de autenticação ativas (MFA, OTP, Senha e Provedores OAuth2 com URLs de autorização e desafios PKCE pré-gerados).
+  - **Painel Administrativo**: Formulários e controles no painel para ativar e configurar durações e parâmetros de OTP, MFA e OAuth2 na edição de coleções auth.
 - **Marco 0.5 — Operação e Configurações**:
   - **SMTP e Entrega de E-mails**: Implementado cliente SMTP em Rust assíncrono via `lettre` com suporte a TLS, STARTTLS, autenticação PLAIN e LOGIN, e endpoint `POST /api/settings/test/email`.
   - **Modelos de E-mail Editáveis**: Suporte aos modelos `verificationTemplate`, `resetPasswordTemplate` e `confirmEmailChangeTemplate` em `Configuracoes.meta`, com substituição dinâmica de placeholders (`{APP_NAME}`, `{APP_URL}`, `{TOKEN}`, `{ACTION_URL}`, `{RECORD:campo}`).

@@ -1211,6 +1211,7 @@ version = "0.0.3"
 dependencies = [
  "argon2",
  "async-trait",
+ "base64 0.22.1",
  "bytes",
  "deadpool-postgres",
  "hex",
@@ -1230,6 +1231,7 @@ dependencies = [
  "tokio-postgres",
  "tokio-postgres-rustls",
  "turso",
+ "url",
  "webpki-roots",
  "zip",
 ]

@@ -44,7 +44,10 @@ pub fn rotas() -> Router<Estado> {
         .route("/_/collections/{nome}", get(colecao_pagina).post(criar))
         .route("/_/collections/{nome}/new", get(novo_form))
         .route("/_/collections/{nome}/tabela", get(tabela))
-        .route("/_/collections/{nome}/records/{id}", get(editar_form).post(atualizar))
+        .route(
+            "/_/collections/{nome}/records/{id}",
+            get(editar_form).post(atualizar),
+        )
         .route("/_/collections/{nome}/records/{id}/delete", post(apagar))
         .route("/_/logs", get(logs_pagina))
         .route("/_/crons", get(crons_pagina))
@@ -53,7 +56,10 @@ pub fn rotas() -> Router<Estado> {
         .route("/_/backups/new", post(backup_novo_painel))
         .route("/_/backups/{key}/delete", post(backup_apagar_painel))
         .route("/_/backups/{key}/restore", post(backup_restaurar_painel))
-        .route("/_/settings", get(settings_pagina).post(settings_salvar_painel))
+        .route(
+            "/_/settings",
+            get(settings_pagina).post(settings_salvar_painel),
+        )
 }
 
 // ── Sessão ───────────────────────────────────────────────────────────────
@@ -171,14 +177,13 @@ async fn nova_colecao_form(State(e): State<Estado>, headers: HeaderMap) -> Respo
     if sessao(&e, &headers).await.is_none() {
         return entrar();
     }
-    html(admin::pagina("Nova Coleção", admin::pagina_nova_colecao(None)))
+    html(admin::pagina(
+        "Nova Coleção",
+        admin::pagina_nova_colecao(None),
+    ))
 }
 
-async fn nova_colecao_criar(
-    State(e): State<Estado>,
-    headers: HeaderMap,
-    corpo: Bytes,
-) -> Response {
+async fn nova_colecao_criar(State(e): State<Estado>, headers: HeaderMap, corpo: Bytes) -> Response {
     if sessao(&e, &headers).await.is_none() {
         return entrar();
     }
@@ -211,35 +216,55 @@ async fn nova_colecao_criar(
         .filter(|s| !s.is_empty());
 
     let list_rule = regra_do_form(
-        p.iter().find(|(k, _)| k == "list_rule_tipo").map(|(_, v)| v.as_str()),
-        p.iter().find(|(k, _)| k == "list_rule_expr").map(|(_, v)| v.as_str()),
+        p.iter()
+            .find(|(k, _)| k == "list_rule_tipo")
+            .map(|(_, v)| v.as_str()),
+        p.iter()
+            .find(|(k, _)| k == "list_rule_expr")
+            .map(|(_, v)| v.as_str()),
     );
     let view_rule = regra_do_form(
-        p.iter().find(|(k, _)| k == "view_rule_tipo").map(|(_, v)| v.as_str()),
-        p.iter().find(|(k, _)| k == "view_rule_expr").map(|(_, v)| v.as_str()),
+        p.iter()
+            .find(|(k, _)| k == "view_rule_tipo")
+            .map(|(_, v)| v.as_str()),
+        p.iter()
+            .find(|(k, _)| k == "view_rule_expr")
+            .map(|(_, v)| v.as_str()),
     );
     let create_rule = if kind == CollectionType::View {
         None
     } else {
         regra_do_form(
-            p.iter().find(|(k, _)| k == "create_rule_tipo").map(|(_, v)| v.as_str()),
-            p.iter().find(|(k, _)| k == "create_rule_expr").map(|(_, v)| v.as_str()),
+            p.iter()
+                .find(|(k, _)| k == "create_rule_tipo")
+                .map(|(_, v)| v.as_str()),
+            p.iter()
+                .find(|(k, _)| k == "create_rule_expr")
+                .map(|(_, v)| v.as_str()),
         )
     };
     let update_rule = if kind == CollectionType::View {
         None
     } else {
         regra_do_form(
-            p.iter().find(|(k, _)| k == "update_rule_tipo").map(|(_, v)| v.as_str()),
-            p.iter().find(|(k, _)| k == "update_rule_expr").map(|(_, v)| v.as_str()),
+            p.iter()
+                .find(|(k, _)| k == "update_rule_tipo")
+                .map(|(_, v)| v.as_str()),
+            p.iter()
+                .find(|(k, _)| k == "update_rule_expr")
+                .map(|(_, v)| v.as_str()),
         )
     };
     let delete_rule = if kind == CollectionType::View {
         None
     } else {
         regra_do_form(
-            p.iter().find(|(k, _)| k == "delete_rule_tipo").map(|(_, v)| v.as_str()),
-            p.iter().find(|(k, _)| k == "delete_rule_expr").map(|(_, v)| v.as_str()),
+            p.iter()
+                .find(|(k, _)| k == "delete_rule_tipo")
+                .map(|(_, v)| v.as_str()),
+            p.iter()
+                .find(|(k, _)| k == "delete_rule_expr")
+                .map(|(_, v)| v.as_str()),
         )
     };
 
@@ -264,6 +289,7 @@ async fn nova_colecao_criar(
         view_query,
         created: String::new(),
         updated: String::new(),
+        ..Default::default()
     };
 
     match e.banco.criar_colecao(col).await {
@@ -284,7 +310,9 @@ async fn colecao_settings_form(
         return entrar();
     }
     let Ok(c) = e.banco.colecao(&nome).await else {
-        return pagina_erro(Erro::NaoEncontrado(format!("A coleção '{nome}' não existe.")));
+        return pagina_erro(Erro::NaoEncontrado(format!(
+            "A coleção '{nome}' não existe."
+        )));
     };
     html(admin::pagina(
         &format!("Configurações: {}", c.name),
@@ -302,7 +330,9 @@ async fn colecao_settings_salvar(
         return entrar();
     }
     let Ok(antiga) = e.banco.colecao(&nome).await else {
-        return pagina_erro(Erro::NaoEncontrado(format!("A coleção '{nome}' não existe.")));
+        return pagina_erro(Erro::NaoEncontrado(format!(
+            "A coleção '{nome}' não existe."
+        )));
     };
     let p = pares(&corpo);
     let novo_nome = if antiga.system {
@@ -326,35 +356,55 @@ async fn colecao_settings_salvar(
     };
 
     let list_rule = regra_do_form(
-        p.iter().find(|(k, _)| k == "list_rule_tipo").map(|(_, v)| v.as_str()),
-        p.iter().find(|(k, _)| k == "list_rule_expr").map(|(_, v)| v.as_str()),
+        p.iter()
+            .find(|(k, _)| k == "list_rule_tipo")
+            .map(|(_, v)| v.as_str()),
+        p.iter()
+            .find(|(k, _)| k == "list_rule_expr")
+            .map(|(_, v)| v.as_str()),
     );
     let view_rule = regra_do_form(
-        p.iter().find(|(k, _)| k == "view_rule_tipo").map(|(_, v)| v.as_str()),
-        p.iter().find(|(k, _)| k == "view_rule_expr").map(|(_, v)| v.as_str()),
+        p.iter()
+            .find(|(k, _)| k == "view_rule_tipo")
+            .map(|(_, v)| v.as_str()),
+        p.iter()
+            .find(|(k, _)| k == "view_rule_expr")
+            .map(|(_, v)| v.as_str()),
     );
     let create_rule = if antiga.kind == CollectionType::View {
         None
     } else {
         regra_do_form(
-            p.iter().find(|(k, _)| k == "create_rule_tipo").map(|(_, v)| v.as_str()),
-            p.iter().find(|(k, _)| k == "create_rule_expr").map(|(_, v)| v.as_str()),
+            p.iter()
+                .find(|(k, _)| k == "create_rule_tipo")
+                .map(|(_, v)| v.as_str()),
+            p.iter()
+                .find(|(k, _)| k == "create_rule_expr")
+                .map(|(_, v)| v.as_str()),
         )
     };
     let update_rule = if antiga.kind == CollectionType::View {
         None
     } else {
         regra_do_form(
-            p.iter().find(|(k, _)| k == "update_rule_tipo").map(|(_, v)| v.as_str()),
-            p.iter().find(|(k, _)| k == "update_rule_expr").map(|(_, v)| v.as_str()),
+            p.iter()
+                .find(|(k, _)| k == "update_rule_tipo")
+                .map(|(_, v)| v.as_str()),
+            p.iter()
+                .find(|(k, _)| k == "update_rule_expr")
+                .map(|(_, v)| v.as_str()),
         )
     };
     let delete_rule = if antiga.kind == CollectionType::View {
         None
     } else {
         regra_do_form(
-            p.iter().find(|(k, _)| k == "delete_rule_tipo").map(|(_, v)| v.as_str()),
-            p.iter().find(|(k, _)| k == "delete_rule_expr").map(|(_, v)| v.as_str()),
+            p.iter()
+                .find(|(k, _)| k == "delete_rule_tipo")
+                .map(|(_, v)| v.as_str()),
+            p.iter()
+                .find(|(k, _)| k == "delete_rule_expr")
+                .map(|(_, v)| v.as_str()),
         )
     };
 
@@ -362,7 +412,10 @@ async fn colecao_settings_salvar(
     if antiga.kind != CollectionType::View {
         let novos_campos = campos_do_form(&p);
         for novo_f in novos_campos {
-            if !fields.iter().any(|f| f.name.eq_ignore_ascii_case(&novo_f.name)) {
+            if !fields
+                .iter()
+                .any(|f| f.name.eq_ignore_ascii_case(&novo_f.name))
+            {
                 fields.push(novo_f);
             }
         }
@@ -377,6 +430,44 @@ async fn colecao_settings_salvar(
     nova.update_rule = update_rule;
     nova.delete_rule = delete_rule;
     nova.fields = fields;
+
+    if antiga.kind == CollectionType::Auth {
+        let mut otp = antiga.otp_config();
+        otp.enabled = p
+            .iter()
+            .any(|(k, v)| k == "otp_enabled" && (v == "true" || v == "on" || v == "1"));
+        if let Some((_, v)) = p.iter().find(|(k, _)| k == "otp_duration")
+            && let Ok(dur) = v.parse::<i64>()
+        {
+            otp.duration = dur.clamp(30, 86400);
+        }
+        if let Some((_, v)) = p.iter().find(|(k, _)| k == "otp_length")
+            && let Ok(len) = v.parse::<usize>()
+        {
+            otp.length = len.clamp(4, 10);
+        }
+        nova.otp = Some(otp);
+
+        let mut mfa = antiga.mfa_config();
+        mfa.enabled = p
+            .iter()
+            .any(|(k, v)| k == "mfa_enabled" && (v == "true" || v == "on" || v == "1"));
+        if let Some((_, v)) = p.iter().find(|(k, _)| k == "mfa_duration")
+            && let Ok(dur) = v.parse::<i64>()
+        {
+            mfa.duration = dur.clamp(60, 86400);
+        }
+        if let Some((_, v)) = p.iter().find(|(k, _)| k == "mfa_rule") {
+            mfa.rule = v.trim().to_string();
+        }
+        nova.mfa = Some(mfa);
+
+        let mut oauth2 = antiga.oauth2_config();
+        oauth2.enabled = p
+            .iter()
+            .any(|(k, v)| k == "oauth2_enabled" && (v == "true" || v == "on" || v == "1"));
+        nova.oauth2 = Some(oauth2);
+    }
 
     match e.banco.atualizar_colecao(&antiga.name, nova).await {
         Ok(atualizada) => {
@@ -787,13 +878,17 @@ async fn logs_pagina(
     if sessao(&e, &headers).await.is_none() {
         return Err(Redirect::to("/_/login"));
     }
-    let lista = e.banco.logs_listar(1, 100, None).await.unwrap_or(forja_core::store::PaginaLogs {
-        page: 1,
-        per_page: 100,
-        total_items: 0,
-        total_pages: 0,
-        items: Vec::new(),
-    });
+    let lista = e
+        .banco
+        .logs_listar(1, 100, None)
+        .await
+        .unwrap_or(forja_core::store::PaginaLogs {
+            page: 1,
+            per_page: 100,
+            total_items: 0,
+            total_pages: 0,
+            items: Vec::new(),
+        });
     let stats = e.banco.logs_stats(None).await.unwrap_or_default();
     Ok(Html(admin::pagina_logs(&lista.items, &stats).into_string()))
 }
@@ -829,7 +924,9 @@ async fn backups_pagina(
         return Err(Redirect::to("/_/login"));
     }
     let itens = e.banco.backups_listar().await.unwrap_or_default();
-    Ok(Html(admin::pagina_backups(&itens, None, None).into_string()))
+    Ok(Html(
+        admin::pagina_backups(&itens, None, None).into_string(),
+    ))
 }
 
 async fn backup_novo_painel(
@@ -985,8 +1082,12 @@ async fn settings_salvar_painel(
     }
 
     match e.banco.salvar_configuracoes(&cfg).await {
-        Ok(salva) => Ok(Html(admin::pagina_settings(&salva, None, Some("Configurações salvas com sucesso!")).into_string())),
-        Err(err) => Ok(Html(admin::pagina_settings(&cfg, Some(&err.to_string()), None).into_string())),
+        Ok(salva) => Ok(Html(
+            admin::pagina_settings(&salva, None, Some("Configurações salvas com sucesso!"))
+                .into_string(),
+        )),
+        Err(err) => Ok(Html(
+            admin::pagina_settings(&cfg, Some(&err.to_string()), None).into_string(),
+        )),
     }
 }
-

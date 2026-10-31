@@ -147,20 +147,20 @@ com uma mensagem clara. "✅" quer dizer validado e guardado.
 |---|---|
 | Superusuário com e-mail e senha (`_superusers/auth-with-password`), senha em Argon2id | ✅ |
 | Usuários de coleções auth com e-mail (ou outro campo de identidade) e senha | ✅ |
-| **OTP** por e-mail (código de uso único) | 📋 |
-| **MFA** (dois métodos diferentes em sequência) | 📋 |
-| **OAuth2** com os provedores do PocketBase: Apple, Bitbucket, Box, Discord, Facebook, Gitea, Gitee, GitHub, GitLab, Google, Instagram, Kakao, Lark, Linear, LiveChat, mailcow, Microsoft, monday.com, Notion, OpenID Connect (até 3 genéricos), Patreon, Planning Center, Spotify, Strava, Trakt, Twitch, Twitter/X, VK, WakaTime, Yandex | 📋 |
-| Fluxo OAuth2 de redirecionamento (`/api/oauth2-redirect`) e PKCE | 📋 |
+| **OTP** por e-mail (código de uso único) | ✅ |
+| **MFA** (dois métodos diferentes em sequência) | ✅ |
+| **OAuth2** com os provedores do PocketBase: Apple, Bitbucket, Box, Discord, Facebook, Gitea, Gitee, GitHub, GitLab, Google, Instagram, Kakao, Lark, Linear, LiveChat, mailcow, Microsoft, monday.com, Notion, OpenID Connect (até 3 genéricos), Patreon, Planning Center, Spotify, Strava, Trakt, Twitch, Twitter/X, VK, WakaTime, Yandex | ✅ |
+| Fluxo OAuth2 de redirecionamento (`/api/oauth2-redirect`) e PKCE | ✅ |
 | Renovar token (`auth-refresh`) | ✅ (superusuário e usuário de coleção auth) |
 | Verificação de e-mail (pedir e confirmar) | ✅ |
 | Redefinir senha (pedir e confirmar) | ✅ |
 | Trocar e-mail (pedir e confirmar) | ✅ |
 | Personificação: superusuário gera token de outro usuário (`impersonate`) | ✅ |
 | Alerta de login de novo dispositivo (`authAlert`) | 📋 |
-| Métodos de login disponíveis por coleção (`auth-methods`) | 📋 |
+| Métodos de login disponíveis por coleção (`auth-methods`) | ✅ |
 | Token JWT de autenticação, invalidado ao trocar a senha | ✅ |
 | Tokens de verificação, senha, e-mail e arquivo | ✅ |
-| Modelos de e-mail editáveis (verificação, senha, troca de e-mail, OTP, alerta) | 📋 (texto fixo; envio no console) |
+| Modelos de e-mail editáveis (verificação, senha, troca de e-mail, OTP, alerta) | ✅ |
 | Gerador do segredo do Sign in with Apple | 📋 |
 
 ## 6. Arquivos
@@ -172,7 +172,7 @@ com uma mensagem clara. "✅" quer dizer validado e guardado.
 | Miniaturas sob demanda (`?thumb=100x100`, com corte e ajuste) | ✅ |
 | Arquivos protegidos com token de arquivo de curta duração | ✅ (3 minutos, e a `viewRule`) |
 | Download forçado (`?download=1`) | ✅ |
-| Testar a conexão S3 pelo painel | 📋 |
+| Testar a conexão S3 pelo painel | ✅ |
 
 ## 7. Tempo real
 

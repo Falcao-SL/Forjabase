@@ -11,7 +11,10 @@ use crate::erro::{Erro, Resultado};
 use crate::filtro::{self, Contexto, Dialeto, Literal};
 use crate::motor::{Executor, Linha};
 use crate::valor::Valor;
-use crate::{Collection, CollectionType, Field, FieldType, agora, auth, data_utc_de_epoch_s, id};
+use crate::{
+    AuthAlertConfig, Collection, CollectionType, Field, FieldType, MfaConfig, OAuth2Config,
+    OtpConfig, PasswordAuthConfig, TokenConfig, agora, auth, data_utc_de_epoch_s, id,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -323,14 +326,17 @@ impl Configuracoes {
     /// Sincroniza `app_name` e `app_url` da raiz com `meta`.
     pub fn sincronizar(&mut self) {
         if self.meta.app_name != self.app_name {
-            if self.app_name != Self::app_name_padrao() && self.meta.app_name == Self::app_name_padrao() {
+            if self.app_name != Self::app_name_padrao()
+                && self.meta.app_name == Self::app_name_padrao()
+            {
                 self.meta.app_name = self.app_name.clone();
             } else {
                 self.app_name = self.meta.app_name.clone();
             }
         }
         if self.meta.app_url != self.app_url {
-            if self.app_url != Self::app_url_padrao() && self.meta.app_url == Self::app_url_padrao() {
+            if self.app_url != Self::app_url_padrao() && self.meta.app_url == Self::app_url_padrao()
+            {
                 self.meta.app_url = self.app_url.clone();
             } else {
                 self.app_url = self.meta.app_url.clone();
@@ -363,6 +369,44 @@ pub struct Credenciais {
     pub senha: String,
     pub token_key: String,
     pub verified: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OtpRegistro {
+    pub id: String,
+    pub collection_id: String,
+    pub record_id: String,
+    pub email: String,
+    pub password: String,
+    pub sent_to: String,
+    pub duration: i64,
+    pub created: String,
+    pub updated: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MfaRegistro {
+    pub id: String,
+    pub collection_id: String,
+    pub record_id: String,
+    pub method: String,
+    pub duration: i64,
+    pub created: String,
+    pub updated: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalAuthRegistro {
+    pub id: String,
+    pub collection_id: String,
+    pub record_id: String,
+    pub provider: String,
+    pub provider_id: String,
+    pub created: String,
+    pub updated: String,
 }
 
 /// Eventos e arquivos que só saem depois do commit de `em_transacao`.
@@ -705,7 +749,8 @@ fn esquema(d: Dialeto) -> Vec<String> {
                 \"indexes\" TEXT NOT NULL DEFAULT '[]',
                 \"created\" TEXT NOT NULL,
                 \"updated\" TEXT NOT NULL,
-                \"viewQuery\" TEXT
+                \"viewQuery\" TEXT,
+                \"options\" TEXT NOT NULL DEFAULT '{{}}'
             )"
         ),
         format!(
@@ -727,6 +772,39 @@ fn esquema(d: Dialeto) -> Vec<String> {
             \"data\" TEXT NOT NULL DEFAULT '{}'
         )".to_string(),
         "CREATE INDEX IF NOT EXISTS \"idx__logs_created\" ON \"_logs\" (\"created\")".to_string(),
+        "CREATE TABLE IF NOT EXISTS \"_externalAuths\" (
+            \"id\" TEXT PRIMARY KEY NOT NULL,
+            \"collectionId\" TEXT NOT NULL,
+            \"recordId\" TEXT NOT NULL,
+            \"provider\" TEXT NOT NULL,
+            \"providerId\" TEXT NOT NULL,
+            \"created\" TEXT NOT NULL,
+            \"updated\" TEXT NOT NULL
+        )".to_string(),
+        "CREATE UNIQUE INDEX IF NOT EXISTS \"idx__externalAuths_unique\" ON \"_externalAuths\" (\"collectionId\", \"provider\", \"providerId\")".to_string(),
+        "CREATE INDEX IF NOT EXISTS \"idx__externalAuths_record\" ON \"_externalAuths\" (\"collectionId\", \"recordId\")".to_string(),
+        "CREATE TABLE IF NOT EXISTS \"_otps\" (
+            \"id\" TEXT PRIMARY KEY NOT NULL,
+            \"collectionId\" TEXT NOT NULL,
+            \"recordId\" TEXT NOT NULL,
+            \"email\" TEXT NOT NULL,
+            \"password\" TEXT NOT NULL,
+            \"sentTo\" TEXT NOT NULL DEFAULT '',
+            \"duration\" INTEGER NOT NULL DEFAULT 180,
+            \"created\" TEXT NOT NULL,
+            \"updated\" TEXT NOT NULL
+        )".to_string(),
+        "CREATE INDEX IF NOT EXISTS \"idx__otps_created\" ON \"_otps\" (\"created\")".to_string(),
+        "CREATE TABLE IF NOT EXISTS \"_mfas\" (
+            \"id\" TEXT PRIMARY KEY NOT NULL,
+            \"collectionId\" TEXT NOT NULL,
+            \"recordId\" TEXT NOT NULL,
+            \"method\" TEXT NOT NULL,
+            \"duration\" INTEGER NOT NULL DEFAULT 1800,
+            \"created\" TEXT NOT NULL,
+            \"updated\" TEXT NOT NULL
+        )".to_string(),
+        "CREATE INDEX IF NOT EXISTS \"idx__mfas_created\" ON \"_mfas\" (\"created\")".to_string(),
     ];
     if d == Dialeto::Postgres {
         v.push("CREATE UNIQUE INDEX IF NOT EXISTS \"_collections_name_ci\" ON \"_collections\" (lower(\"name\"))".into());
@@ -1328,7 +1406,54 @@ fn linha_para_registro(c: &Collection, l: Linha) -> Value {
     Value::Object(m)
 }
 
-const COLS_COLECAO: &str = "\"id\", \"name\", \"type\", \"system\", \"fields\", \"listRule\", \"viewRule\", \"createRule\", \"updateRule\", \"deleteRule\", \"indexes\", \"created\", \"updated\", \"viewQuery\"";
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ColecaoOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auth_rule: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    manage_rule: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auth_alert: Option<AuthAlertConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    oauth2: Option<OAuth2Config>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    password_auth: Option<PasswordAuthConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mfa: Option<MfaConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    otp: Option<OtpConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auth_token: Option<TokenConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    password_reset_token: Option<TokenConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    email_change_token: Option<TokenConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verification_token: Option<TokenConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_token: Option<TokenConfig>,
+}
+
+fn serializar_colecao_options(c: &Collection) -> String {
+    let opts = ColecaoOptions {
+        auth_rule: c.auth_rule.clone(),
+        manage_rule: c.manage_rule.clone(),
+        auth_alert: c.auth_alert.clone(),
+        oauth2: c.oauth2.clone(),
+        password_auth: c.password_auth.clone(),
+        mfa: c.mfa.clone(),
+        otp: c.otp.clone(),
+        auth_token: c.auth_token.clone(),
+        password_reset_token: c.password_reset_token.clone(),
+        email_change_token: c.email_change_token.clone(),
+        verification_token: c.verification_token.clone(),
+        file_token: c.file_token.clone(),
+    };
+    serde_json::to_string(&opts).unwrap_or_else(|_| "{}".into())
+}
+
+const COLS_COLECAO: &str = "\"id\", \"name\", \"type\", \"system\", \"fields\", \"listRule\", \"viewRule\", \"createRule\", \"updateRule\", \"deleteRule\", \"indexes\", \"created\", \"updated\", \"viewQuery\", \"options\"";
 
 fn ler_colecao(l: Linha) -> Collection {
     let mut it = l.into_iter();
@@ -1350,10 +1475,40 @@ fn ler_colecao(l: Linha) -> Collection {
         regra(prox()),
     );
     let indices = prox().texto_ou_vazio();
+    let created = prox().texto_ou_vazio();
+    let updated = prox().texto_ou_vazio();
+    let view_query = match prox() {
+        Valor::Texto(t) if !t.is_empty() => Some(t),
+        _ => None,
+    };
+    let options_str = prox().texto_ou_vazio();
+    let opts: ColecaoOptions = serde_json::from_str(&options_str).unwrap_or_default();
+    let kind: CollectionType = serde_json::from_value(json!(tipo)).unwrap_or_default();
+
+    let (password_auth, mfa, otp, oauth2, auth_token) = if kind == CollectionType::Auth {
+        (
+            Some(opts.password_auth.unwrap_or_default()),
+            Some(opts.mfa.unwrap_or_default()),
+            Some(opts.otp.unwrap_or_default()),
+            Some(opts.oauth2.unwrap_or_default()),
+            Some(opts.auth_token.unwrap_or(TokenConfig {
+                duration: 1_209_600,
+            })),
+        )
+    } else {
+        (
+            opts.password_auth,
+            opts.mfa,
+            opts.otp,
+            opts.oauth2,
+            opts.auth_token,
+        )
+    };
+
     Collection {
         id,
         name,
-        kind: serde_json::from_value(json!(tipo)).unwrap_or_default(),
+        kind,
         system,
         fields: serde_json::from_str(&campos).unwrap_or_default(),
         list_rule,
@@ -1362,12 +1517,21 @@ fn ler_colecao(l: Linha) -> Collection {
         update_rule,
         delete_rule,
         indexes: serde_json::from_str(&indices).unwrap_or_default(),
-        created: prox().texto_ou_vazio(),
-        updated: prox().texto_ou_vazio(),
-        view_query: match prox() {
-            Valor::Texto(t) if !t.is_empty() => Some(t),
-            _ => None,
-        },
+        created,
+        updated,
+        view_query,
+        auth_rule: opts.auth_rule,
+        manage_rule: opts.manage_rule,
+        auth_alert: opts.auth_alert,
+        oauth2,
+        password_auth,
+        mfa,
+        otp,
+        auth_token,
+        password_reset_token: opts.password_reset_token,
+        email_change_token: opts.email_change_token,
+        verification_token: opts.verification_token,
+        file_token: opts.file_token,
     }
 }
 
@@ -1568,29 +1732,40 @@ impl Banco {
         Ok((texto, params))
     }
 
-    /// Coluna `viewQuery` em bancos criados antes da 0.2.
+    /// Migrações de colunas e tabelas do sistema adicionadas entre versões.
     async fn migrar(&self) -> Resultado<()> {
-        let tem = match self.dialeto() {
+        let (tem_view_query, tem_options) = match self.dialeto() {
             Dialeto::Sqlite => {
                 let cols = self
                     .ex
                     .consultar("PRAGMA table_info('_collections')", vec![])
                     .await?;
-                cols.iter()
-                    .any(|l| l.get(1).and_then(Valor::texto) == Some("viewQuery"))
+                let vq = cols
+                    .iter()
+                    .any(|l| l.get(1).and_then(Valor::texto) == Some("viewQuery"));
+                let opt = cols
+                    .iter()
+                    .any(|l| l.get(1).and_then(Valor::texto) == Some("options"));
+                (vq, opt)
             }
             Dialeto::Postgres => {
                 let cols = self
                     .ex
                     .consultar(
-                        "SELECT column_name FROM information_schema.columns WHERE table_name = '_collections' AND column_name = 'viewQuery'",
+                        "SELECT column_name FROM information_schema.columns WHERE table_name = '_collections'",
                         vec![],
                     )
                     .await?;
-                !cols.is_empty()
+                let vq = cols
+                    .iter()
+                    .any(|l| l.first().and_then(Valor::texto) == Some("viewQuery"));
+                let opt = cols
+                    .iter()
+                    .any(|l| l.first().and_then(Valor::texto) == Some("options"));
+                (vq, opt)
             }
         };
-        if !tem {
+        if !tem_view_query {
             let sql = if self.dialeto() == Dialeto::Postgres {
                 "ALTER TABLE \"_collections\" ADD COLUMN IF NOT EXISTS \"viewQuery\" TEXT"
             } else {
@@ -1598,6 +1773,55 @@ impl Banco {
             };
             self.ex.executar(sql, vec![]).await?;
         }
+        if !tem_options {
+            let sql = if self.dialeto() == Dialeto::Postgres {
+                "ALTER TABLE \"_collections\" ADD COLUMN IF NOT EXISTS \"options\" TEXT NOT NULL DEFAULT '{}'"
+            } else {
+                "ALTER TABLE \"_collections\" ADD COLUMN \"options\" TEXT NOT NULL DEFAULT '{}'"
+            };
+            self.ex.executar(sql, vec![]).await?;
+        }
+
+        // Garante que tabelas de OAuth2, OTP e MFA existam
+        let extras = [
+            "CREATE TABLE IF NOT EXISTS \"_externalAuths\" (
+                \"id\" TEXT PRIMARY KEY NOT NULL,
+                \"collectionId\" TEXT NOT NULL,
+                \"recordId\" TEXT NOT NULL,
+                \"provider\" TEXT NOT NULL,
+                \"providerId\" TEXT NOT NULL,
+                \"created\" TEXT NOT NULL,
+                \"updated\" TEXT NOT NULL
+            )",
+            "CREATE UNIQUE INDEX IF NOT EXISTS \"idx__externalAuths_unique\" ON \"_externalAuths\" (\"collectionId\", \"provider\", \"providerId\")",
+            "CREATE INDEX IF NOT EXISTS \"idx__externalAuths_record\" ON \"_externalAuths\" (\"collectionId\", \"recordId\")",
+            "CREATE TABLE IF NOT EXISTS \"_otps\" (
+                \"id\" TEXT PRIMARY KEY NOT NULL,
+                \"collectionId\" TEXT NOT NULL,
+                \"recordId\" TEXT NOT NULL,
+                \"email\" TEXT NOT NULL,
+                \"password\" TEXT NOT NULL,
+                \"sentTo\" TEXT NOT NULL DEFAULT '',
+                \"duration\" INTEGER NOT NULL DEFAULT 180,
+                \"created\" TEXT NOT NULL,
+                \"updated\" TEXT NOT NULL
+            )",
+            "CREATE INDEX IF NOT EXISTS \"idx__otps_created\" ON \"_otps\" (\"created\")",
+            "CREATE TABLE IF NOT EXISTS \"_mfas\" (
+                \"id\" TEXT PRIMARY KEY NOT NULL,
+                \"collectionId\" TEXT NOT NULL,
+                \"recordId\" TEXT NOT NULL,
+                \"method\" TEXT NOT NULL,
+                \"duration\" INTEGER NOT NULL DEFAULT 1800,
+                \"created\" TEXT NOT NULL,
+                \"updated\" TEXT NOT NULL
+            )",
+            "CREATE INDEX IF NOT EXISTS \"idx__mfas_created\" ON \"_mfas\" (\"created\")",
+        ];
+        for cmd in extras {
+            self.ex.executar(cmd, vec![]).await?;
+        }
+
         Ok(())
     }
 
@@ -1881,7 +2105,8 @@ impl Banco {
     pub async fn salvar_configuracoes(&self, c: &Configuracoes) -> Resultado<Configuracoes> {
         let mut cfg = c.clone();
         cfg.sincronizar();
-        let json = serde_json::to_string(&cfg).map_err(|e| Erro::Interno(format!("settings: {e}")))?;
+        let json =
+            serde_json::to_string(&cfg).map_err(|e| Erro::Interno(format!("settings: {e}")))?;
         self.salvar_parametro("settings", &json).await?;
         Ok(cfg)
     }
@@ -1941,7 +2166,9 @@ impl Banco {
         let sql = "SELECT \"id\", \"created\", \"updated\", \"level\", \"message\", \"data\" FROM \"_logs\" WHERE \"id\" = ?";
         let mut linhas = self.ex.consultar(sql, vec![id.into()]).await?;
         if linhas.is_empty() {
-            return Err(Erro::NaoEncontrado("The requested log was not found.".into()));
+            return Err(Erro::NaoEncontrado(
+                "The requested log was not found.".into(),
+            ));
         }
         let mut it = linhas.remove(0).into_iter();
         let id = it.next().unwrap_or(Valor::Nulo).texto_ou_vazio();
@@ -1950,7 +2177,8 @@ impl Banco {
         let level = it.next().unwrap_or(Valor::Nulo).int() as i32;
         let message = it.next().unwrap_or(Valor::Nulo).texto_ou_vazio();
         let data_raw = it.next().unwrap_or(Valor::Nulo).texto_ou_vazio();
-        let data = serde_json::from_str(&data_raw).unwrap_or(serde_json::Value::Object(Default::default()));
+        let data = serde_json::from_str(&data_raw)
+            .unwrap_or(serde_json::Value::Object(Default::default()));
 
         Ok(LogItem {
             id,
@@ -1991,7 +2219,11 @@ impl Banco {
         let sql_total = format!("SELECT COUNT(*) FROM \"_logs\"{where_clause}");
         let linhas_total = self.ex.consultar(&sql_total, params.clone()).await?;
         let total_items = linhas_total.first().map(|l| l[0].int()).unwrap_or(0) as usize;
-        let total_pages = if total_items == 0 { 0 } else { total_items.div_ceil(por_pagina) };
+        let total_pages = if total_items == 0 {
+            0
+        } else {
+            total_items.div_ceil(por_pagina)
+        };
 
         let mut params_select = params;
         params_select.push(Valor::Int(por_pagina as i64));
@@ -2012,8 +2244,16 @@ impl Banco {
                 let level = it.next().unwrap_or(Valor::Nulo).int() as i32;
                 let message = it.next().unwrap_or(Valor::Nulo).texto_ou_vazio();
                 let data_raw = it.next().unwrap_or(Valor::Nulo).texto_ou_vazio();
-                let data = serde_json::from_str(&data_raw).unwrap_or(serde_json::Value::Object(Default::default()));
-                LogItem { id, created, updated, level, message, data }
+                let data = serde_json::from_str(&data_raw)
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                LogItem {
+                    id,
+                    created,
+                    updated,
+                    level,
+                    message,
+                    data,
+                }
             })
             .collect();
 
@@ -2141,7 +2381,10 @@ impl Banco {
 
         let destino_zip = backups_dir.join(&key);
 
-        let _ = self.ex.executar("PRAGMA wal_checkpoint(TRUNCATE)", vec![]).await;
+        let _ = self
+            .ex
+            .executar("PRAGMA wal_checkpoint(TRUNCATE)", vec![])
+            .await;
 
         let raiz_clone = pasta_raiz.clone();
         let destino_clone = destino_zip.clone();
@@ -2157,10 +2400,9 @@ impl Banco {
             if db_path.exists() {
                 zip.start_file("data.db", options)
                     .map_err(|e| Erro::Interno(e.to_string()))?;
-                let mut db_file = std::fs::File::open(&db_path)
-                    .map_err(|e| Erro::Interno(e.to_string()))?;
-                std::io::copy(&mut db_file, &mut zip)
-                    .map_err(|e| Erro::Interno(e.to_string()))?;
+                let mut db_file =
+                    std::fs::File::open(&db_path).map_err(|e| Erro::Interno(e.to_string()))?;
+                std::io::copy(&mut db_file, &mut zip).map_err(|e| Erro::Interno(e.to_string()))?;
             }
 
             let storage_path = raiz_clone.join("storage");
@@ -2239,13 +2481,15 @@ impl Banco {
 
         let raiz_clone = pasta_raiz.clone();
         tokio::task::spawn_blocking(move || -> Resultado<()> {
-            let file = std::fs::File::open(&backup_path)
-                .map_err(|e| Erro::Interno(e.to_string()))?;
+            let file =
+                std::fs::File::open(&backup_path).map_err(|e| Erro::Interno(e.to_string()))?;
             let mut archive = zip::ZipArchive::new(file)
                 .map_err(|e| Erro::Interno(format!("Invalid zip archive: {e}")))?;
 
             for i in 0..archive.len() {
-                let mut item = archive.by_index(i).map_err(|e| Erro::Interno(e.to_string()))?;
+                let mut item = archive
+                    .by_index(i)
+                    .map_err(|e| Erro::Interno(e.to_string()))?;
                 let outpath = match item.enclosed_name() {
                     Some(path) => raiz_clone.join(path),
                     None => continue,
@@ -2259,8 +2503,10 @@ impl Banco {
                     {
                         std::fs::create_dir_all(p).map_err(|e| Erro::Interno(e.to_string()))?;
                     }
-                    let mut outfile = std::fs::File::create(&outpath).map_err(|e| Erro::Interno(e.to_string()))?;
-                    std::io::copy(&mut item, &mut outfile).map_err(|e| Erro::Interno(e.to_string()))?;
+                    let mut outfile = std::fs::File::create(&outpath)
+                        .map_err(|e| Erro::Interno(e.to_string()))?;
+                    std::io::copy(&mut item, &mut outfile)
+                        .map_err(|e| Erro::Interno(e.to_string()))?;
                 }
             }
             Ok(())
@@ -2275,12 +2521,10 @@ impl Banco {
 
     pub async fn crons_listar(&self) -> Resultado<Vec<CronItem>> {
         let cfg = self.configuracoes().await;
-        let mut lista = vec![
-            CronItem {
-                id: "__pbLogsCleanup__".into(),
-                expression: "0 */6 * * *".into(),
-            },
-        ];
+        let mut lista = vec![CronItem {
+            id: "__pbLogsCleanup__".into(),
+            expression: "0 */6 * * *".into(),
+        }];
         if !cfg.backups.cron.trim().is_empty() {
             lista.push(CronItem {
                 id: "__pbBackupRun__".into(),
@@ -2337,6 +2581,23 @@ impl Banco {
         // Toda coleção `auth` ganha os cinco campos de sistema do PocketBase.
         if c.kind == CollectionType::Auth {
             c.fields = injetar_campos_auth(c.fields);
+            if c.password_auth.is_none() {
+                c.password_auth = Some(PasswordAuthConfig::default());
+            }
+            if c.mfa.is_none() {
+                c.mfa = Some(MfaConfig::default());
+            }
+            if c.otp.is_none() {
+                c.otp = Some(OtpConfig::default());
+            }
+            if c.oauth2.is_none() {
+                c.oauth2 = Some(OAuth2Config::default());
+            }
+            if c.auth_token.is_none() {
+                c.auth_token = Some(TokenConfig {
+                    duration: 1_209_600,
+                });
+            }
         }
         if c.kind == CollectionType::View {
             let q = match c.view_query.as_deref() {
@@ -2408,7 +2669,7 @@ impl Banco {
         }
         let insert = (
             format!(
-                "INSERT INTO \"_collections\" ({COLS_COLECAO}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                "INSERT INTO \"_collections\" ({COLS_COLECAO}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             ),
             vec![
                 c.id.clone().into(),
@@ -2433,6 +2694,7 @@ impl Banco {
                 c.created.clone().into(),
                 c.updated.clone().into(),
                 c.view_query.clone().into(),
+                serializar_colecao_options(&c).into(),
             ],
         );
         let criar_relacao = if c.kind == CollectionType::View {
@@ -2520,6 +2782,42 @@ impl Banco {
         }
         if c.kind == CollectionType::Auth {
             c.fields = injetar_campos_auth(c.fields);
+            if c.auth_rule.is_none() {
+                c.auth_rule = antiga.auth_rule;
+            }
+            if c.manage_rule.is_none() {
+                c.manage_rule = antiga.manage_rule;
+            }
+            if c.auth_alert.is_none() {
+                c.auth_alert = antiga.auth_alert;
+            }
+            if c.oauth2.is_none() {
+                c.oauth2 = antiga.oauth2;
+            }
+            if c.password_auth.is_none() {
+                c.password_auth = antiga.password_auth;
+            }
+            if c.mfa.is_none() {
+                c.mfa = antiga.mfa;
+            }
+            if c.otp.is_none() {
+                c.otp = antiga.otp;
+            }
+            if c.auth_token.is_none() {
+                c.auth_token = antiga.auth_token;
+            }
+            if c.password_reset_token.is_none() {
+                c.password_reset_token = antiga.password_reset_token;
+            }
+            if c.email_change_token.is_none() {
+                c.email_change_token = antiga.email_change_token;
+            }
+            if c.verification_token.is_none() {
+                c.verification_token = antiga.verification_token;
+            }
+            if c.file_token.is_none() {
+                c.file_token = antiga.file_token;
+            }
         }
         if c.kind == CollectionType::View {
             let q = match c.view_query.as_deref().or(antiga.view_query.as_deref()) {
@@ -2591,11 +2889,23 @@ impl Banco {
         }
 
         if c.kind != CollectionType::View {
-            let tabela = if c.name != antiga.name { &c.name } else { &antiga.name };
+            let tabela = if c.name != antiga.name {
+                &c.name
+            } else {
+                &antiga.name
+            };
             for f in &c.fields {
-                if !antiga.fields.iter().any(|old| old.name.eq_ignore_ascii_case(&f.name)) {
+                if !antiga
+                    .fields
+                    .iter()
+                    .any(|old| old.name.eq_ignore_ascii_case(&f.name))
+                {
                     comandos.push((
-                        format!("ALTER TABLE \"{tabela}\" ADD COLUMN \"{}\" {}", f.name, tipo_sql(f, d)),
+                        format!(
+                            "ALTER TABLE \"{tabela}\" ADD COLUMN \"{}\" {}",
+                            f.name,
+                            tipo_sql(f, d)
+                        ),
                         vec![],
                     ));
                 }
@@ -2605,7 +2915,7 @@ impl Banco {
         c.created = antiga.created;
         c.updated = agora();
         comandos.push((
-            "UPDATE \"_collections\" SET \"name\" = ?, \"fields\" = ?, \"listRule\" = ?, \"viewRule\" = ?, \"createRule\" = ?, \"updateRule\" = ?, \"deleteRule\" = ?, \"indexes\" = ?, \"updated\" = ?, \"viewQuery\" = ? WHERE \"id\" = ?".into(),
+            "UPDATE \"_collections\" SET \"name\" = ?, \"fields\" = ?, \"listRule\" = ?, \"viewRule\" = ?, \"createRule\" = ?, \"updateRule\" = ?, \"deleteRule\" = ?, \"indexes\" = ?, \"updated\" = ?, \"viewQuery\" = ?, \"options\" = ? WHERE \"id\" = ?".into(),
             vec![
                 c.name.clone().into(),
                 serde_json::to_string(&c.fields).unwrap_or_else(|_| "[]".into()).into(),
@@ -2617,6 +2927,7 @@ impl Banco {
                 serde_json::to_string(&c.indexes).unwrap_or_else(|_| "[]".into()).into(),
                 c.updated.clone().into(),
                 c.view_query.clone().into(),
+                serializar_colecao_options(&c).into(),
                 c.id.clone().into(),
             ],
         ));
@@ -3201,6 +3512,267 @@ impl Banco {
             .await
             .unwrap_or_else(|_| json!({ "id": id }));
         self.publicar(&c.name, Acao::Atualizar, id, registro);
+        Ok(())
+    }
+
+    // ── OTP (One-Time Password) ─────────────────────────────────────────────
+
+    pub async fn otp_criar(
+        &self,
+        colecao_id: &str,
+        record_id: &str,
+        email: &str,
+        hash_codigo: &str,
+        sent_to: &str,
+        duracao: i64,
+    ) -> Resultado<String> {
+        let id = id::novo();
+        let agora_str = agora();
+        self.ex
+            .executar(
+                "INSERT INTO \"_otps\" (\"id\", \"collectionId\", \"recordId\", \"email\", \"password\", \"sentTo\", \"duration\", \"created\", \"updated\") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                vec![
+                    id.clone().into(),
+                    colecao_id.into(),
+                    record_id.into(),
+                    email.into(),
+                    hash_codigo.into(),
+                    sent_to.into(),
+                    duracao.into(),
+                    agora_str.clone().into(),
+                    agora_str.into(),
+                ],
+            )
+            .await?;
+        Ok(id)
+    }
+
+    pub async fn otp_obter(
+        &self,
+        colecao_id: &str,
+        otp_id: &str,
+    ) -> Resultado<Option<OtpRegistro>> {
+        let linhas = self
+            .ex
+            .consultar(
+                "SELECT \"id\", \"collectionId\", \"recordId\", \"email\", \"password\", \"sentTo\", \"duration\", \"created\", \"updated\" FROM \"_otps\" WHERE \"id\" = ? AND \"collectionId\" = ?",
+                vec![otp_id.into(), colecao_id.into()],
+            )
+            .await?;
+        if let Some(l) = linhas.into_iter().next() {
+            let mut it = l.into_iter();
+            let mut prox = || it.next().unwrap_or(Valor::Nulo);
+            Ok(Some(OtpRegistro {
+                id: prox().texto_ou_vazio(),
+                collection_id: prox().texto_ou_vazio(),
+                record_id: prox().texto_ou_vazio(),
+                email: prox().texto_ou_vazio(),
+                password: prox().texto_ou_vazio(),
+                sent_to: prox().texto_ou_vazio(),
+                duration: prox().int(),
+                created: prox().texto_ou_vazio(),
+                updated: prox().texto_ou_vazio(),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn otp_apagar(&self, otp_id: &str) -> Resultado<()> {
+        self.ex
+            .executar(
+                "DELETE FROM \"_otps\" WHERE \"id\" = ?",
+                vec![otp_id.into()],
+            )
+            .await?;
+        Ok(())
+    }
+
+    // ── MFA (Multi-Factor Authentication) ───────────────────────────────────
+
+    pub async fn mfa_criar(
+        &self,
+        colecao_id: &str,
+        record_id: &str,
+        metodo: &str,
+        duracao: i64,
+    ) -> Resultado<String> {
+        let id = id::novo();
+        let agora_str = agora();
+        self.ex
+            .executar(
+                "INSERT INTO \"_mfas\" (\"id\", \"collectionId\", \"recordId\", \"method\", \"duration\", \"created\", \"updated\") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                vec![
+                    id.clone().into(),
+                    colecao_id.into(),
+                    record_id.into(),
+                    metodo.into(),
+                    duracao.into(),
+                    agora_str.clone().into(),
+                    agora_str.into(),
+                ],
+            )
+            .await?;
+        Ok(id)
+    }
+
+    pub async fn mfa_obter(
+        &self,
+        colecao_id: &str,
+        mfa_id: &str,
+    ) -> Resultado<Option<MfaRegistro>> {
+        let linhas = self
+            .ex
+            .consultar(
+                "SELECT \"id\", \"collectionId\", \"recordId\", \"method\", \"duration\", \"created\", \"updated\" FROM \"_mfas\" WHERE \"id\" = ? AND \"collectionId\" = ?",
+                vec![mfa_id.into(), colecao_id.into()],
+            )
+            .await?;
+        if let Some(l) = linhas.into_iter().next() {
+            let mut it = l.into_iter();
+            let mut prox = || it.next().unwrap_or(Valor::Nulo);
+            Ok(Some(MfaRegistro {
+                id: prox().texto_ou_vazio(),
+                collection_id: prox().texto_ou_vazio(),
+                record_id: prox().texto_ou_vazio(),
+                method: prox().texto_ou_vazio(),
+                duration: prox().int(),
+                created: prox().texto_ou_vazio(),
+                updated: prox().texto_ou_vazio(),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn mfa_apagar(&self, mfa_id: &str) -> Resultado<()> {
+        self.ex
+            .executar(
+                "DELETE FROM \"_mfas\" WHERE \"id\" = ?",
+                vec![mfa_id.into()],
+            )
+            .await?;
+        Ok(())
+    }
+
+    // ── External Auths (OAuth2 Linkings) ───────────────────────────────────
+
+    pub async fn external_auth_obter(
+        &self,
+        colecao_id: &str,
+        provedor: &str,
+        provedor_id: &str,
+    ) -> Resultado<Option<ExternalAuthRegistro>> {
+        let linhas = self
+            .ex
+            .consultar(
+                "SELECT \"id\", \"collectionId\", \"recordId\", \"provider\", \"providerId\", \"created\", \"updated\" FROM \"_externalAuths\" WHERE \"collectionId\" = ? AND \"provider\" = ? AND \"providerId\" = ?",
+                vec![colecao_id.into(), provedor.into(), provedor_id.into()],
+            )
+            .await?;
+        if let Some(l) = linhas.into_iter().next() {
+            let mut it = l.into_iter();
+            let mut prox = || it.next().unwrap_or(Valor::Nulo);
+            Ok(Some(ExternalAuthRegistro {
+                id: prox().texto_ou_vazio(),
+                collection_id: prox().texto_ou_vazio(),
+                record_id: prox().texto_ou_vazio(),
+                provider: prox().texto_ou_vazio(),
+                provider_id: prox().texto_ou_vazio(),
+                created: prox().texto_ou_vazio(),
+                updated: prox().texto_ou_vazio(),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn external_auth_criar(
+        &self,
+        colecao_id: &str,
+        record_id: &str,
+        provedor: &str,
+        provedor_id: &str,
+    ) -> Resultado<ExternalAuthRegistro> {
+        let id = id::novo();
+        let agora_str = agora();
+        self.ex
+            .executar(
+                "INSERT INTO \"_externalAuths\" (\"id\", \"collectionId\", \"recordId\", \"provider\", \"providerId\", \"created\", \"updated\") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                vec![
+                    id.clone().into(),
+                    colecao_id.into(),
+                    record_id.into(),
+                    provedor.into(),
+                    provedor_id.into(),
+                    agora_str.clone().into(),
+                    agora_str.clone().into(),
+                ],
+            )
+            .await?;
+        Ok(ExternalAuthRegistro {
+            id,
+            collection_id: colecao_id.into(),
+            record_id: record_id.into(),
+            provider: provedor.into(),
+            provider_id: provedor_id.into(),
+            created: agora_str.clone(),
+            updated: agora_str,
+        })
+    }
+
+    pub async fn external_auth_listar(
+        &self,
+        colecao_id: &str,
+        record_id: &str,
+    ) -> Resultado<Vec<ExternalAuthRegistro>> {
+        let linhas = self
+            .ex
+            .consultar(
+                "SELECT \"id\", \"collectionId\", \"recordId\", \"provider\", \"providerId\", \"created\", \"updated\" FROM \"_externalAuths\" WHERE \"collectionId\" = ? AND \"recordId\" = ? ORDER BY \"created\"",
+                vec![colecao_id.into(), record_id.into()],
+            )
+            .await?;
+        Ok(linhas
+            .into_iter()
+            .map(|l| {
+                let mut it = l.into_iter();
+                let mut prox = || it.next().unwrap_or(Valor::Nulo);
+                ExternalAuthRegistro {
+                    id: prox().texto_ou_vazio(),
+                    collection_id: prox().texto_ou_vazio(),
+                    record_id: prox().texto_ou_vazio(),
+                    provider: prox().texto_ou_vazio(),
+                    provider_id: prox().texto_ou_vazio(),
+                    created: prox().texto_ou_vazio(),
+                    updated: prox().texto_ou_vazio(),
+                }
+            })
+            .collect())
+    }
+
+    pub async fn external_auth_apagar(&self, id: &str) -> Resultado<()> {
+        self.ex
+            .executar(
+                "DELETE FROM \"_externalAuths\" WHERE \"id\" = ?",
+                vec![id.into()],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn external_auth_apagar_por_provider(
+        &self,
+        colecao_id: &str,
+        record_id: &str,
+        provedor: &str,
+    ) -> Resultado<()> {
+        self.ex
+            .executar(
+                "DELETE FROM \"_externalAuths\" WHERE \"collectionId\" = ? AND \"recordId\" = ? AND \"provider\" = ?",
+                vec![colecao_id.into(), record_id.into(), provedor.into()],
+            )
+            .await?;
         Ok(())
     }
 
@@ -4546,7 +5118,10 @@ mod tests {
         b.criar_colecao(colecao_produtos()).await.unwrap();
 
         // Consulta válida retorna os campos inferidos (sem o 'id' que é coluna primária implícita)
-        let campos = b.dry_run_view("SELECT id, nome FROM produtos").await.unwrap();
+        let campos = b
+            .dry_run_view("SELECT id, nome FROM produtos")
+            .await
+            .unwrap();
         assert!(campos.iter().any(|f| f.name == "nome"));
 
         // Consulta sem id falha com erro de validação
@@ -5473,11 +6048,19 @@ mod tests {
 
         // 1. Grava logs
         let l1 = b
-            .log_gravar(0, "GET /api/health 200", json!({ "status": 200, "ip": "127.0.0.1" }))
+            .log_gravar(
+                0,
+                "GET /api/health 200",
+                json!({ "status": 200, "ip": "127.0.0.1" }),
+            )
             .await
             .unwrap();
         let l2 = b
-            .log_gravar(4, "POST /api/auth 400", json!({ "status": 400, "ip": "127.0.0.1" }))
+            .log_gravar(
+                4,
+                "POST /api/auth 400",
+                json!({ "status": 400, "ip": "127.0.0.1" }),
+            )
             .await
             .unwrap();
 
@@ -5537,5 +6120,71 @@ mod tests {
 
         // Executa cron manual
         b.cron_executar("__pbLogsCleanup__").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn otp_mfa_e_external_auth_armazenamento() {
+        let b = Banco::sqlite_memoria().await.unwrap();
+
+        // 1. Testa criação e obtenção de OTP
+        let otp_id = b
+            .otp_criar(
+                "col1",
+                "rec1",
+                "user@test.com",
+                "hash123",
+                "user@test.com",
+                180,
+            )
+            .await
+            .unwrap();
+        let obtido = b
+            .otp_obter("col1", &otp_id)
+            .await
+            .unwrap()
+            .expect("otp existe");
+        assert_eq!(obtido.email, "user@test.com");
+        assert_eq!(obtido.record_id, "rec1");
+        assert_eq!(obtido.duration, 180);
+        b.otp_apagar(&otp_id).await.unwrap();
+        assert!(b.otp_obter("col1", &otp_id).await.unwrap().is_none());
+
+        // 2. Testa criação e obtenção de MFA
+        let mfa_id = b.mfa_criar("col1", "rec1", "password", 1800).await.unwrap();
+        let mfa_obtido = b
+            .mfa_obter("col1", &mfa_id)
+            .await
+            .unwrap()
+            .expect("mfa existe");
+        assert_eq!(mfa_obtido.method, "password");
+        assert_eq!(mfa_obtido.duration, 1800);
+        b.mfa_apagar(&mfa_id).await.unwrap();
+        assert!(b.mfa_obter("col1", &mfa_id).await.unwrap().is_none());
+
+        // 3. Testa vínculo de external auth
+        let ext = b
+            .external_auth_criar("col1", "rec1", "google", "g-123")
+            .await
+            .unwrap();
+        assert_eq!(ext.provider, "google");
+        assert_eq!(ext.provider_id, "g-123");
+
+        let achado = b
+            .external_auth_obter("col1", "google", "g-123")
+            .await
+            .unwrap()
+            .expect("ext auth existe");
+        assert_eq!(achado.record_id, "rec1");
+
+        let lista = b.external_auth_listar("col1", "rec1").await.unwrap();
+        assert_eq!(lista.len(), 1);
+
+        b.external_auth_apagar(&ext.id).await.unwrap();
+        assert!(
+            b.external_auth_obter("col1", "google", "g-123")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

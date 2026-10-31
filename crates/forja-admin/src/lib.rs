@@ -552,6 +552,51 @@ pub fn pagina_editar_colecao(c: &Collection, erro: Option<&str>) -> Markup {
                 (campo_regra("Apagar registro (deleteRule)", "delete_rule", c.delete_rule.as_deref()))
             }
 
+            @if c.kind == CollectionType::Auth {
+                h2 style="font-size:16px; margin:24px 0 12px;" { "Autenticação (OTP, MFA e OAuth2)" }
+
+                div .campo {
+                    label {
+                        input type="checkbox" name="otp_enabled" value="true" checked[c.otp_config().enabled];
+                        " Habilitar OTP por e-mail (código de uso único)"
+                    }
+                    div style="display:flex; gap:12px; margin-top:8px;" {
+                        div style="flex:1;" {
+                            label for="otp_duration" style="font-size:12px;" { "Duração do código (segundos)" }
+                            input type="number" id="otp_duration" name="otp_duration" value=(c.otp_config().duration) min="30" max="86400";
+                        }
+                        div style="flex:1;" {
+                            label for="otp_length" style="font-size:12px;" { "Comprimento (dígitos)" }
+                            input type="number" id="otp_length" name="otp_length" value=(c.otp_config().length) min="4" max="10";
+                        }
+                    }
+                }
+
+                div .campo {
+                    label {
+                        input type="checkbox" name="mfa_enabled" value="true" checked[c.mfa_config().enabled];
+                        " Habilitar MFA (dois fatores obrigatórios)"
+                    }
+                    div style="display:flex; gap:12px; margin-top:8px;" {
+                        div style="flex:1;" {
+                            label for="mfa_duration" style="font-size:12px;" { "Duração da sessão MFA (segundos)" }
+                            input type="number" id="mfa_duration" name="mfa_duration" value=(c.mfa_config().duration) min="60" max="86400";
+                        }
+                        div style="flex:2;" {
+                            label for="mfa_rule" style="font-size:12px;" { "Regra de bypass (ex: @request.context != 'oauth2')" }
+                            input type="text" id="mfa_rule" name="mfa_rule" value=(c.mfa_config().rule);
+                        }
+                    }
+                }
+
+                div .campo {
+                    label {
+                        input type="checkbox" name="oauth2_enabled" value="true" checked[c.oauth2_config().enabled];
+                        " Habilitar login via OAuth2"
+                    }
+                }
+            }
+
             @if c.kind != CollectionType::View {
                 h2 style="font-size:16px; margin:24px 0 12px;" { "Campos Existentes" }
                 table style="margin-bottom:18px;" {
@@ -846,328 +891,336 @@ fn url_encode(s: &str) -> String {
 /// Tela de Logs de Requisições com gráfico horário e tabela de eventos.
 pub fn pagina_logs(itens: &[LogItem], stats: &[LogStat]) -> Markup {
     let max_stat = stats.iter().map(|s| s.total).max().unwrap_or(1).max(1);
-    pagina("Logs", html! {
-        div .cabecalho {
-            h1 { "Logs de Requisições" }
-            span .contagem { (itens.len()) " eventos recentes" }
-        }
-
-        @if !stats.is_empty() {
-            div .secao-config {
-                h2 { "Volume de requisições por hora" }
-                div .grafico-barras {
-                    @for s in stats {
-                        @let altura = ((s.total as f64 / max_stat as f64) * 55.0).max(4.0) as i64;
-                        div .barra-item style=(format!("height: {altura}px")) title=(format!("{}: {} requisições", s.date, s.total)) {}
-                    }
-                }
+    pagina(
+        "Logs",
+        html! {
+            div .cabecalho {
+                h1 { "Logs de Requisições" }
+                span .contagem { (itens.len()) " eventos recentes" }
             }
-        }
 
-        @if itens.is_empty() {
-            p .vazio { "Nenhum log registrado ainda." }
-        } @else {
-            table {
-                thead {
-                    tr {
-                        th { "Data/Hora (UTC)" }
-                        th { "Status" }
-                        th { "Método" }
-                        th { "URL" }
-                        th { "Duração" }
-                        th { "Nível" }
-                    }
-                }
-                tbody {
-                    @for item in itens {
-                        @let status = item.data.get("status").and_then(Value::as_u64).unwrap_or(200);
-                        @let method = item.data.get("method").and_then(Value::as_str).unwrap_or("GET");
-                        @let url = item.data.get("url").and_then(Value::as_str).unwrap_or(&item.message);
-                        @let exec_time = item.data.get("execTime").and_then(Value::as_f64).unwrap_or(0.0);
-                        @let badge_class = if status >= 500 {
-                            "status-badge status-5xx"
-                        } else if status >= 400 {
-                            "status-badge status-4xx"
-                        } else if status >= 300 {
-                            "status-badge status-3xx"
-                        } else {
-                            "status-badge status-2xx"
-                        };
-
-                        tr {
-                            td { (item.created) }
-                            td { span class=(badge_class) { (status) } }
-                            td { strong { (method) } }
-                            td { code { (url) } }
-                            td { (format!("{:.2} ms", exec_time * 1000.0)) }
-                            td { (item.level) }
+            @if !stats.is_empty() {
+                div .secao-config {
+                    h2 { "Volume de requisições por hora" }
+                    div .grafico-barras {
+                        @for s in stats {
+                            @let altura = ((s.total as f64 / max_stat as f64) * 55.0).max(4.0) as i64;
+                            div .barra-item style=(format!("height: {altura}px")) title=(format!("{}: {} requisições", s.date, s.total)) {}
                         }
                     }
                 }
             }
-        }
-    })
+
+            @if itens.is_empty() {
+                p .vazio { "Nenhum log registrado ainda." }
+            } @else {
+                table {
+                    thead {
+                        tr {
+                            th { "Data/Hora (UTC)" }
+                            th { "Status" }
+                            th { "Método" }
+                            th { "URL" }
+                            th { "Duração" }
+                            th { "Nível" }
+                        }
+                    }
+                    tbody {
+                        @for item in itens {
+                            @let status = item.data.get("status").and_then(Value::as_u64).unwrap_or(200);
+                            @let method = item.data.get("method").and_then(Value::as_str).unwrap_or("GET");
+                            @let url = item.data.get("url").and_then(Value::as_str).unwrap_or(&item.message);
+                            @let exec_time = item.data.get("execTime").and_then(Value::as_f64).unwrap_or(0.0);
+                            @let badge_class = if status >= 500 {
+                                "status-badge status-5xx"
+                            } else if status >= 400 {
+                                "status-badge status-4xx"
+                            } else if status >= 300 {
+                                "status-badge status-3xx"
+                            } else {
+                                "status-badge status-2xx"
+                            };
+
+                            tr {
+                                td { (item.created) }
+                                td { span class=(badge_class) { (status) } }
+                                td { strong { (method) } }
+                                td { code { (url) } }
+                                td { (format!("{:.2} ms", exec_time * 1000.0)) }
+                                td { (item.level) }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    )
 }
 
 /// Tela de Tarefas Agendadas (Crons).
 pub fn pagina_crons(itens: &[CronItem]) -> Markup {
-    pagina("Crons", html! {
-        div .cabecalho {
-            h1 { "Tarefas Agendadas" }
-            span .contagem { (itens.len()) " agendamentos ativos" }
-        }
+    pagina(
+        "Crons",
+        html! {
+            div .cabecalho {
+                h1 { "Tarefas Agendadas" }
+                span .contagem { (itens.len()) " agendamentos ativos" }
+            }
 
-        @if itens.is_empty() {
-            p .vazio { "Nenhuma tarefa cron registrada." }
-        } @else {
-            table {
-                thead {
-                    tr {
-                        th { "Identificador" }
-                        th { "Expressão Cron" }
-                        th .direita { "Ações" }
-                    }
-                }
-                tbody {
-                    @for item in itens {
+            @if itens.is_empty() {
+                p .vazio { "Nenhuma tarefa cron registrada." }
+            } @else {
+                table {
+                    thead {
                         tr {
-                            td { strong { (item.id) } }
-                            td { code { (item.expression) } }
-                            td .direita {
-                                form method="post" action=(format!("/_/crons/{}/run", item.id)) style="display:inline;" {
-                                    button .botao type="submit" { "Executar agora" }
+                            th { "Identificador" }
+                            th { "Expressão Cron" }
+                            th .direita { "Ações" }
+                        }
+                    }
+                    tbody {
+                        @for item in itens {
+                            tr {
+                                td { strong { (item.id) } }
+                                td { code { (item.expression) } }
+                                td .direita {
+                                    form method="post" action=(format!("/_/crons/{}/run", item.id)) style="display:inline;" {
+                                        button .botao type="submit" { "Executar agora" }
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-        }
-    })
+        },
+    )
 }
 
 /// Tela de Gerenciamento de Backups.
 pub fn pagina_backups(itens: &[BackupItem], erro: Option<&str>, sucesso: Option<&str>) -> Markup {
-    pagina("Backups", html! {
-        div .cabecalho {
-            h1 { "Backups" }
-            span .contagem { (itens.len()) " snapshots salvos" }
-            div .acoes {
-                form method="post" action="/_/backups/new" style="margin:0;" {
-                    button .botao.solido type="submit" { "+ Criar backup" }
-                }
-            }
-        }
-
-        @if let Some(m) = erro {
-            div .global { (m) }
-        }
-        @if let Some(s) = sucesso {
-            div .sucesso { (s) }
-        }
-
-        @if itens.is_empty() {
-            p .vazio { "Nenhum backup disponível. Clique no botão acima para criar o primeiro snapshot." }
-        } @else {
-            table {
-                thead {
-                    tr {
-                        th { "Arquivo" }
-                        th { "Data de Modificação" }
-                        th { "Tamanho" }
-                        th .direita { "Ações" }
+    pagina(
+        "Backups",
+        html! {
+            div .cabecalho {
+                h1 { "Backups" }
+                span .contagem { (itens.len()) " snapshots salvos" }
+                div .acoes {
+                    form method="post" action="/_/backups/new" style="margin:0;" {
+                        button .botao.solido type="submit" { "+ Criar backup" }
                     }
                 }
-                tbody {
-                    @for item in itens {
-                        @let tamanho_kb = item.size as f64 / 1024.0;
-                        @let tamanho_str = if tamanho_kb > 1024.0 {
-                            format!("{:.2} MB", tamanho_kb / 1024.0)
-                        } else {
-                            format!("{:.1} KB", tamanho_kb)
-                        };
+            }
+
+            @if let Some(m) = erro {
+                div .global { (m) }
+            }
+            @if let Some(s) = sucesso {
+                div .sucesso { (s) }
+            }
+
+            @if itens.is_empty() {
+                p .vazio { "Nenhum backup disponível. Clique no botão acima para criar o primeiro snapshot." }
+            } @else {
+                table {
+                    thead {
                         tr {
-                            td { strong { (item.key) } }
-                            td { (item.modified) }
-                            td { (tamanho_str) }
-                            td .direita {
-                                a .botao href=(format!("/api/backups/{}", item.key)) target="_blank" download { "Baixar" }
-                                " "
-                                form method="post" action=(format!("/_/backups/{}/restore", item.key)) style="display:inline;" onsubmit="return confirm('Deseja realmente restaurar este backup? O processo substituirá os dados atuais.');" {
-                                    button .botao type="submit" { "Restaurar" }
-                                }
-                                " "
-                                form method="post" action=(format!("/_/backups/{}/delete", item.key)) style="display:inline;" onsubmit="return confirm('Excluir este arquivo de backup?');" {
-                                    button .botao.perigo type="submit" { "Excluir" }
+                            th { "Arquivo" }
+                            th { "Data de Modificação" }
+                            th { "Tamanho" }
+                            th .direita { "Ações" }
+                        }
+                    }
+                    tbody {
+                        @for item in itens {
+                            @let tamanho_kb = item.size as f64 / 1024.0;
+                            @let tamanho_str = if tamanho_kb > 1024.0 {
+                                format!("{:.2} MB", tamanho_kb / 1024.0)
+                            } else {
+                                format!("{:.1} KB", tamanho_kb)
+                            };
+                            tr {
+                                td { strong { (item.key) } }
+                                td { (item.modified) }
+                                td { (tamanho_str) }
+                                td .direita {
+                                    a .botao href=(format!("/api/backups/{}", item.key)) target="_blank" download { "Baixar" }
+                                    " "
+                                    form method="post" action=(format!("/_/backups/{}/restore", item.key)) style="display:inline;" onsubmit="return confirm('Deseja realmente restaurar este backup? O processo substituirá os dados atuais.');" {
+                                        button .botao type="submit" { "Restaurar" }
+                                    }
+                                    " "
+                                    form method="post" action=(format!("/_/backups/{}/delete", item.key)) style="display:inline;" onsubmit="return confirm('Excluir este arquivo de backup?');" {
+                                        button .botao.perigo type="submit" { "Excluir" }
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-        }
-    })
+        },
+    )
 }
 
 /// Tela de Configurações Gerais da Aplicação.
-pub fn pagina_settings(
-    cfg: &Configuracoes,
-    erro: Option<&str>,
-    sucesso: Option<&str>,
-) -> Markup {
-    pagina("Configurações", html! {
-        div .cabecalho {
-            h1 { "Configurações da Aplicação" }
-        }
-
-        @if let Some(m) = erro {
-            div .global { (m) }
-        }
-        @if let Some(s) = sucesso {
-            div .sucesso { (s) }
-        }
-
-        form method="post" action="/_/settings" {
-            // 1. Identidade da Aplicação
-            div .secao-config {
-                h2 { "Identidade e URL" }
-                div .grid-2 {
-                    div .campo {
-                        label for="appName" { "Nome da Aplicação" }
-                        input type="text" id="appName" name="appName" value=(cfg.meta.app_name) required;
-                    }
-                    div .campo {
-                        label for="appUrl" { "URL Pública da Aplicação" }
-                        input type="url" id="appUrl" name="appUrl" value=(cfg.meta.app_url) required;
-                        p .dica { "Utilizada nos links de confirmação e e-mails." }
-                    }
-                }
+pub fn pagina_settings(cfg: &Configuracoes, erro: Option<&str>, sucesso: Option<&str>) -> Markup {
+    pagina(
+        "Configurações",
+        html! {
+            div .cabecalho {
+                h1 { "Configurações da Aplicação" }
             }
 
-            // 2. Remetente de E-mails
-            div .secao-config {
-                h2 { "Remetente de E-mails" }
-                div .grid-2 {
-                    div .campo {
-                        label for="senderName" { "Nome do Remetente" }
-                        input type="text" id="senderName" name="senderName" value=(cfg.meta.sender_name) required;
-                    }
-                    div .campo {
-                        label for="senderAddress" { "Endereço do Remetente" }
-                        input type="email" id="senderAddress" name="senderAddress" value=(cfg.meta.sender_address) required;
-                    }
-                }
+            @if let Some(m) = erro {
+                div .global { (m) }
+            }
+            @if let Some(s) = sucesso {
+                div .sucesso { (s) }
             }
 
-            // 3. Servidor SMTP
-            div .secao-config {
-                h2 { "Servidor SMTP" }
-                div .campo {
-                    label {
-                        input type="checkbox" name="smtpEnabled" value="true" checked[cfg.smtp.enabled];
-                        " Habilitar envio de e-mails via SMTP"
+            form method="post" action="/_/settings" {
+                // 1. Identidade da Aplicação
+                div .secao-config {
+                    h2 { "Identidade e URL" }
+                    div .grid-2 {
+                        div .campo {
+                            label for="appName" { "Nome da Aplicação" }
+                            input type="text" id="appName" name="appName" value=(cfg.meta.app_name) required;
+                        }
+                        div .campo {
+                            label for="appUrl" { "URL Pública da Aplicação" }
+                            input type="url" id="appUrl" name="appUrl" value=(cfg.meta.app_url) required;
+                            p .dica { "Utilizada nos links de confirmação e e-mails." }
+                        }
                     }
                 }
-                div .grid-2 {
-                    div .campo {
-                        label for="smtpHost" { "Host SMTP" }
-                        input type="text" id="smtpHost" name="smtpHost" value=(cfg.smtp.host);
+
+                // 2. Remetente de E-mails
+                div .secao-config {
+                    h2 { "Remetente de E-mails" }
+                    div .grid-2 {
+                        div .campo {
+                            label for="senderName" { "Nome do Remetente" }
+                            input type="text" id="senderName" name="senderName" value=(cfg.meta.sender_name) required;
+                        }
+                        div .campo {
+                            label for="senderAddress" { "Endereço do Remetente" }
+                            input type="email" id="senderAddress" name="senderAddress" value=(cfg.meta.sender_address) required;
+                        }
                     }
+                }
+
+                // 3. Servidor SMTP
+                div .secao-config {
+                    h2 { "Servidor SMTP" }
                     div .campo {
-                        label for="smtpPort" { "Porta" }
-                        input type="number" id="smtpPort" name="smtpPort" value=(cfg.smtp.port);
+                        label {
+                            input type="checkbox" name="smtpEnabled" value="true" checked[cfg.smtp.enabled];
+                            " Habilitar envio de e-mails via SMTP"
+                        }
                     }
-                    div .campo {
-                        label for="smtpUsername" { "Usuário" }
-                        input type="text" id="smtpUsername" name="smtpUsername" value=(cfg.smtp.username);
-                    }
-                    div .campo {
-                        label for="smtpPassword" { "Senha" }
-                        input type="password" id="smtpPassword" name="smtpPassword" value=(cfg.smtp.password);
-                    }
-                    div .campo {
-                        label for="smtpAuthMethod" { "Método de Autenticação" }
-                        select id="smtpAuthMethod" name="smtpAuthMethod" {
-                            option value="PLAIN" selected[cfg.smtp.auth_method == "PLAIN"] { "PLAIN" }
-                            option value="LOGIN" selected[cfg.smtp.auth_method == "LOGIN"] { "LOGIN" }
+                    div .grid-2 {
+                        div .campo {
+                            label for="smtpHost" { "Host SMTP" }
+                            input type="text" id="smtpHost" name="smtpHost" value=(cfg.smtp.host);
+                        }
+                        div .campo {
+                            label for="smtpPort" { "Porta" }
+                            input type="number" id="smtpPort" name="smtpPort" value=(cfg.smtp.port);
+                        }
+                        div .campo {
+                            label for="smtpUsername" { "Usuário" }
+                            input type="text" id="smtpUsername" name="smtpUsername" value=(cfg.smtp.username);
+                        }
+                        div .campo {
+                            label for="smtpPassword" { "Senha" }
+                            input type="password" id="smtpPassword" name="smtpPassword" value=(cfg.smtp.password);
+                        }
+                        div .campo {
+                            label for="smtpAuthMethod" { "Método de Autenticação" }
+                            select id="smtpAuthMethod" name="smtpAuthMethod" {
+                                option value="PLAIN" selected[cfg.smtp.auth_method == "PLAIN"] { "PLAIN" }
+                                option value="LOGIN" selected[cfg.smtp.auth_method == "LOGIN"] { "LOGIN" }
+                            }
+                        }
+                        div .campo {
+                            label for="smtpLocalName" { "Nome Local (EHLO / HELO)" }
+                            input type="text" id="smtpLocalName" name="smtpLocalName" value=(cfg.smtp.local_name);
                         }
                     }
                     div .campo {
-                        label for="smtpLocalName" { "Nome Local (EHLO / HELO)" }
-                        input type="text" id="smtpLocalName" name="smtpLocalName" value=(cfg.smtp.local_name);
+                        label {
+                            input type="checkbox" name="smtpTls" value="true" checked[cfg.smtp.tls];
+                            " Utilizar criptografia TLS / STARTTLS"
+                        }
                     }
                 }
-                div .campo {
-                    label {
-                        input type="checkbox" name="smtpTls" value="true" checked[cfg.smtp.tls];
-                        " Utilizar criptografia TLS / STARTTLS"
-                    }
-                }
-            }
 
-            // 4. Armazenamento S3
-            div .secao-config {
-                h2 { "Armazenamento em Nuvem (S3 Compatível)" }
-                div .campo {
-                    label {
-                        input type="checkbox" name="s3Enabled" value="true" checked[cfg.s3.enabled];
-                        " Habilitar armazenamento em bucket S3 (AWS, MinIO, R2, Wasabi)"
+                // 4. Armazenamento S3
+                div .secao-config {
+                    h2 { "Armazenamento em Nuvem (S3 Compatível)" }
+                    div .campo {
+                        label {
+                            input type="checkbox" name="s3Enabled" value="true" checked[cfg.s3.enabled];
+                            " Habilitar armazenamento em bucket S3 (AWS, MinIO, R2, Wasabi)"
+                        }
+                    }
+                    div .grid-2 {
+                        div .campo {
+                            label for="s3Bucket" { "Bucket" }
+                            input type="text" id="s3Bucket" name="s3Bucket" value=(cfg.s3.bucket);
+                        }
+                        div .campo {
+                            label for="s3Region" { "Região" }
+                            input type="text" id="s3Region" name="s3Region" value=(cfg.s3.region);
+                        }
+                        div .campo {
+                            label for="s3Endpoint" { "Endpoint Customizado (opcional)" }
+                            input type="text" id="s3Endpoint" name="s3Endpoint" value=(cfg.s3.endpoint);
+                            p .dica { "Ex: http://127.0.0.1:9000 para MinIO ou https://<account>.r2.cloudflarestorage.com" }
+                        }
+                        div .campo {
+                            label for="s3AccessKey" { "Access Key" }
+                            input type="text" id="s3AccessKey" name="s3AccessKey" value=(cfg.s3.access_key);
+                        }
+                        div .campo {
+                            label for="s3Secret" { "Secret Key" }
+                            input type="password" id="s3Secret" name="s3Secret" value=(cfg.s3.secret);
+                        }
+                    }
+                    div .campo {
+                        label {
+                            input type="checkbox" name="s3ForcePathStyle" value="true" checked[cfg.s3.force_path_style];
+                            " Forçar Path-Style (obrigatório para MinIO e hosts locais)"
+                        }
                     }
                 }
-                div .grid-2 {
-                    div .campo {
-                        label for="s3Bucket" { "Bucket" }
-                        input type="text" id="s3Bucket" name="s3Bucket" value=(cfg.s3.bucket);
-                    }
-                    div .campo {
-                        label for="s3Region" { "Região" }
-                        input type="text" id="s3Region" name="s3Region" value=(cfg.s3.region);
-                    }
-                    div .campo {
-                        label for="s3Endpoint" { "Endpoint Customizado (opcional)" }
-                        input type="text" id="s3Endpoint" name="s3Endpoint" value=(cfg.s3.endpoint);
-                        p .dica { "Ex: http://127.0.0.1:9000 para MinIO ou https://<account>.r2.cloudflarestorage.com" }
-                    }
-                    div .campo {
-                        label for="s3AccessKey" { "Access Key" }
-                        input type="text" id="s3AccessKey" name="s3AccessKey" value=(cfg.s3.access_key);
-                    }
-                    div .campo {
-                        label for="s3Secret" { "Secret Key" }
-                        input type="password" id="s3Secret" name="s3Secret" value=(cfg.s3.secret);
-                    }
-                }
-                div .campo {
-                    label {
-                        input type="checkbox" name="s3ForcePathStyle" value="true" checked[cfg.s3.force_path_style];
-                        " Forçar Path-Style (obrigatório para MinIO e hosts locais)"
-                    }
-                }
-            }
 
-            // 5. Backups e Retenção
-            div .secao-config {
-                h2 { "Backups e Retenção de Logs" }
-                div .grid-2 {
-                    div .campo {
-                        label for="backupsCron" { "Agendamento Automático de Backups (Cron)" }
-                        input type="text" id="backupsCron" name="backupsCron" value=(cfg.backups.cron);
-                        p .dica { "Ex: 0 0 * * * (todo dia à meia-noite). Deixe vazio para desligar." }
-                    }
-                    div .campo {
-                        label for="backupsCronMaxKeep" { "Máximo de Backups Mantidos" }
-                        input type="number" id="backupsCronMaxKeep" name="backupsCronMaxKeep" value=(cfg.backups.cron_max_keep) min="1";
-                    }
-                    div .campo {
-                        label for="logsMaxDays" { "Retenção de Logs (dias)" }
-                        input type="number" id="logsMaxDays" name="logsMaxDays" value=(cfg.logs.max_days) min="1";
+                // 5. Backups e Retenção
+                div .secao-config {
+                    h2 { "Backups e Retenção de Logs" }
+                    div .grid-2 {
+                        div .campo {
+                            label for="backupsCron" { "Agendamento Automático de Backups (Cron)" }
+                            input type="text" id="backupsCron" name="backupsCron" value=(cfg.backups.cron);
+                            p .dica { "Ex: 0 0 * * * (todo dia à meia-noite). Deixe vazio para desligar." }
+                        }
+                        div .campo {
+                            label for="backupsCronMaxKeep" { "Máximo de Backups Mantidos" }
+                            input type="number" id="backupsCronMaxKeep" name="backupsCronMaxKeep" value=(cfg.backups.cron_max_keep) min="1";
+                        }
+                        div .campo {
+                            label for="logsMaxDays" { "Retenção de Logs (dias)" }
+                            input type="number" id="logsMaxDays" name="logsMaxDays" value=(cfg.logs.max_days) min="1";
+                        }
                     }
                 }
-            }
 
-            div style="margin-top:24px;" {
-                button .botao.solido type="submit" { "Salvar alterações" }
+                div style="margin-top:24px;" {
+                    button .botao.solido type="submit" { "Salvar alterações" }
+                }
             }
-        }
-    })
+        },
+    )
 }

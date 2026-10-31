@@ -651,53 +651,53 @@ impl Escritor<'_> {
         if let Operando::Campo(n) = esq
             && let Some((campo, "isset")) = n.split_once(':')
         {
-                if !(self.valido)(campo) {
-                    return Err(Erro::invalido(format!(
-                        "Invalid filter: unknown field '{campo}'"
-                    )));
-                }
-                let bool_val = match dir {
-                    Operando::Valor(Literal::Bool(b)) => *b,
-                    Operando::Valor(Literal::Texto(s)) if s == "true" => true,
-                    Operando::Valor(Literal::Texto(s)) if s == "false" => false,
-                    _ => {
-                        return Err(Erro::invalido(
-                            "Invalid filter: ':isset' modifier expects a boolean",
-                        ));
-                    }
-                };
-                let quer_definido = match op {
-                    Op::Igual => bool_val,
-                    Op::Diferente => !bool_val,
-                    _ => {
-                        return Err(Erro::invalido(
-                            "Invalid filter: ':isset' modifier only supports '=' and '!='",
-                        ));
-                    }
-                };
-                let col = if self.qualificar {
-                    let tabela = self.escopo.map(|e| e.tabela).unwrap_or("");
-                    format!("\"{tabela}\".\"{campo}\"")
-                } else {
-                    format!("\"{campo}\"")
-                };
-                return Ok(match self.dialeto {
-                    Dialeto::Sqlite => {
-                        if quer_definido {
-                            format!("({col} IS NOT NULL AND {col} != '')")
-                        } else {
-                            format!("({col} IS NULL OR {col} = '')")
-                        }
-                    }
-                    Dialeto::Postgres => {
-                        if quer_definido {
-                            format!("({col} IS NOT NULL AND {col}::text != '')")
-                        } else {
-                            format!("({col} IS NULL OR {col}::text = '')")
-                        }
-                    }
-                });
+            if !(self.valido)(campo) {
+                return Err(Erro::invalido(format!(
+                    "Invalid filter: unknown field '{campo}'"
+                )));
             }
+            let bool_val = match dir {
+                Operando::Valor(Literal::Bool(b)) => *b,
+                Operando::Valor(Literal::Texto(s)) if s == "true" => true,
+                Operando::Valor(Literal::Texto(s)) if s == "false" => false,
+                _ => {
+                    return Err(Erro::invalido(
+                        "Invalid filter: ':isset' modifier expects a boolean",
+                    ));
+                }
+            };
+            let quer_definido = match op {
+                Op::Igual => bool_val,
+                Op::Diferente => !bool_val,
+                _ => {
+                    return Err(Erro::invalido(
+                        "Invalid filter: ':isset' modifier only supports '=' and '!='",
+                    ));
+                }
+            };
+            let col = if self.qualificar {
+                let tabela = self.escopo.map(|e| e.tabela).unwrap_or("");
+                format!("\"{tabela}\".\"{campo}\"")
+            } else {
+                format!("\"{campo}\"")
+            };
+            return Ok(match self.dialeto {
+                Dialeto::Sqlite => {
+                    if quer_definido {
+                        format!("({col} IS NOT NULL AND {col} != '')")
+                    } else {
+                        format!("({col} IS NULL OR {col} = '')")
+                    }
+                }
+                Dialeto::Postgres => {
+                    if quer_definido {
+                        format!("({col} IS NOT NULL AND {col}::text != '')")
+                    } else {
+                        format!("({col} IS NULL OR {col}::text = '')")
+                    }
+                }
+            });
+        }
 
         // `campo = null` vale para vazio também, como no PocketBase.
         let nulo = |o: &Operando| matches!(o, Operando::Valor(Literal::Nulo));
@@ -1204,15 +1204,27 @@ mod tests {
         let s = para_sql("tags ?= 'rust'", &campos_ext, Dialeto::Sqlite).unwrap();
         assert!(s.texto.contains("json_valid(\"tags\")"));
         assert!(s.texto.contains("json_each.value = ?"));
-        assert_eq!(s.params, vec![Literal::Texto("rust".into()), Literal::Texto("rust".into())]);
+        assert_eq!(
+            s.params,
+            vec![Literal::Texto("rust".into()), Literal::Texto("rust".into())]
+        );
 
         let s_contem = para_sql("tags ?~ 'rus'", &campos_ext, Dialeto::Sqlite).unwrap();
         assert!(s_contem.texto.contains("json_each.value LIKE ?"));
-        assert_eq!(s_contem.params, vec![Literal::Texto("%rus%".into()), Literal::Texto("%rus%".into())]);
+        assert_eq!(
+            s_contem.params,
+            vec![
+                Literal::Texto("%rus%".into()),
+                Literal::Texto("%rus%".into())
+            ]
+        );
 
         let s_maior = para_sql("idade ?> 18", &campos_ext, Dialeto::Sqlite).unwrap();
         assert!(s_maior.texto.contains("json_each.value > ?"));
-        assert_eq!(s_maior.params, vec![Literal::Numero(18.0), Literal::Numero(18.0)]);
+        assert_eq!(
+            s_maior.params,
+            vec![Literal::Numero(18.0), Literal::Numero(18.0)]
+        );
     }
 
     #[test]
@@ -1243,20 +1255,31 @@ mod tests {
 
         let s_start = sql("nome >= @todayStart");
         assert_eq!(s_start.texto, "\"nome\" >= ?");
-        assert!(matches!(s_start.params.first(), Some(Literal::Texto(s)) if s.ends_with(" 00:00:00.000Z")));
+        assert!(
+            matches!(s_start.params.first(), Some(Literal::Texto(s)) if s.ends_with(" 00:00:00.000Z"))
+        );
 
         let s_end = sql("nome <= @todayEnd");
         assert_eq!(s_end.texto, "\"nome\" <= ?");
-        assert!(matches!(s_end.params.first(), Some(Literal::Texto(s)) if s.ends_with(" 23:59:59.999Z")));
+        assert!(
+            matches!(s_end.params.first(), Some(Literal::Texto(s)) if s.ends_with(" 23:59:59.999Z"))
+        );
 
         let s_mstart = sql("nome >= @monthStart");
-        assert!(matches!(s_mstart.params.first(), Some(Literal::Texto(s)) if s.ends_with("-01 00:00:00.000Z")));
+        assert!(
+            matches!(s_mstart.params.first(), Some(Literal::Texto(s)) if s.ends_with("-01 00:00:00.000Z"))
+        );
 
         let s_mend = sql("nome <= @monthEnd");
-        assert!(matches!(s_mend.params.first(), Some(Literal::Texto(s)) if s.ends_with(" 23:59:59.999Z")));
+        assert!(
+            matches!(s_mend.params.first(), Some(Literal::Texto(s)) if s.ends_with(" 23:59:59.999Z"))
+        );
 
         let s_yr = sql("@year >= 2026");
         assert_eq!(s_yr.texto, "? >= ?");
-        assert_eq!(s_yr.params, vec![Literal::Numero(2026.0), Literal::Numero(2026.0)]);
+        assert_eq!(
+            s_yr.params,
+            vec![Literal::Numero(2026.0), Literal::Numero(2026.0)]
+        );
     }
 }

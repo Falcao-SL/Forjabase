@@ -27,7 +27,11 @@ pub struct Mensagem {
 }
 
 impl Mensagem {
-    pub fn nova(para: impl Into<String>, assunto: impl Into<String>, corpo: impl Into<String>) -> Self {
+    pub fn nova(
+        para: impl Into<String>,
+        assunto: impl Into<String>,
+        corpo: impl Into<String>,
+    ) -> Self {
         Self {
             para: para.into(),
             assunto: assunto.into(),
@@ -328,12 +332,8 @@ mod tests {
         let mut extras = HashMap::new();
         extras.insert("nome".into(), "Carlos".into());
 
-        let (assunto, corpo) = tpl.renderizar(
-            "Forjabase",
-            "https://meuapp.com",
-            "token123",
-            &extras,
-        );
+        let (assunto, corpo) =
+            tpl.renderizar("Forjabase", "https://meuapp.com", "token123", &extras);
 
         assert_eq!(assunto, "Verifique sua conta Forjabase");
         assert!(corpo.contains("https://meuapp.com/_/#/confirm/token123"));

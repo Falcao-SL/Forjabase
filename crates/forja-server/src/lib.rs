@@ -12,8 +12,8 @@ use axum::extract::{
 use axum::http::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE};
 use axum::http::{StatusCode, request::Parts};
 use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::response::{Html, IntoResponse, Response};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use forja_core::arquivos::{self, Recebido};
 use forja_core::auth::{
@@ -22,8 +22,11 @@ use forja_core::auth::{
 };
 use forja_core::correio::{Console, Correio, Mensagem};
 use forja_core::filtro::Contexto;
+use forja_core::oauth2::{self, AuthProviderInfo};
 use forja_core::store::{Banco, Consulta, Credenciais, Motor, Superusuario};
-use forja_core::{Collection, CollectionType, Erro, Field, FieldType};
+use forja_core::{
+    Collection, CollectionType, Erro, Field, FieldType, agora_epoch_s, epoch_s_de_data_utc, id,
+};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::future::Future;
@@ -149,6 +152,7 @@ type Res<T> = Result<T, ErroApi>;
 // ── Autenticação ─────────────────────────────────────────────────────────
 
 /// Quem está chamando.
+#[allow(clippy::large_enum_variant)]
 pub enum Identidade {
     Superusuario(Superusuario),
     Registro {
@@ -814,7 +818,9 @@ pub(crate) fn filtrar_campos(mut reg: Value, fields_param: &str) -> Value {
         if let Some(val) = mapa.get(nome_puro) {
             let mut val_final = val.clone();
             if let Some(mod_str) = modifier
-                && let Some(dentro) = mod_str.strip_prefix("excerpt(").and_then(|s| s.strip_suffix(')'))
+                && let Some(dentro) = mod_str
+                    .strip_prefix("excerpt(")
+                    .and_then(|s| s.strip_suffix(')'))
             {
                 let len = dentro
                     .split(',')
@@ -838,23 +844,23 @@ pub(crate) fn filtrar_campos(mut reg: Value, fields_param: &str) -> Value {
         && let Some(Value::Object(exp_mapa)) = mapa.get("expand")
     {
         let mut novo_exp = Map::new();
-            for (sub, campo) in expand_seletores {
-                if let Some(sub_val) = exp_mapa.get(sub) {
-                    if campo == "*" {
-                        novo_exp.insert(sub.to_string(), sub_val.clone());
-                    } else if let Value::Object(sub_obj) = sub_val {
-                        let mut sub_novo = match novo_exp.remove(sub) {
-                            Some(Value::Object(m)) => m,
-                            _ => Map::new(),
-                        };
-                        if let Some(v) = sub_obj.get(campo) {
-                            sub_novo.insert(campo.to_string(), v.clone());
-                        }
-                        novo_exp.insert(sub.to_string(), Value::Object(sub_novo));
+        for (sub, campo) in expand_seletores {
+            if let Some(sub_val) = exp_mapa.get(sub) {
+                if campo == "*" {
+                    novo_exp.insert(sub.to_string(), sub_val.clone());
+                } else if let Value::Object(sub_obj) = sub_val {
+                    let mut sub_novo = match novo_exp.remove(sub) {
+                        Some(Value::Object(m)) => m,
+                        _ => Map::new(),
+                    };
+                    if let Some(v) = sub_obj.get(campo) {
+                        sub_novo.insert(campo.to_string(), v.clone());
                     }
+                    novo_exp.insert(sub.to_string(), Value::Object(sub_novo));
                 }
             }
-            novo.insert("expand".to_string(), Value::Object(novo_exp));
+        }
+        novo.insert("expand".to_string(), Value::Object(novo_exp));
     }
 
     Value::Object(novo)
@@ -1286,12 +1292,7 @@ fn link(colecao: &str, acao: &str, token: &str) -> String {
     format!("/api/collections/{colecao}/{acao}?token={token}")
 }
 
-async fn enviar_email(
-    e: &Estado,
-    para: &str,
-    assunto: &str,
-    corpo: String,
-) -> Result<(), Erro> {
+async fn enviar_email(e: &Estado, para: &str, assunto: &str, corpo: String) -> Result<(), Erro> {
     let cfg = e.banco.configuracoes().await;
     let msg = Mensagem::com_remetente(
         para,
@@ -1342,13 +1343,24 @@ async fn credenciais_de(e: &Estado, c: &Collection, id: &str) -> Res<Credenciais
 struct LoginAuth {
     identity: String,
     password: String,
+    #[serde(default, rename = "mfaId")]
+    mfa_id: Option<String>,
+}
+
+fn resposta_mfa(mfa_id: &str) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        json!({ "mfaId": mfa_id }).to_string(),
+    )
+        .into_response()
 }
 
 async fn auth_com_senha(
     State(e): State<Estado>,
     Path(nome): Path<String>,
     Json(l): Json<LoginAuth>,
-) -> Res<Json<Value>> {
+) -> Res<Response> {
     let c = colecao_auth(&e, nome).await?;
     let falha = || ErroApi(Erro::invalido("Failed to authenticate."));
     let cred = e
@@ -1364,8 +1376,41 @@ async fn auth_com_senha(
     if !ok {
         return Err(falha());
     }
+
+    let mfa_cfg = c.mfa_config();
+    if mfa_cfg.enabled {
+        if let Some(mfa_id) = &l.mfa_id {
+            let sessao = e.banco.mfa_obter(&c.id, mfa_id).await?.ok_or_else(|| {
+                ErroApi(Erro::invalido(
+                    "Failed to authenticate with MFA. Invalid MFA session.",
+                ))
+            })?;
+            let criado_s = epoch_s_de_data_utc(&sessao.created).unwrap_or(0);
+            if agora_epoch_s() > criado_s + sessao.duration {
+                let _ = e.banco.mfa_apagar(mfa_id).await;
+                return Err(ErroApi(Erro::invalido("MFA session expired.")));
+            }
+            if sessao.record_id != cred.id {
+                return Err(ErroApi(Erro::invalido("Invalid MFA session for user.")));
+            }
+            if sessao.method == "password" {
+                return Err(ErroApi(Erro::invalido(
+                    "Second MFA factor must be different.",
+                )));
+            }
+            let _ = e.banco.mfa_apagar(mfa_id).await;
+        } else {
+            let novo_mfa_id = e
+                .banco
+                .mfa_criar(&c.id, &cred.id, "password", mfa_cfg.duration)
+                .await?;
+            return Ok(resposta_mfa(&novo_mfa_id));
+        }
+    }
+
     let registro = e.banco.registro(&c, &cred.id, None).await?;
-    resposta_registro(&e, &c, &cred, registro)
+    let resp = resposta_registro(&e, &c, &cred, registro)?;
+    Ok(resp.into_response())
 }
 
 async fn auth_refresh(
@@ -1634,6 +1679,451 @@ async fn personificar(
     Ok(Json(json!({ "token": token, "record": registro })))
 }
 
+#[derive(Deserialize, Default)]
+struct QueryAuthMethods {
+    #[serde(default)]
+    state: Option<String>,
+}
+
+async fn obter_auth_methods(
+    State(e): State<Estado>,
+    Path(nome): Path<String>,
+    Query(q): Query<QueryAuthMethods>,
+) -> Res<Json<Value>> {
+    let c = colecao_auth(&e, nome).await?;
+    let cfg = e.banco.configuracoes().await;
+    let redirect_uri = format!(
+        "{}/api/oauth2-redirect",
+        cfg.meta.app_url.trim_end_matches('/')
+    );
+
+    let mfa_cfg = c.mfa_config();
+    let otp_cfg = c.otp_config();
+    let pwd_cfg = c.password_auth_config();
+    let oauth2_cfg = c.oauth2_config();
+
+    let providers: Vec<AuthProviderInfo> = oauth2_cfg
+        .providers
+        .iter()
+        .filter(|p| p.habilitado())
+        .map(|p| oauth2::preparar_provedor(p, &redirect_uri, q.state.as_deref()))
+        .collect();
+
+    Ok(Json(json!({
+        "mfa": {
+            "enabled": mfa_cfg.enabled,
+            "duration": mfa_cfg.duration
+        },
+        "otp": {
+            "enabled": otp_cfg.enabled,
+            "duration": otp_cfg.duration
+        },
+        "password": {
+            "enabled": pwd_cfg.enabled,
+            "identityFields": pwd_cfg.identity_fields
+        },
+        "oauth2": {
+            "enabled": oauth2_cfg.enabled,
+            "providers": providers
+        }
+    })))
+}
+
+#[derive(Deserialize)]
+struct PedidoOtp {
+    email: String,
+}
+
+async fn pedir_otp(
+    State(e): State<Estado>,
+    Path(nome): Path<String>,
+    Json(p): Json<PedidoOtp>,
+) -> Res<Json<Value>> {
+    let c = colecao_auth(&e, nome).await?;
+    let otp_cfg = c.otp_config();
+    if !otp_cfg.enabled {
+        return Err(ErroApi(Erro::invalido(
+            "Failed to request OTP. OTP authentication is disabled for this collection.",
+        )));
+    }
+    let otp_id = id::novo();
+    let code = oauth2::gerar_codigo_otp(otp_cfg.length);
+    let hash = auth::hash_senha(&code)?;
+
+    let mut id_retorno = otp_id.clone();
+
+    if let Some(usuario) = e.banco.auth_credenciais(&c, &p.email).await? {
+        let criado_id = e
+            .banco
+            .otp_criar(
+                &c.id,
+                &usuario.id,
+                &usuario.email,
+                &hash,
+                &usuario.email,
+                otp_cfg.duration,
+            )
+            .await?;
+        id_retorno = criado_id;
+
+        let cfg = e.banco.configuracoes().await;
+        let mut placeholders = std::collections::HashMap::new();
+        placeholders.insert("APP_NAME", cfg.meta.app_name.clone());
+        placeholders.insert("APP_URL", cfg.meta.app_url.clone());
+        placeholders.insert("OTP", code.clone());
+        placeholders.insert("OTP_ID", id_retorno.clone());
+        placeholders.insert("DURATION", otp_cfg.duration.to_string());
+        placeholders.insert("RECORD:email", usuario.email.clone());
+
+        let (assunto, corpo) = if let Some(tmpl) = &otp_cfg.email_template {
+            let mut extras = std::collections::HashMap::new();
+            extras.insert("email".into(), usuario.email.clone());
+            extras.insert("otpId".into(), id_retorno.clone());
+            extras.insert("duration".into(), otp_cfg.duration.to_string());
+            let (mut a, mut b) =
+                tmpl.renderizar(&cfg.meta.app_name, &cfg.meta.app_url, &code, &extras);
+            a = a.replace("{OTP}", &code);
+            b = b.replace("{OTP}", &code);
+            (a, b)
+        } else {
+            (
+                format!("OTP verification code for {}", cfg.meta.app_name),
+                format!(
+                    "Your one-time password is: {}\n\nIt will expire in {} seconds.",
+                    code, otp_cfg.duration
+                ),
+            )
+        };
+
+        let _ = enviar_email(&e, &usuario.email, &assunto, corpo).await;
+    }
+
+    Ok(Json(json!({ "otpId": id_retorno })))
+}
+
+#[derive(Deserialize)]
+struct AuthComOtp {
+    #[serde(rename = "otpId")]
+    otp_id: String,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default, rename = "mfaId")]
+    mfa_id: Option<String>,
+}
+
+async fn auth_com_otp(
+    State(e): State<Estado>,
+    Path(nome): Path<String>,
+    Json(p): Json<AuthComOtp>,
+) -> Res<Response> {
+    let c = colecao_auth(&e, nome).await?;
+    let otp_cfg = c.otp_config();
+    if !otp_cfg.enabled {
+        return Err(ErroApi(Erro::invalido(
+            "Failed to authenticate. OTP authentication is disabled for this collection.",
+        )));
+    }
+    let codigo = p
+        .password
+        .or(p.code)
+        .ok_or_else(|| ErroApi(Erro::invalido("Missing OTP code.")))?;
+
+    let otp = e.banco.otp_obter(&c.id, &p.otp_id).await?.ok_or_else(|| {
+        ErroApi(Erro::invalido(
+            "Failed to authenticate. Invalid or expired OTP.",
+        ))
+    })?;
+
+    let criado_s = epoch_s_de_data_utc(&otp.created).unwrap_or(0);
+    if agora_epoch_s() > criado_s + otp.duration {
+        let _ = e.banco.otp_apagar(&otp.id).await;
+        return Err(ErroApi(Erro::invalido(
+            "Failed to authenticate. Invalid or expired OTP.",
+        )));
+    }
+
+    let ok = auth::conferir_senha(&otp.password, &codigo);
+    if !ok {
+        return Err(ErroApi(Erro::invalido(
+            "Failed to authenticate. Invalid or expired OTP.",
+        )));
+    }
+
+    let _ = e.banco.otp_apagar(&otp.id).await;
+
+    let cred = credenciais_de(&e, &c, &otp.record_id).await?;
+
+    if !cred.verified {
+        let _ = e.banco.auth_verificar(&c, &cred.id, None).await;
+    }
+
+    let mfa_cfg = c.mfa_config();
+    if mfa_cfg.enabled {
+        if let Some(mfa_id) = &p.mfa_id {
+            let sessao = e.banco.mfa_obter(&c.id, mfa_id).await?.ok_or_else(|| {
+                ErroApi(Erro::invalido(
+                    "Failed to authenticate with MFA. Invalid MFA session.",
+                ))
+            })?;
+            let criado_s = epoch_s_de_data_utc(&sessao.created).unwrap_or(0);
+            if agora_epoch_s() > criado_s + sessao.duration {
+                let _ = e.banco.mfa_apagar(mfa_id).await;
+                return Err(ErroApi(Erro::invalido("MFA session expired.")));
+            }
+            if sessao.record_id != cred.id {
+                return Err(ErroApi(Erro::invalido("Invalid MFA session for user.")));
+            }
+            if sessao.method == "otp" {
+                return Err(ErroApi(Erro::invalido(
+                    "Second MFA factor must be different.",
+                )));
+            }
+            let _ = e.banco.mfa_apagar(mfa_id).await;
+        } else {
+            let novo_mfa_id = e
+                .banco
+                .mfa_criar(&c.id, &cred.id, "otp", mfa_cfg.duration)
+                .await?;
+            return Ok(resposta_mfa(&novo_mfa_id));
+        }
+    }
+
+    let registro = e.banco.registro(&c, &cred.id, None).await?;
+    let resp = resposta_registro(&e, &c, &cred, registro)?;
+    Ok(resp.into_response())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthComOAuth2 {
+    provider: String,
+    code: String,
+    #[serde(default)]
+    code_verifier: Option<String>,
+    #[serde(default)]
+    redirect_url: Option<String>,
+    #[serde(default)]
+    create_data: Option<Map<String, Value>>,
+    #[serde(default)]
+    mfa_id: Option<String>,
+}
+
+async fn auth_com_oauth2(
+    State(e): State<Estado>,
+    Path(nome): Path<String>,
+    Json(p): Json<AuthComOAuth2>,
+) -> Res<Response> {
+    let c = colecao_auth(&e, nome).await?;
+    let oauth2_cfg = c.oauth2_config();
+    if !oauth2_cfg.enabled {
+        return Err(ErroApi(Erro::invalido(
+            "Failed to authenticate. OAuth2 authentication is disabled for this collection.",
+        )));
+    }
+
+    let provedor = oauth2_cfg
+        .providers
+        .iter()
+        .find(|prov| prov.name.eq_ignore_ascii_case(&p.provider) && prov.habilitado())
+        .ok_or_else(|| {
+            ErroApi(Erro::invalido(format!(
+                "OAuth2 provider '{}' is not configured or disabled.",
+                p.provider
+            )))
+        })?;
+
+    let cfg = e.banco.configuracoes().await;
+    let redirect_url = p.redirect_url.filter(|u| !u.is_empty()).unwrap_or_else(|| {
+        format!(
+            "{}/api/oauth2-redirect",
+            cfg.meta.app_url.trim_end_matches('/')
+        )
+    });
+
+    let token_resp =
+        oauth2::trocar_codigo(provedor, &p.code, p.code_verifier.as_deref(), &redirect_url).await?;
+
+    let perfil = oauth2::buscar_perfil(provedor, &token_resp.access_token).await?;
+
+    let mut is_new = false;
+    let record_id = if let Some(ext) = e
+        .banco
+        .external_auth_obter(&c.id, &provedor.name, &perfil.id)
+        .await?
+    {
+        ext.record_id
+    } else if !perfil.email.is_empty()
+        && let Some(usuario) = e.banco.auth_credenciais(&c, &perfil.email).await?
+    {
+        let _ = e
+            .banco
+            .external_auth_criar(&c.id, &usuario.id, &provedor.name, &perfil.id)
+            .await?;
+        usuario.id
+    } else {
+        let novo_id = id::novo();
+        let mut mapa = p.create_data.unwrap_or_default();
+        mapa.insert("id".into(), novo_id.clone().into());
+        mapa.insert("email".into(), perfil.email.clone().into());
+        mapa.insert("emailVisibility".into(), Value::Bool(true));
+        mapa.insert("verified".into(), Value::Bool(true));
+
+        let senha_rand = id::aleatorio(30);
+        mapa.insert("password".into(), senha_rand.into());
+
+        if c.campo("name").is_some() && !mapa.contains_key("name") && !perfil.name.is_empty() {
+            mapa.insert("name".into(), perfil.name.clone().into());
+        }
+        if c.campo("avatar").is_some()
+            && !mapa.contains_key("avatar")
+            && !perfil.avatar_url.is_empty()
+        {
+            mapa.insert("avatar".into(), perfil.avatar_url.clone().into());
+        }
+
+        let _ = e.banco.criar(&c, &mapa).await?;
+        let _ = e
+            .banco
+            .external_auth_criar(&c.id, &novo_id, &provedor.name, &perfil.id)
+            .await?;
+        is_new = true;
+        novo_id
+    };
+
+    let cred = credenciais_de(&e, &c, &record_id).await?;
+
+    let mfa_cfg = c.mfa_config();
+    if mfa_cfg.enabled {
+        if let Some(mfa_id) = &p.mfa_id {
+            let sessao = e.banco.mfa_obter(&c.id, mfa_id).await?.ok_or_else(|| {
+                ErroApi(Erro::invalido(
+                    "Failed to authenticate with MFA. Invalid MFA session.",
+                ))
+            })?;
+            let criado_s = epoch_s_de_data_utc(&sessao.created).unwrap_or(0);
+            if agora_epoch_s() > criado_s + sessao.duration {
+                let _ = e.banco.mfa_apagar(mfa_id).await;
+                return Err(ErroApi(Erro::invalido("MFA session expired.")));
+            }
+            if sessao.record_id != cred.id {
+                return Err(ErroApi(Erro::invalido("Invalid MFA session for user.")));
+            }
+            if sessao.method == "oauth2" {
+                return Err(ErroApi(Erro::invalido(
+                    "Second MFA factor must be different.",
+                )));
+            }
+            let _ = e.banco.mfa_apagar(mfa_id).await;
+        } else {
+            let novo_mfa_id = e
+                .banco
+                .mfa_criar(&c.id, &cred.id, "oauth2", mfa_cfg.duration)
+                .await?;
+            return Ok(resposta_mfa(&novo_mfa_id));
+        }
+    }
+
+    let registro = e.banco.registro(&c, &record_id, None).await?;
+    let token = auth::emitir_tipo(
+        &e.segredo,
+        &cred.id,
+        &c.id,
+        &cred.token_key,
+        auth::TIPO_AUTH,
+        auth::VALIDADE_AUTH,
+        None,
+    )?;
+
+    let meta = json!({
+        "id": perfil.id,
+        "name": perfil.name,
+        "username": perfil.username,
+        "email": perfil.email,
+        "avatarUrl": perfil.avatar_url,
+        "accessToken": token_resp.access_token,
+        "refreshToken": token_resp.refresh_token,
+        "isNew": is_new,
+        "rawUser": perfil.raw_user
+    });
+
+    Ok(Json(json!({
+        "token": token,
+        "record": registro,
+        "meta": meta
+    }))
+    .into_response())
+}
+
+async fn oauth2_redirect_html() -> impl IntoResponse {
+    let html = r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>OAuth2 redirect</title>
+</head>
+<body>
+    <script>
+        const params = new URLSearchParams(window.location.search);
+        const data = {
+            type: "oauth2Redirect",
+            code: params.get("code") || "",
+            state: params.get("state") || "",
+            error: params.get("error") || "",
+            url: window.location.href
+        };
+        if (window.opener) {
+            window.opener.postMessage(data, "*");
+            window.close();
+        } else {
+            document.body.innerText = "Auth completed. You can close this window.";
+        }
+    </script>
+    <p>Auth completed. You can close this window.</p>
+</body>
+</html>"#;
+    Html(html)
+}
+
+async fn listar_external_auths(
+    State(e): State<Estado>,
+    quem: Chamador,
+    Path((nome, id)): Path<(String, String)>,
+) -> Res<Json<Value>> {
+    let c = colecao_auth(&e, nome).await?;
+    if !quem.superusuario() {
+        let Some((col, reg)) = quem.registro() else {
+            return Err(nao_autorizado());
+        };
+        if col.id != c.id || reg["id"].as_str() != Some(&id) {
+            return Err(nao_autorizado());
+        }
+    }
+    let lista = e.banco.external_auth_listar(&c.id, &id).await?;
+    Ok(Json(json!(lista)))
+}
+
+async fn desvincular_external_auth(
+    State(e): State<Estado>,
+    quem: Chamador,
+    Path((nome, id, provider)): Path<(String, String, String)>,
+) -> Res<StatusCode> {
+    let c = colecao_auth(&e, nome).await?;
+    if !quem.superusuario() {
+        let Some((col, reg)) = quem.registro() else {
+            return Err(nao_autorizado());
+        };
+        if col.id != c.id || reg["id"].as_str() != Some(&id) {
+            return Err(nao_autorizado());
+        }
+    }
+    e.banco
+        .external_auth_apagar_por_provider(&c.id, &id, &provider)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ── Arquivos ─────────────────────────────────────────────────────────────
 
 #[derive(Deserialize, Default)]
@@ -1848,11 +2338,7 @@ async fn health() -> Json<Value> {
     Json(json!({ "code": 200, "message": "API is healthy.", "data": {} }))
 }
 
-async fn log_middleware(
-    State(e): State<Estado>,
-    req: Request,
-    next: Next,
-) -> Response {
+async fn log_middleware(State(e): State<Estado>, req: Request, next: Next) -> Response {
     let method = req.method().to_string();
     let uri = req.uri().to_string();
     let inicio = std::time::Instant::now();
@@ -1902,10 +2388,7 @@ pub fn router(e: Estado) -> Router {
             "/api/collections/meta/dry-run-view",
             post(colecoes_dry_run_view),
         )
-        .route(
-            "/api/collections/dry-run-view",
-            post(colecoes_dry_run_view),
-        )
+        .route("/api/collections/dry-run-view", post(colecoes_dry_run_view))
         .route(
             "/api/collections",
             get(colecoes_listar).post(colecoes_criar),
@@ -1962,6 +2445,31 @@ pub fn router(e: Estado) -> Router {
             "/api/collections/{colecao}/impersonate/{id}",
             post(personificar),
         )
+        .route(
+            "/api/collections/{colecao}/auth-methods",
+            get(obter_auth_methods),
+        )
+        .route("/api/collections/{colecao}/request-otp", post(pedir_otp))
+        .route(
+            "/api/collections/{colecao}/auth-with-otp",
+            post(auth_com_otp),
+        )
+        .route(
+            "/api/collections/{colecao}/auth-with-oauth2",
+            post(auth_com_oauth2),
+        )
+        .route(
+            "/api/oauth2-redirect",
+            get(oauth2_redirect_html).post(oauth2_redirect_html),
+        )
+        .route(
+            "/api/collections/{colecao}/records/{id}/external-auths",
+            get(listar_external_auths),
+        )
+        .route(
+            "/api/collections/{colecao}/records/{id}/external-auths/{provider}",
+            delete(desvincular_external_auth),
+        )
         .route("/api/batch", post(lote::http))
         .route(
             "/api/realtime",
@@ -1981,7 +2489,10 @@ pub fn router(e: Estado) -> Router {
         .route("/api/logs", get(logs_listar_api))
         .route("/api/logs/stats", get(logs_stats_api))
         .route("/api/logs/{id}", get(logs_obter_api))
-        .route("/api/backups", get(backups_listar_api).post(backups_criar_api))
+        .route(
+            "/api/backups",
+            get(backups_listar_api).post(backups_criar_api),
+        )
         .route("/api/backups/upload", post(backups_upload_api))
         .route(
             "/api/backups/{key}",
@@ -3667,7 +4178,13 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::OK, "{dry}");
-        assert!(dry["fields"].as_array().unwrap().iter().any(|f| f["name"] == "titulo"));
+        assert!(
+            dry["fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["name"] == "titulo")
+        );
 
         // 3. PATCH /api/collections/artigos (adicionar campo 'resumo')
         let mut patch_c = c.clone();
@@ -3684,7 +4201,13 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::OK, "{atualizada}");
-        assert!(atualizada["fields"].as_array().unwrap().iter().any(|f| f["name"] == "resumo"));
+        assert!(
+            atualizada["fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["name"] == "resumo")
+        );
 
         // 4. Criar registros com tags
         let (s, _) = chamar(
@@ -3805,12 +4328,26 @@ mod tests {
         let cookie = entrar_no_painel(&e).await;
 
         // 1. Tela de nova coleção
-        let (s, _, corpo) = pedir(&e, "GET", "/_/new-collection", &[("cookie", cookie.as_str())], "").await;
+        let (s, _, corpo) = pedir(
+            &e,
+            "GET",
+            "/_/new-collection",
+            &[("cookie", cookie.as_str())],
+            "",
+        )
+        .await;
         assert_eq!(s, StatusCode::OK);
         assert!(corpo.contains("Nova Coleção"), "{corpo}");
 
         // 2. Fragmento htmx de linha de campo
-        let (s, _, fragmento) = pedir(&e, "GET", "/_/htmx/campo-linha", &[("cookie", cookie.as_str())], "").await;
+        let (s, _, fragmento) = pedir(
+            &e,
+            "GET",
+            "/_/htmx/campo-linha",
+            &[("cookie", cookie.as_str())],
+            "",
+        )
+        .await;
         assert_eq!(s, StatusCode::OK);
         assert!(fragmento.contains("linha-campo"), "{fragmento}");
 
@@ -3842,10 +4379,21 @@ mod tests {
         assert_eq!(col.list_rule, Some(String::new()));
         assert_eq!(col.view_rule, None);
         assert!(col.fields.iter().any(|f| f.name == "titulo" && f.required));
-        assert!(col.fields.iter().any(|f| f.name == "concluida" && !f.required));
+        assert!(
+            col.fields
+                .iter()
+                .any(|f| f.name == "concluida" && !f.required)
+        );
 
         // 4. Tela de configurações
-        let (s, _, corpo) = pedir(&e, "GET", "/_/collections/tarefas/settings", &[("cookie", cookie.as_str())], "").await;
+        let (s, _, corpo) = pedir(
+            &e,
+            "GET",
+            "/_/collections/tarefas/settings",
+            &[("cookie", cookie.as_str())],
+            "",
+        )
+        .await;
         assert_eq!(s, StatusCode::OK);
         assert!(corpo.contains("Configurações: tarefas"), "{corpo}");
 
@@ -3870,7 +4418,10 @@ mod tests {
 
         let col_atualizada = e.banco.colecao("afazeres").await.unwrap();
         assert_eq!(col_atualizada.name, "afazeres");
-        assert_eq!(col_atualizada.list_rule, Some("@request.auth.id != ''".to_string()));
+        assert_eq!(
+            col_atualizada.list_rule,
+            Some("@request.auth.id != ''".to_string())
+        );
         assert_eq!(col_atualizada.view_rule, Some(String::new()));
         assert!(col_atualizada.fields.iter().any(|f| f.name == "prazo"));
 
@@ -4077,7 +4628,12 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
-        assert!(resp["message"].as_str().unwrap().contains("Failed to connect"));
+        assert!(
+            resp["message"]
+                .as_str()
+                .unwrap()
+                .contains("Failed to connect")
+        );
     }
 
     #[tokio::test]
@@ -4159,7 +4715,14 @@ mod tests {
         let id_log = primeiro["id"].as_str().unwrap();
 
         // 3. Superusuário obtém log por ID
-        let (s, item) = chamar(&e, "GET", &format!("/api/logs/{id_log}"), Some(&admin), None).await;
+        let (s, item) = chamar(
+            &e,
+            "GET",
+            &format!("/api/logs/{id_log}"),
+            Some(&admin),
+            None,
+        )
+        .await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(item["id"], id_log);
         assert!(item["data"]["status"].as_u64().is_some());
@@ -4201,7 +4764,14 @@ mod tests {
         assert_eq!(lista[0]["key"], "backup_teste.zip");
 
         // 4. Baixar backup
-        let (s, _) = chamar(&e, "GET", "/api/backups/backup_teste.zip", Some(&admin), None).await;
+        let (s, _) = chamar(
+            &e,
+            "GET",
+            "/api/backups/backup_teste.zip",
+            Some(&admin),
+            None,
+        )
+        .await;
         assert_eq!(s, StatusCode::OK);
 
         // 5. Restaurar backup
@@ -4231,7 +4801,14 @@ mod tests {
         assert_eq!(s, StatusCode::OK);
         assert!(!crons.as_array().unwrap().is_empty());
 
-        let (s, _) = chamar(&e, "POST", "/api/crons/__pbLogsCleanup__", Some(&admin), None).await;
+        let (s, _) = chamar(
+            &e,
+            "POST",
+            "/api/crons/__pbLogsCleanup__",
+            Some(&admin),
+            None,
+        )
+        .await;
         assert_eq!(s, StatusCode::NO_CONTENT);
     }
 
@@ -4257,12 +4834,14 @@ mod tests {
         assert_eq!(h["location"], "/_/crons");
 
         // 3. Backups
-        let (s, _, corpo) = pedir(&e, "GET", "/_/backups", &[("cookie", cookie.as_str())], "").await;
+        let (s, _, corpo) =
+            pedir(&e, "GET", "/_/backups", &[("cookie", cookie.as_str())], "").await;
         assert_eq!(s, StatusCode::OK);
         assert!(corpo.contains("Backups"), "{corpo}");
 
         // 4. Configurações
-        let (s, _, corpo) = pedir(&e, "GET", "/_/settings", &[("cookie", cookie.as_str())], "").await;
+        let (s, _, corpo) =
+            pedir(&e, "GET", "/_/settings", &[("cookie", cookie.as_str())], "").await;
         assert_eq!(s, StatusCode::OK);
         assert!(corpo.contains("Configurações da Aplicação"), "{corpo}");
 
@@ -4283,7 +4862,10 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::OK);
-        assert!(corpo.contains("Configurações salvas com sucesso!"), "{corpo}");
+        assert!(
+            corpo.contains("Configurações salvas com sucesso!"),
+            "{corpo}"
+        );
 
         // Confere que persistiu no banco
         let cfg = e.banco.configuracoes().await;
@@ -4291,5 +4873,469 @@ mod tests {
         assert_eq!(cfg.meta.sender_name, "Equipe Suporte");
         assert!(cfg.smtp.enabled);
         assert_eq!(cfg.smtp.host, "smtp.sendgrid.net");
+    }
+
+    fn colecao_auth_teste(nome: &str) -> Collection {
+        Collection {
+            name: nome.to_string(),
+            kind: CollectionType::Auth,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn api_auth_methods_e_oauth2_redirect() {
+        let mem = forja_core::correio::Memoria::default();
+        let e = Estado::com_correio(
+            Banco::sqlite_memoria().await.unwrap(),
+            Arc::new(mem.clone()),
+        )
+        .await
+        .unwrap();
+        let _token = login(&e).await;
+
+        // Cria coleção auth com OAuth2, OTP e MFA configurados
+        let mut col = colecao_auth_teste("clientes");
+        col.mfa = Some(forja_core::MfaConfig {
+            enabled: true,
+            duration: 1800,
+            rule: String::new(),
+        });
+        col.otp = Some(forja_core::OtpConfig {
+            enabled: true,
+            duration: 180,
+            length: 6,
+            email_template: None,
+        });
+        col.oauth2 = Some(forja_core::OAuth2Config {
+            enabled: true,
+            providers: vec![forja_core::OAuth2ProviderConfig {
+                name: "google".into(),
+                display_name: "Google Login".into(),
+                client_id: "google-client-id-123".into(),
+                client_secret: "secret".into(),
+                auth_url: String::new(),
+                token_url: String::new(),
+                user_api_url: String::new(),
+                pkce: Some(true),
+                extra: Map::new(),
+            }],
+            mapped_fields: None,
+        });
+
+        let _col = e.banco.criar_colecao(col).await.unwrap();
+
+        // 1. Testa GET /api/collections/clientes/auth-methods
+        let (s, res) = chamar(
+            &e,
+            "GET",
+            "/api/collections/clientes/auth-methods",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(res["mfa"]["enabled"], true);
+        assert_eq!(res["mfa"]["duration"], 1800);
+        assert_eq!(res["otp"]["enabled"], true);
+        assert_eq!(res["otp"]["duration"], 180);
+        assert_eq!(res["password"]["enabled"], true);
+        assert_eq!(res["oauth2"]["enabled"], true);
+
+        let providers = res["oauth2"]["providers"]
+            .as_array()
+            .expect("array de provedores");
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0]["name"], "google");
+        assert_eq!(providers[0]["displayName"], "Google Login");
+        assert_eq!(providers[0]["codeChallengeMethod"], "S256");
+        assert!(providers[0]["state"].as_str().unwrap().len() >= 30);
+        assert!(providers[0]["codeVerifier"].as_str().unwrap().len() >= 43);
+        let auth_url = providers[0]["authUrl"].as_str().unwrap();
+        assert!(auth_url.contains("client_id=google-client-id-123"));
+        assert!(auth_url.contains("code_challenge="));
+
+        // 2. Testa GET /api/oauth2-redirect
+        let (s, _, corpo) = pedir(
+            &e,
+            "GET",
+            "/api/oauth2-redirect?code=xyz&state=123",
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(corpo.contains("oauth2Redirect"), "{corpo}");
+        assert!(corpo.contains("window.opener"), "{corpo}");
+    }
+
+    #[tokio::test]
+    async fn api_otp_request_e_auth() {
+        let mem = forja_core::correio::Memoria::default();
+        let e = Estado::com_correio(
+            Banco::sqlite_memoria().await.unwrap(),
+            Arc::new(mem.clone()),
+        )
+        .await
+        .unwrap();
+
+        let mut col = colecao_auth_teste("membros");
+        col.otp = Some(forja_core::OtpConfig {
+            enabled: true,
+            duration: 180,
+            length: 6,
+            email_template: None,
+        });
+        col.mfa = Some(forja_core::MfaConfig {
+            enabled: false,
+            duration: 1800,
+            rule: String::new(),
+        });
+        let col = e.banco.criar_colecao(col).await.unwrap();
+
+        // Cria usuário de teste com verified = false
+        let user = e
+            .banco
+            .criar(
+                &col,
+                json!({
+                    "email": "ana@exemplo.com",
+                    "password": "senha-secreta-456",
+                    "verified": false,
+                })
+                .as_object()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(user["verified"], false);
+
+        // 1. Pede OTP para e-mail inexistente (deve responder 200 com otpId sem enviar e-mail)
+        let (s, res_fake) = chamar(
+            &e,
+            "POST",
+            "/api/collections/membros/request-otp",
+            None,
+            Some(json!({ "email": "fantasma@exemplo.com" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(res_fake["otpId"].as_str().is_some());
+        assert!(mem.ultima().is_none());
+
+        // 2. Pede OTP para usuário existente
+        let (s, res) = chamar(
+            &e,
+            "POST",
+            "/api/collections/membros/request-otp",
+            None,
+            Some(json!({ "email": "ana@exemplo.com" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let otp_id = res["otpId"].as_str().unwrap().to_string();
+
+        let email_enviado = mem.ultima().expect("e-mail disparado");
+        assert_eq!(email_enviado.para, "ana@exemplo.com");
+        let codigo = email_enviado
+            .corpo
+            .split("Your one-time password is: ")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap();
+        assert_eq!(codigo.len(), 6);
+
+        // 3. Tenta autenticar com código errado
+        let (s_err, _) = chamar(
+            &e,
+            "POST",
+            "/api/collections/membros/auth-with-otp",
+            None,
+            Some(json!({ "otpId": otp_id, "password": "000000" })),
+        )
+        .await;
+        assert_eq!(s_err, StatusCode::BAD_REQUEST);
+
+        // 4. Autentica com o código correto
+        let (s_ok, res_auth) = chamar(
+            &e,
+            "POST",
+            "/api/collections/membros/auth-with-otp",
+            None,
+            Some(json!({ "otpId": otp_id, "password": codigo })),
+        )
+        .await;
+        assert_eq!(s_ok, StatusCode::OK, "{res_auth}");
+        assert!(res_auth["token"].as_str().is_some());
+        assert_eq!(res_auth["record"]["email"], "ana@exemplo.com");
+        assert_eq!(
+            res_auth["record"]["verified"], true,
+            "OTP valida e-mail automaticamente"
+        );
+
+        // 5. Tenta reutilizar o mesmo OTP (uso único)
+        let (s_reuse, _) = chamar(
+            &e,
+            "POST",
+            "/api/collections/membros/auth-with-otp",
+            None,
+            Some(json!({ "otpId": otp_id, "password": codigo })),
+        )
+        .await;
+        assert_eq!(s_reuse, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn api_mfa_flow() {
+        let mem = forja_core::correio::Memoria::default();
+        let e = Estado::com_correio(
+            Banco::sqlite_memoria().await.unwrap(),
+            Arc::new(mem.clone()),
+        )
+        .await
+        .unwrap();
+
+        let mut col = colecao_auth_teste("cofre");
+        col.mfa = Some(forja_core::MfaConfig {
+            enabled: true,
+            duration: 1800,
+            rule: String::new(),
+        });
+        col.otp = Some(forja_core::OtpConfig {
+            enabled: true,
+            duration: 180,
+            length: 6,
+            email_template: None,
+        });
+        let col = e.banco.criar_colecao(col).await.unwrap();
+
+        let _user = e
+            .banco
+            .criar(
+                &col,
+                json!({
+                    "email": "beto@exemplo.com",
+                    "password": "senha-muito-segura-123",
+                })
+                .as_object()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // 1. Tenta login por senha: com MFA ativo, retorna 401 com mfaId
+        let (s, res_mfa) = chamar(
+            &e,
+            "POST",
+            "/api/collections/cofre/auth-with-password",
+            None,
+            Some(json!({
+                "identity": "beto@exemplo.com",
+                "password": "senha-muito-segura-123"
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        let mfa_id = res_mfa["mfaId"]
+            .as_str()
+            .expect("mfaId retornado no 401")
+            .to_string();
+
+        // 2. Pede segundo fator (OTP)
+        let (s, res_otp) = chamar(
+            &e,
+            "POST",
+            "/api/collections/cofre/request-otp",
+            None,
+            Some(json!({ "email": "beto@exemplo.com" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let otp_id = res_otp["otpId"].as_str().unwrap().to_string();
+
+        let email_msg = mem.ultima().expect("e-mail com OTP disparado");
+        let codigo = email_msg
+            .corpo
+            .split("Your one-time password is: ")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap();
+
+        // 3. Tenta reutilizar a mesma senha como segundo fator (deve falhar)
+        let (s_same, _) = chamar(
+            &e,
+            "POST",
+            "/api/collections/cofre/auth-with-password",
+            None,
+            Some(json!({
+                "identity": "beto@exemplo.com",
+                "password": "senha-muito-segura-123",
+                "mfaId": mfa_id,
+            })),
+        )
+        .await;
+        assert_eq!(s_same, StatusCode::BAD_REQUEST);
+
+        // 4. Conclui com o segundo fator diferente (OTP + mfaId)
+        let (s_ok, res_final) = chamar(
+            &e,
+            "POST",
+            "/api/collections/cofre/auth-with-otp",
+            None,
+            Some(json!({
+                "otpId": otp_id,
+                "password": codigo,
+                "mfaId": mfa_id,
+            })),
+        )
+        .await;
+        assert_eq!(s_ok, StatusCode::OK, "{res_final}");
+        assert!(res_final["token"].as_str().is_some());
+        assert_eq!(res_final["record"]["email"], "beto@exemplo.com");
+    }
+
+    #[tokio::test]
+    async fn api_oauth2_auth_e_external_auths() {
+        // Mock server OAuth2 local
+        let mock_app = axum::Router::new()
+            .route(
+                "/token",
+                post(|| async {
+                    axum::Json(json!({
+                        "access_token": "token-oauth2-mock-123",
+                        "token_type": "Bearer"
+                    }))
+                }),
+            )
+            .route(
+                "/userinfo",
+                get(|| async {
+                    axum::Json(json!({
+                        "id": 888777,
+                        "login": "devrust",
+                        "name": "Dev Rust",
+                        "email": "devrust@github.com",
+                        "avatar_url": "https://avatars.githubusercontent.com/u/888777"
+                    }))
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, mock_app).await;
+        });
+
+        let base_mock = format!("http://127.0.0.1:{}", addr.port());
+
+        let mem = forja_core::correio::Memoria::default();
+        let e = Estado::com_correio(
+            Banco::sqlite_memoria().await.unwrap(),
+            Arc::new(mem.clone()),
+        )
+        .await
+        .unwrap();
+
+        let mut col = colecao_auth_teste("desenvolvedores");
+        col.oauth2 = Some(forja_core::OAuth2Config {
+            enabled: true,
+            providers: vec![forja_core::OAuth2ProviderConfig {
+                name: "github".into(),
+                display_name: "GitHub".into(),
+                client_id: "client-gh-1".into(),
+                client_secret: "secret-gh-1".into(),
+                auth_url: format!("{base_mock}/auth"),
+                token_url: format!("{base_mock}/token"),
+                user_api_url: format!("{base_mock}/userinfo"),
+                pkce: Some(true),
+                extra: Map::new(),
+            }],
+            mapped_fields: None,
+        });
+
+        let _col = e.banco.criar_colecao(col).await.unwrap();
+
+        // 1. Faz login com OAuth2 (usuário novo)
+        let (s, res) = chamar(
+            &e,
+            "POST",
+            "/api/collections/desenvolvedores/auth-with-oauth2",
+            None,
+            Some(json!({
+                "provider": "github",
+                "code": "code-mock-xyz",
+                "redirectUrl": "http://127.0.0.1:8090/api/oauth2-redirect",
+            })),
+        )
+        .await;
+
+        assert_eq!(s, StatusCode::OK, "{res}");
+        let user_token = res["token"].as_str().unwrap().to_string();
+        let user_id = res["record"]["id"].as_str().unwrap().to_string();
+        assert_eq!(res["record"]["email"], "devrust@github.com");
+        assert_eq!(res["record"]["verified"], true);
+        assert_eq!(res["meta"]["isNew"], true);
+        assert_eq!(res["meta"]["id"], "888777");
+        assert_eq!(res["meta"]["username"], "devrust");
+        assert_eq!(res["meta"]["accessToken"], "token-oauth2-mock-123");
+
+        // 2. Lista vínculos externos (external-auths)
+        let auth_hdr = format!("Bearer {user_token}");
+        let (s, ext_list) = chamar(
+            &e,
+            "GET",
+            &format!("/api/collections/desenvolvedores/records/{user_id}/external-auths"),
+            Some(&auth_hdr),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{ext_list}");
+        let lista = ext_list.as_array().unwrap();
+        assert_eq!(lista.len(), 1);
+        assert_eq!(lista[0]["provider"], "github");
+        assert_eq!(lista[0]["providerId"], "888777");
+
+        // 3. Login novamente com OAuth2 (usuário existente)
+        let (s_again, res_again) = chamar(
+            &e,
+            "POST",
+            "/api/collections/desenvolvedores/auth-with-oauth2",
+            None,
+            Some(json!({
+                "provider": "github",
+                "code": "code-mock-xyz",
+            })),
+        )
+        .await;
+        assert_eq!(s_again, StatusCode::OK, "{res_again}");
+        assert_eq!(res_again["meta"]["isNew"], false);
+        assert_eq!(res_again["record"]["id"], user_id);
+
+        // 4. Desvincula o provedor externo
+        let (s_del, _) = chamar(
+            &e,
+            "DELETE",
+            &format!("/api/collections/desenvolvedores/records/{user_id}/external-auths/github"),
+            Some(&auth_hdr),
+            None,
+        )
+        .await;
+        assert_eq!(s_del, StatusCode::NO_CONTENT);
+
+        // Confere que a lista agora está vazia
+        let (s, ext_list_vazia) = chamar(
+            &e,
+            "GET",
+            &format!("/api/collections/desenvolvedores/records/{user_id}/external-auths"),
+            Some(&auth_hdr),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(ext_list_vazia.as_array().unwrap().len(), 0);
     }
 }

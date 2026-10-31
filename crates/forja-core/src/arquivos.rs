@@ -358,13 +358,11 @@ pub fn assinar_s3(
     let payload_hash = hex::encode(hasher.finalize());
 
     let signed_headers = "host;x-amz-content-sha256;x-amz-date";
-    let canonical_headers = format!(
-        "host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{data_hora}\n"
-    );
+    let canonical_headers =
+        format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{data_hora}\n");
 
-    let canonical_request = format!(
-        "{metodo}\n{path}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
-    );
+    let canonical_request =
+        format!("{metodo}\n{path}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
 
     let mut cr_hasher = Sha256::new();
     cr_hasher.update(canonical_request.as_bytes());
@@ -409,9 +407,7 @@ impl S3Storage {
     pub fn new(config: S3Config) -> Self {
         Self {
             config,
-            client: reqwest::Client::builder()
-                .build()
-                .unwrap_or_default(),
+            client: reqwest::Client::builder().build().unwrap_or_default(),
         }
     }
 
@@ -594,7 +590,9 @@ impl ProvedorStorage for S3Storage {
         } else {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            Err(Erro::Interno(format!("S3 upload failed ({status}): {body}")))
+            Err(Erro::Interno(format!(
+                "S3 upload failed ({status}): {body}"
+            )))
         }
     }
 
@@ -760,7 +758,10 @@ pub fn caminho_thumb(
     arquivo: &str,
     thumb: &str,
 ) -> Resultado<PathBuf> {
-    if !segmento_ok(colecao) || !id::valido(registro) || !nome_seguro(arquivo) || !thumb_seguro(thumb)
+    if !segmento_ok(colecao)
+        || !id::valido(registro)
+        || !nome_seguro(arquivo)
+        || !thumb_seguro(thumb)
     {
         return Err(Erro::NaoEncontrado(
             "The requested resource wasn't found.".into(),
@@ -781,9 +782,17 @@ pub fn gerar_thumb(bytes: &[u8], spec: &ThumbSpec, ext: &str) -> Option<Vec<u8>>
     }
 
     let processada = if spec.w == 0 {
-        img.resize(orig_w.saturating_mul(spec.h) / orig_h.max(1), spec.h, FilterType::Triangle)
+        img.resize(
+            orig_w.saturating_mul(spec.h) / orig_h.max(1),
+            spec.h,
+            FilterType::Triangle,
+        )
     } else if spec.h == 0 {
-        img.resize(spec.w, orig_h.saturating_mul(spec.w) / orig_w.max(1), FilterType::Triangle)
+        img.resize(
+            spec.w,
+            orig_h.saturating_mul(spec.w) / orig_w.max(1),
+            FilterType::Triangle,
+        )
     } else {
         match spec.modo {
             ThumbModo::Center => img.resize_to_fill(spec.w, spec.h, FilterType::Triangle),

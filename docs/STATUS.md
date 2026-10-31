@@ -4,17 +4,23 @@
 
 | Campo | Valor |
 |---|---|
-| **Estágio** | **Em desenvolvimento** — Marcos 0.1, 0.2, 0.3, 0.4 e 0.5 concluídos! SMTP/e-mails com templates renderizáveis, agendador cron in-process, logs estruturados com agregações horárias, backups compactados em zip com restauração e upload, encerramento gracioso, e telas completas no painel administrativo |
+| **Estágio** | **Em desenvolvimento** — Marcos 0.1, 0.2, 0.3, 0.4, 0.5 e 0.6 concluídos! OAuth2 com PKCE e normalização de perfis, OTP por e-mail com uso único e auto-verificação, MFA em dois fatores com desafio 401 e `mfaId`, endpoint `auth-methods`, SMTP/e-mails, agendador cron in-process, logs estruturados com agregações horárias, backups em zip com restauração e upload, encerramento gracioso, e telas completas no painel administrativo |
 | **Plataformas** | Servidor: macOS, Linux, Windows (Rust); painel: navegador, HTML no servidor + htmx (sem build de front-end) |
 | **Stack** | Rust (axum; SQLite), maud + htmx, wasmtime in-process na 0.8. Decisão: [ADR-001](arquitetura/ADR-001-um-binario.md) |
 | **Site** | Landing em `site/` (inglês na raiz, português em `index.pt.html`). O host previsto é https://forja.falcaosl.com, no Coolify, com `deploy/site/Dockerfile`. O DNS ainda não existe; o endereço público segue o repositório. |
 | **Monetização** | Nenhuma: código aberto, MIT |
-| **Próximo marco** | Marco 0.6 (OAuth2, OTP e MFA) |
+| **Próximo marco** | Marco 0.7 (Segredo Apple OAuth2, Alertas de login e Rate limiting) |
 | **Data-alvo** | A definir; 1.0.0 só quando estável (PLANO §6) |
 
 ## O que já está pronto
 
-- Workspace com 4 crates e 72 testes passando.
+- Workspace com 4 crates e 82 testes passando.
+- Autenticação avançada (Marco 0.6 completo):
+  - **OAuth2**: suporte aos provedores do PocketBase (Google, GitHub, GitLab, Discord, Microsoft, generic OIDC, etc.), fluxo de autorização com geração automática de PKCE (S256) e State, troca de código e consulta de perfil com normalização de dados, vínculo com tabela `_externalAuths`, endpoints `POST /api/collections/{colecao}/auth-with-oauth2`, `GET /api/collections/{colecao}/records/{id}/external-auths`, `DELETE /api/collections/{colecao}/records/{id}/external-auths/{provider}` e página de redirecionamento `GET /api/oauth2-redirect` via postMessage compatível com popups dos SDKs.
+  - **OTP (One-Time Password)**: geração criptográfica de códigos numéricos com expiração configurável, entrega por e-mail com templates personalizáveis, proteção contra enumeração de e-mails, validação com expiração e uso único, endpoints `POST /api/collections/{colecao}/request-otp` e `POST /api/collections/{colecao}/auth-with-otp`, validação automática de e-mail (`verified = true`).
+  - **MFA (Multi-Factor Authentication)**: autenticação em dois fatores sequenciais distintos (senha + OTP, OAuth2 + OTP, etc.), emissão de desafio com código de status HTTP `401 Unauthorized` contendo `{"mfaId": "..."}`, expiração de sessão e prevenção de repetição do mesmo fator.
+  - **Métodos de Autenticação (`auth-methods`)**: endpoint público `GET /api/collections/{colecao}/auth-methods` expondo status e parâmetros de MFA, OTP, Senha e Provedores OAuth2 com PKCE gerado.
+  - **Painel Administrativo**: aba e campos de configuração de OTP, MFA e OAuth2 no editor de coleções auth.
 - Operação e Configurações (Marco 0.5 completo):
   - Suporte completo a SMTP (`SmtpCorreio` via `lettre`) com TLS, STARTTLS, PLAIN e LOGIN, e endpoint de teste `POST /api/settings/test/email`.
   - Modelos de e-mail editáveis (`verificationTemplate`, `resetPasswordTemplate`, `confirmEmailChangeTemplate`) com placeholders (`{APP_NAME}`, `{APP_URL}`, `{TOKEN}`, `{ACTION_URL}`, `{RECORD:campo}`).
