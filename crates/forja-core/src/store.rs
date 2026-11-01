@@ -1590,6 +1590,40 @@ fn injetar_campos_auth(campos: Vec<Field>) -> Vec<Field> {
     out
 }
 
+/// Extrai o nome do índice a partir de uma instrução DDL como `CREATE [UNIQUE] INDEX ...`.
+pub fn extrair_nome_indice(sql: &str) -> Option<String> {
+    let tokens: Vec<&str> = sql.split_whitespace().collect();
+    let mut i = 0;
+    if i < tokens.len() && tokens[i].eq_ignore_ascii_case("create") {
+        i += 1;
+    } else {
+        return None;
+    }
+    if i < tokens.len() && tokens[i].eq_ignore_ascii_case("unique") {
+        i += 1;
+    }
+    if i < tokens.len() && tokens[i].eq_ignore_ascii_case("index") {
+        i += 1;
+    } else {
+        return None;
+    }
+    if i + 2 < tokens.len()
+        && tokens[i].eq_ignore_ascii_case("if")
+        && tokens[i + 1].eq_ignore_ascii_case("not")
+        && tokens[i + 2].eq_ignore_ascii_case("exists")
+    {
+        i += 3;
+    }
+    if i < tokens.len() {
+        let raw =
+            tokens[i].trim_matches(|c| c == '`' || c == '"' || c == '[' || c == ']' || c == ';');
+        if !raw.is_empty() {
+            return Some(raw.to_string());
+        }
+    }
+    None
+}
+
 fn validar_colecao(c: &Collection) -> Resultado<()> {
     let mut erros = Map::new();
     if !nome_valido(&c.name)
@@ -2755,6 +2789,14 @@ impl Banco {
                 vec![],
             ));
         }
+        if c.kind != CollectionType::View {
+            for idx in &c.indexes {
+                let trimmed = idx.trim();
+                if !trimmed.is_empty() {
+                    comandos.push((trimmed.to_string(), vec![]));
+                }
+            }
+        }
         self.ex.lote(comandos).await.map_err(|e| {
             if matches!(e, Erro::Duplicado(_)) {
                 duplicado()
@@ -2943,6 +2985,28 @@ impl Banco {
                         ),
                         vec![],
                     ));
+                }
+            }
+
+            // Remove índices antigos que não existem mais na nova definição
+            for idx_antigo in &antiga.indexes {
+                let t_antigo = idx_antigo.trim();
+                if !t_antigo.is_empty() && !c.indexes.iter().any(|novo| novo.trim() == t_antigo) {
+                    let Some(nome) = extrair_nome_indice(t_antigo) else {
+                        continue;
+                    };
+                    comandos.push((format!("DROP INDEX IF EXISTS \"{nome}\""), vec![]));
+                }
+            }
+
+            // Cria índices novos ou recria se o nome da tabela mudou
+            for idx_novo in &c.indexes {
+                let t_novo = idx_novo.trim();
+                if !t_novo.is_empty()
+                    && (c.name != antiga.name
+                        || !antiga.indexes.iter().any(|old| old.trim() == t_novo))
+                {
+                    comandos.push((t_novo.to_string(), vec![]));
                 }
             }
         }
@@ -6460,5 +6524,64 @@ mod tests {
             .unwrap();
         let origens_depois = b.auth_origins_listar("col1", "rec1").await.unwrap();
         assert_eq!(origens_depois.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn indices_sincronizacao_e_unicidade() {
+        assert_eq!(
+            extrair_nome_indice("CREATE UNIQUE INDEX `idx_artigos_slug` ON `artigos` (`slug`)"),
+            Some("idx_artigos_slug".into())
+        );
+        assert_eq!(
+            extrair_nome_indice(
+                "CREATE INDEX IF NOT EXISTS \"idx_artigos_titulo\" ON artigos (titulo)"
+            ),
+            Some("idx_artigos_titulo".into())
+        );
+        assert_eq!(
+            extrair_nome_indice("create index idx_sem_aspas on artigos (created)"),
+            Some("idx_sem_aspas".into())
+        );
+
+        let b = Banco::sqlite_memoria().await.unwrap();
+        let c = b
+            .criar_colecao(
+                serde_json::from_value(json!({
+                    "name": "artigos",
+                    "fields": [{"name": "slug", "type": "text"}],
+                    "indexes": ["CREATE UNIQUE INDEX idx_artigos_slug ON artigos (slug)"]
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // 1. Inserir primeiro registro com slug
+        let r1 = b
+            .criar(&c, json!({"slug": "rust-lang"}).as_object().unwrap())
+            .await;
+        assert!(r1.is_ok());
+
+        // 2. Inserir duplicado com o mesmo slug deve falhar pela restrição de unicidade
+        let r2 = b
+            .criar(&c, json!({"slug": "rust-lang"}).as_object().unwrap())
+            .await;
+        assert!(r2.is_err(), "deve falhar por violação de índice único");
+
+        // 3. Atualizar coleção removendo o índice único
+        let mut col_atualizada = b.colecao("artigos").await.unwrap();
+        col_atualizada.indexes.clear();
+        b.atualizar_colecao("artigos", col_atualizada)
+            .await
+            .unwrap();
+
+        // 4. Agora inserção com mesmo slug deve ter sucesso
+        let r3 = b
+            .criar(&c, json!({"slug": "rust-lang"}).as_object().unwrap())
+            .await;
+        assert!(
+            r3.is_ok(),
+            "após remoção do índice único, duplicado é permitido"
+        );
     }
 }
