@@ -1,5 +1,7 @@
 //! `forja`: o executável único (servidor + painel embutido, quando pronto).
 
+mod mcp;
+
 use clap::{Parser, Subcommand, ValueEnum};
 use forja_core::store::{Banco, Consulta, Motor};
 use std::net::SocketAddr;
@@ -90,6 +92,14 @@ enum Comando {
     Superuser {
         #[command(subcommand)]
         acao: AcaoSuperuser,
+    },
+    /// Inicia o servidor MCP local (Model Context Protocol) via stdio para agentes de IA.
+    Mcp {
+        #[arg(long, default_value = "default")]
+        project: String,
+        /// Habilita operações de escrita e exclusão (por padrão é somente leitura).
+        #[arg(long, default_value_t = false)]
+        read_write: bool,
     },
 }
 
@@ -614,6 +624,16 @@ async fn executar(comando: Comando, dir: PathBuf, motor: Motor) -> Result<(), St
             .map(|s| println!("Superusuário {} apagado do projeto '{project}'.", s.email))
             .map_err(formatar_erro),
         },
+        Comando::Mcp {
+            project,
+            read_write,
+        } => {
+            let b = Banco::abrir(&motor, &dir, &project)
+                .await
+                .map_err(|e| e.to_string())?;
+            let srv = mcp::ServidorMcp::novo(b, read_write);
+            srv.rodar_stdio().await.map_err(|e| e.to_string())
+        }
     }
 }
 
