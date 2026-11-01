@@ -1025,6 +1025,11 @@ pub fn ordem(sort: &str, valido: &dyn Fn(&str) -> bool, dialeto: Dialeto) -> Res
             });
             continue;
         }
+        if nome == "@rowid" {
+            let direcao = if desc { "DESC" } else { "ASC" };
+            partes.push(format!("\"rowid\" {direcao}"));
+            continue;
+        }
         let col = coluna(nome, valido)
             .map_err(|_| Erro::invalido(format!("Invalid sort field '{nome}'")))?;
         partes.push(format!("{col} {}", if desc { "DESC" } else { "ASC" }));
@@ -1155,6 +1160,14 @@ mod tests {
         assert_eq!(
             ordem("@random", &campos, Dialeto::Sqlite).unwrap(),
             "RANDOM()"
+        );
+        assert_eq!(
+            ordem("@rowid", &campos, Dialeto::Sqlite).unwrap(),
+            "\"rowid\" ASC"
+        );
+        assert_eq!(
+            ordem("-@rowid", &campos, Dialeto::Sqlite).unwrap(),
+            "\"rowid\" DESC"
         );
         assert!(ordem("nome; DROP", &campos, Dialeto::Sqlite).is_err());
     }

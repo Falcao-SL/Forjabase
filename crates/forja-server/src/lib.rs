@@ -505,6 +505,28 @@ async fn colecoes_importar_api(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Deserialize)]
+struct SqlRequisicao {
+    query: String,
+}
+
+async fn sql_executar_api(
+    State(e): State<Estado>,
+    quem: Chamador,
+    Json(p): Json<SqlRequisicao>,
+) -> Res<Json<forja_core::SqlResultado>> {
+    quem.exigir_superusuario()?;
+    let r = e
+        .banco
+        .executar_sql_bruto(&p.query)
+        .await
+        .map_err(|err| match err {
+            Erro::Interno(msg) => ErroApi(Erro::invalido(msg)),
+            outro => ErroApi(outro),
+        })?;
+    Ok(Json(r))
+}
+
 async fn settings_obter(
     State(e): State<Estado>,
     quem: Chamador,
@@ -2896,6 +2918,7 @@ pub fn router(e: Estado) -> Router {
         .route("/api/logs", get(logs_listar_api))
         .route("/api/logs/stats", get(logs_stats_api))
         .route("/api/logs/{id}", get(logs_obter_api))
+        .route("/api/sql", post(sql_executar_api))
         .route(
             "/api/backups",
             get(backups_listar_api).post(backups_criar_api),
@@ -6472,5 +6495,94 @@ QZsW/88VekgRw1uMBJnAOVmLF6rgxw9BFHjwoDinr9grT9ylHAqQb5kj\n\
         assert!(lista.contains(&"default".to_string()));
         assert!(lista.contains(&"cliente_alpha".to_string()));
         assert!(lista.contains(&"cliente_beta".to_string()));
+    }
+
+    #[tokio::test]
+    async fn api_sql_endpoint_e_geo_distance() {
+        let e = estado().await;
+        let admin = login(&e).await;
+
+        // 1. Visitante sem token recebe 403
+        let (s_anon, _) = chamar(
+            &e,
+            "POST",
+            "/api/sql",
+            None,
+            Some(json!({ "query": "SELECT 1" })),
+        )
+        .await;
+        assert_eq!(s_anon, StatusCode::FORBIDDEN);
+
+        // 2. Consulta inválida retorna 400
+        let (s_err, v_err) = chamar(
+            &e,
+            "POST",
+            "/api/sql",
+            Some(&admin),
+            Some(json!({ "query": "SELECT * FROM tabela_fantasma_xyz" })),
+        )
+        .await;
+        assert_eq!(s_err, StatusCode::BAD_REQUEST);
+        assert!(v_err["message"].as_str().unwrap().contains("no such table"));
+
+        // 3. Consulta com geoDistance entre São Paulo (-46.6333, -23.5505) e Rio (-43.1729, -22.9068)
+        let (s_geo, v_geo) = chamar(
+            &e,
+            "POST",
+            "/api/sql",
+            Some(&admin),
+            Some(json!({
+                "query": "SELECT geoDistance(-46.6333, -23.5505, -43.1729, -22.9068) as distancia_metros"
+            })),
+        )
+        .await;
+        assert_eq!(s_geo, StatusCode::OK, "{v_geo}");
+        assert_eq!(v_geo["columns"][0]["name"], "distancia_metros");
+        let dist = v_geo["rows"][0][0].as_f64().unwrap();
+        // A distância real é ~358 km (358.000 metros)
+        assert!(
+            (dist - 358_000.0).abs() < 5_000.0,
+            "Distância esperada ~358km, obtido: {dist}m"
+        );
+
+        // 4. Execução de comandos DDL e DML
+        let (s_create, v_create) = chamar(
+            &e,
+            "POST",
+            "/api/sql",
+            Some(&admin),
+            Some(json!({ "query": "CREATE TABLE itens_teste (id TEXT PRIMARY KEY, preco REAL)" })),
+        )
+        .await;
+        assert_eq!(s_create, StatusCode::OK, "{v_create}");
+
+        let (s_ins, v_ins) = chamar(
+            &e,
+            "POST",
+            "/api/sql",
+            Some(&admin),
+            Some(json!({ "query": "INSERT INTO itens_teste VALUES ('i1', 99.9), ('i2', 150.0)" })),
+        )
+        .await;
+        assert_eq!(s_ins, StatusCode::OK, "{v_ins}");
+        assert_eq!(v_ins["affectedRows"], 2);
+
+        // 5. SELECT nos dados inseridos
+        let (s_sel, v_sel) = chamar(
+            &e,
+            "POST",
+            "/api/sql",
+            Some(&admin),
+            Some(json!({ "query": "SELECT id, preco FROM itens_teste ORDER BY preco ASC" })),
+        )
+        .await;
+        assert_eq!(s_sel, StatusCode::OK, "{v_sel}");
+        assert_eq!(v_sel["columns"].as_array().unwrap().len(), 2);
+        let rows = v_sel["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], "i1");
+        assert_eq!(rows[0][1], 99.9);
+        assert_eq!(rows[1][0], "i2");
+        assert_eq!(rows[1][1], 150.0);
     }
 }

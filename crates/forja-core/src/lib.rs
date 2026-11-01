@@ -21,6 +21,7 @@ pub mod valor;
 mod view;
 
 pub use erro::Erro;
+pub use motor::{SqlColunaInfo, SqlResultado};
 pub use oauth2::{
     AuthAlertConfig, AuthMethodsResponse, AuthProviderInfo, MfaConfig, OAuth2Config,
     OAuth2MappedFields, OAuth2PerfilUsuario, OAuth2ProviderConfig, OAuth2TokenResponse, OtpConfig,

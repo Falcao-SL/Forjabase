@@ -3059,6 +3059,14 @@ impl Banco {
         Ok(())
     }
 
+    pub async fn executar_sql_bruto(&self, sql: &str) -> Resultado<crate::motor::SqlResultado> {
+        let sql = sql.trim();
+        if sql.is_empty() {
+            return Err(Erro::invalido("SQL query cannot be empty."));
+        }
+        self.ex.executar_sql_bruto(sql).await
+    }
+
     pub async fn listar(&self, c: &Collection, q: &Consulta) -> Resultado<Lista> {
         let por_pagina = q.por_pagina.clamp(1, 1000);
         let pagina = q.pagina.max(1);

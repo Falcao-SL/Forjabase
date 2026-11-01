@@ -1,7 +1,7 @@
 //! SQLite pelo rusqlite: o motor padrão, comprovado, um arquivo por projeto.
 //! O rusqlite é síncrono; cada chamada roda em `spawn_blocking`.
 
-use super::{Executor, Guardiao, Linha};
+use super::{Executor, Guardiao, Linha, SqlColunaInfo, SqlResultado};
 use crate::erro::{Erro, Resultado};
 use crate::filtro::Dialeto;
 use crate::valor::Valor;
@@ -43,6 +43,32 @@ impl Sqlite {
             "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 10000; PRAGMA synchronous = NORMAL;",
         )
         .map_err(erro)?;
+
+        conn.create_scalar_function(
+            "geoDistance",
+            4,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| {
+                let lon1: f64 = ctx.get(0)?;
+                let lat1: f64 = ctx.get(1)?;
+                let lon2: f64 = ctx.get(2)?;
+                let lat2: f64 = ctx.get(3)?;
+
+                let r = 6371000.0;
+                let d_lat = (lat2 - lat1).to_radians();
+                let d_lon = (lon2 - lon1).to_radians();
+                let lat1_rad = lat1.to_radians();
+                let lat2_rad = lat2.to_radians();
+
+                let a = (d_lat / 2.0).sin().powi(2)
+                    + lat1_rad.cos() * lat2_rad.cos() * (d_lon / 2.0).sin().powi(2);
+                let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
+                Ok(r * c)
+            },
+        )
+        .map_err(erro)?;
+
         Ok(Sqlite {
             conn: Arc::new(Mutex::new(conn)),
             trava: Arc::new(tokio::sync::Mutex::new(())),
@@ -240,6 +266,75 @@ impl Executor for Sqlite {
                 }
             }
             tx.commit()
+        })
+        .await
+    }
+
+    async fn executar_sql_bruto(&self, sql: &str) -> Resultado<SqlResultado> {
+        let sql = sql.to_string();
+        self.com(move |c| {
+            let start = std::time::Instant::now();
+            let trimmed = sql.trim().to_uppercase();
+            let is_query = trimmed.starts_with("SELECT")
+                || trimmed.starts_with("WITH")
+                || trimmed.starts_with("PRAGMA")
+                || trimmed.starts_with("EXPLAIN");
+
+            if is_query {
+                let mut st = c.prepare(&sql)?;
+                let col_names: Vec<String> =
+                    st.column_names().into_iter().map(String::from).collect();
+                let columns: Vec<SqlColunaInfo> = col_names
+                    .iter()
+                    .map(|n| SqlColunaInfo {
+                        name: n.clone(),
+                        kind: "TEXT".to_string(),
+                        nullable: true,
+                    })
+                    .collect();
+
+                let mut rows = Vec::new();
+                let mut query_iter = st.query([])?;
+                while let Some(row) = query_iter.next()? {
+                    let mut row_vals = Vec::with_capacity(col_names.len());
+                    for i in 0..col_names.len() {
+                        let sv: rusqlite::types::Value = row.get(i)?;
+                        let jv = match sv {
+                            rusqlite::types::Value::Null => serde_json::Value::Null,
+                            rusqlite::types::Value::Integer(n) => serde_json::json!(n),
+                            rusqlite::types::Value::Real(f) => serde_json::json!(f),
+                            rusqlite::types::Value::Text(t) => serde_json::json!(t),
+                            rusqlite::types::Value::Blob(b) => {
+                                serde_json::json!(String::from_utf8_lossy(&b))
+                            }
+                        };
+                        row_vals.push(jv);
+                    }
+                    rows.push(row_vals);
+                    if rows.len() >= 1000 {
+                        break;
+                    }
+                }
+                let exec_time = start.elapsed().as_millis() as u64;
+                Ok(SqlResultado {
+                    exec_time,
+                    affected_rows: 0,
+                    columns,
+                    rows,
+                })
+            } else {
+                let tx = c.transaction()?;
+                let _ = tx.execute_batch(&sql)?;
+                tx.commit()?;
+                let changes = c.changes();
+                let exec_time = start.elapsed().as_millis() as u64;
+                Ok(SqlResultado {
+                    exec_time,
+                    affected_rows: changes,
+                    columns: vec![],
+                    rows: vec![],
+                })
+            }
         })
         .await
     }

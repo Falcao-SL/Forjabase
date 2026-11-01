@@ -5,10 +5,11 @@
 //! O SQL chega sempre com `?` como marcador. O executor do Postgres troca
 //! por `$1`, `$2`… antes de enviar.
 
-use crate::erro::Resultado;
+use crate::erro::{Erro, Resultado};
 use crate::filtro::Dialeto;
 use crate::valor::Valor;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "postgres")]
 pub mod postgres;
@@ -19,6 +20,24 @@ pub mod turso;
 
 /// Uma linha de resultado, na ordem das colunas do `SELECT`.
 pub type Linha = Vec<Valor>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SqlColunaInfo {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub nullable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SqlResultado {
+    pub exec_time: u64,
+    pub affected_rows: u64,
+    pub columns: Vec<SqlColunaInfo>,
+    pub rows: Vec<Vec<serde_json::Value>>,
+}
 
 #[async_trait]
 pub trait Executor: Send + Sync {
@@ -36,6 +55,13 @@ pub trait Executor: Send + Sync {
 
     /// Executa vários comandos numa transação: tudo ou nada.
     async fn lote(&self, comandos: Vec<(String, Vec<Valor>)>) -> Resultado<()>;
+
+    /// Executa uma instrução SQL bruta com medição e retorno estruturado.
+    async fn executar_sql_bruto(&self, _sql: &str) -> Resultado<SqlResultado> {
+        Err(Erro::invalido(
+            "Raw SQL execution is not supported on this engine.",
+        ))
+    }
 
     /// Transação exclusiva em volta de várias chamadas. O padrão não faz
     /// nada: só o SQLite (o motor suportado) segura a conexão até o commit.
