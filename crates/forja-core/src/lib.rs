@@ -27,7 +27,9 @@ pub use oauth2::{
     OAuth2MappedFields, OAuth2PerfilUsuario, OAuth2ProviderConfig, OAuth2TokenResponse, OtpConfig,
     PasswordAuthConfig, TokenConfig,
 };
-pub use store::{AuthOriginRegistro, ExternalAuthRegistro, MfaRegistro, OtpRegistro};
+pub use store::{
+    AuthOriginRegistro, ExternalAuthRegistro, GanchoRegistro, MfaRegistro, OtpRegistro,
+};
 
 /// Versão do Forja (a mesma do workspace).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

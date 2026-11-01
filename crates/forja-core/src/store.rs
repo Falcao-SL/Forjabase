@@ -431,6 +431,47 @@ struct Pendencias {
     arquivos: Vec<std::path::PathBuf>,
 }
 
+/// Trait para ganchos (hooks) de ciclo de vida de registros.
+/// Permite interceptar, validar ou transformar dados antes e depois de inserções, atualizações e exclusões.
+#[async_trait::async_trait]
+pub trait GanchoRegistro: Send + Sync {
+    async fn antes_criar(
+        &self,
+        _colecao: &Collection,
+        _dados: &mut Map<String, Value>,
+    ) -> Resultado<()> {
+        Ok(())
+    }
+    async fn depois_criar(
+        &self,
+        _colecao: &Collection,
+        _registro: &Map<String, Value>,
+    ) -> Resultado<()> {
+        Ok(())
+    }
+    async fn antes_atualizar(
+        &self,
+        _colecao: &Collection,
+        _id: &str,
+        _dados: &mut Map<String, Value>,
+    ) -> Resultado<()> {
+        Ok(())
+    }
+    async fn depois_atualizar(
+        &self,
+        _colecao: &Collection,
+        _registro: &Map<String, Value>,
+    ) -> Resultado<()> {
+        Ok(())
+    }
+    async fn antes_apagar(&self, _colecao: &Collection, _id: &str) -> Resultado<()> {
+        Ok(())
+    }
+    async fn depois_apagar(&self, _colecao: &Collection, _id: &str) -> Resultado<()> {
+        Ok(())
+    }
+}
+
 /// O banco de um projeto.
 #[derive(Clone)]
 pub struct Banco {
@@ -441,6 +482,8 @@ pub struct Banco {
     pasta: Option<Arc<std::path::PathBuf>>,
     /// Preenchido só na tarefa que abriu `em_transacao`.
     adiados: Arc<std::sync::Mutex<Option<(tokio::task::Id, Pendencias)>>>,
+    /// Ganchos registrados para interceptação de registros.
+    ganchos: Arc<tokio::sync::RwLock<Vec<Arc<dyn GanchoRegistro>>>>,
 }
 
 // ── Abrir ────────────────────────────────────────────────────────────────
@@ -483,6 +526,7 @@ impl Banco {
             barramento: Barramento::novo(),
             pasta: None,
             adiados: Arc::new(std::sync::Mutex::new(None)),
+            ganchos: Arc::new(tokio::sync::RwLock::new(Vec::new())),
         };
         b.ex.lote(
             esquema(b.dialeto())
@@ -557,6 +601,11 @@ impl Banco {
 
     pub fn pasta(&self) -> Option<Arc<std::path::PathBuf>> {
         self.pasta.clone()
+    }
+
+    /// Registra um gancho (hook) para interceptar o ciclo de vida de registros.
+    pub async fn registrar_gancho(&self, gancho: Arc<dyn GanchoRegistro>) {
+        self.ganchos.write().await.push(gancho);
     }
 
     fn publicar(&self, colecao: &str, acao: Acao, id: &str, registro: Value) {
@@ -3319,6 +3368,12 @@ impl Banco {
         if c.kind == CollectionType::View {
             return Err(Erro::invalido("The collection is not writable."));
         }
+        let mut dados_mut = dados.clone();
+        let ganchos = self.ganchos.read().await.clone();
+        for g in &ganchos {
+            g.antes_criar(c, &mut dados_mut).await?;
+        }
+        let dados = &dados_mut;
         let resolvido = arquivos::resolver(c, dados, None, recebidos)
             .map_err(|campos| invalido("Failed to create record.", campos))?;
         let dados = &resolvido.dados;
@@ -3428,6 +3483,11 @@ impl Banco {
             return Err(e);
         }
         let registro = self.registro(c, &novo_id, None).await?;
+        if let Some(obj) = registro.as_object() {
+            for g in &ganchos {
+                g.depois_criar(c, obj).await?;
+            }
+        }
         self.publicar(&c.name, Acao::Criar, &novo_id, registro.clone());
         Ok(registro)
     }
@@ -3486,6 +3546,12 @@ impl Banco {
         if c.kind == CollectionType::View {
             return Err(Erro::invalido("The collection is not writable."));
         }
+        let mut dados_mut = dados.clone();
+        let ganchos = self.ganchos.read().await.clone();
+        for g in &ganchos {
+            g.antes_atualizar(c, id, &mut dados_mut).await?;
+        }
+        let dados = &dados_mut;
         let atual = self.registro_com(c, id, regra, ctx).await?;
         let resolvido = arquivos::resolver(c, dados, Some(&atual), recebidos)
             .map_err(|campos| invalido("Failed to update record.", campos))?;
@@ -3574,6 +3640,11 @@ impl Banco {
             .await?;
         self.esquecer_nomes(&c.id, id, &resolvido.apagar);
         let registro = self.registro_com(c, id, None, ctx).await?;
+        if let Some(obj) = registro.as_object() {
+            for g in &ganchos {
+                g.depois_atualizar(c, obj).await?;
+            }
+        }
         self.publicar(&c.name, Acao::Atualizar, id, registro.clone());
         Ok(registro)
     }
@@ -3593,8 +3664,16 @@ impl Banco {
             return Err(Erro::invalido("The collection is not writable."));
         }
         self.registro_com(c, id, regra, ctx).await?;
+        let ganchos = self.ganchos.read().await.clone();
+        for g in &ganchos {
+            g.antes_apagar(c, id).await?;
+        }
         let efeitos = self.planejar_cascata(c, id).await?;
-        self.aplicar_efeitos(efeitos).await
+        self.aplicar_efeitos(efeitos).await?;
+        for g in &ganchos {
+            g.depois_apagar(c, id).await?;
+        }
+        Ok(())
     }
 
     /// Credenciais de um usuário de coleção `auth`, por e-mail ou por id.
@@ -6582,6 +6661,116 @@ mod tests {
         assert!(
             r3.is_ok(),
             "após remoção do índice único, duplicado é permitido"
+        );
+    }
+
+    #[tokio::test]
+    async fn ganchos_ciclo_de_vida_registros() {
+        struct MeuGanchoAuditoria {
+            contador_depois_criar: std::sync::atomic::AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl GanchoRegistro for MeuGanchoAuditoria {
+            async fn antes_criar(
+                &self,
+                _c: &Collection,
+                dados: &mut Map<String, Value>,
+            ) -> Resultado<()> {
+                dados.insert("slug".into(), json!("slug-gerado-no-gancho"));
+                Ok(())
+            }
+
+            async fn depois_criar(
+                &self,
+                _c: &Collection,
+                _r: &Map<String, Value>,
+            ) -> Resultado<()> {
+                self.contador_depois_criar
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+
+            async fn antes_atualizar(
+                &self,
+                _c: &Collection,
+                _id: &str,
+                dados: &mut Map<String, Value>,
+            ) -> Resultado<()> {
+                if let Some(status) = dados.get("status").and_then(Value::as_str)
+                    && status == "bloqueado"
+                {
+                    return Err(Erro::invalido(
+                        "Transição para bloqueado não permitida pelo hook.",
+                    ));
+                }
+                Ok(())
+            }
+        }
+
+        let b = Banco::sqlite_memoria().await.unwrap();
+        let gancho = Arc::new(MeuGanchoAuditoria {
+            contador_depois_criar: std::sync::atomic::AtomicUsize::new(0),
+        });
+        b.registrar_gancho(gancho.clone()).await;
+
+        let c = b
+            .criar_colecao(
+                serde_json::from_value(json!({
+                    "name": "posts",
+                    "fields": [
+                        {"name": "titulo", "type": "text"},
+                        {"name": "slug", "type": "text"},
+                        {"name": "status", "type": "text"}
+                    ]
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // 1. Criar registro: antes_criar deve injetar o slug e depois_criar deve incrementar o contador
+        let rec = b
+            .criar(&c, json!({"titulo": "Primeiro Post"}).as_object().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(rec["slug"], "slug-gerado-no-gancho");
+        assert_eq!(
+            gancho
+                .contador_depois_criar
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        let id = rec["id"].as_str().unwrap();
+
+        // 2. Atualizar permitido
+        let rec_up = b
+            .atualizar(
+                &c,
+                id,
+                json!({"status": "publicado"}).as_object().unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rec_up["status"], "publicado");
+
+        // 3. Atualizar bloqueado pelo hook antes_atualizar
+        let err_up = b
+            .atualizar(
+                &c,
+                id,
+                json!({"status": "bloqueado"}).as_object().unwrap(),
+                None,
+            )
+            .await;
+        assert!(err_up.is_err());
+        assert!(
+            err_up
+                .unwrap_err()
+                .to_string()
+                .contains("Transição para bloqueado não permitida")
         );
     }
 }
