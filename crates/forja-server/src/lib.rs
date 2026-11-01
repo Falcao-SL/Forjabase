@@ -13,8 +13,11 @@ use axum::body::Body;
 use axum::extract::{
     DefaultBodyLimit, FromRequest, FromRequestParts, Multipart, Path, Query, Request, State,
 };
-use axum::http::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE};
-use axum::http::{StatusCode, request::Parts};
+use axum::http::header::{
+    AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HeaderName,
+    RANGE,
+};
+use axum::http::{HeaderValue, Method, StatusCode, request::Parts};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
@@ -39,6 +42,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use tower_http::cors::CorsLayer;
 
 /// Onboarding do primeiro superusuário.
 ///
@@ -79,6 +83,24 @@ impl Instalador {
     }
 }
 
+/// Configurações operacionais do servidor HTTP (origens CORS, pasta pública, modo dev).
+#[derive(Clone, Debug)]
+pub struct ServidorConfig {
+    pub origins: Vec<String>,
+    pub public_dir: Option<std::path::PathBuf>,
+    pub dev: bool,
+}
+
+impl Default for ServidorConfig {
+    fn default() -> Self {
+        Self {
+            origins: vec!["*".into()],
+            public_dir: None,
+            dev: false,
+        }
+    }
+}
+
 /// Estado compartilhado: o banco do projeto, o segredo dos tokens e o correio.
 #[derive(Clone)]
 pub struct Estado {
@@ -88,6 +110,7 @@ pub struct Estado {
     pub instalador: Arc<Instalador>,
     pub realtime: Arc<realtime::Hub>,
     pub rate_limiter: rate_limit::RateLimiter,
+    pub config: Arc<ServidorConfig>,
 }
 
 impl Estado {
@@ -119,7 +142,44 @@ impl Estado {
             instalador: Arc::new(instalador),
             realtime,
             rate_limiter: rate_limit::RateLimiter::novo(),
+            config: Arc::new(ServidorConfig::default()),
         })
+    }
+
+    pub fn com_config(mut self, config: ServidorConfig) -> Self {
+        self.config = Arc::new(config);
+        self
+    }
+}
+
+/// Cria o middleware de CORS baseado na configuração do servidor.
+pub fn cors_layer(config: &ServidorConfig) -> CorsLayer {
+    if config.origins.is_empty() || config.origins.iter().any(|o| o == "*") {
+        CorsLayer::very_permissive()
+    } else {
+        let allowed_origins: Vec<HeaderValue> = config
+            .origins
+            .iter()
+            .filter_map(|o| HeaderValue::from_str(o.trim()).ok())
+            .collect();
+        CorsLayer::new()
+            .allow_origin(allowed_origins)
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::PATCH,
+                Method::DELETE,
+                Method::OPTIONS,
+            ])
+            .allow_headers([
+                AUTHORIZATION,
+                CONTENT_TYPE,
+                RANGE,
+                HeaderName::from_static("x-token"),
+                HeaderName::from_static("x-requested-with"),
+            ])
+            .allow_credentials(true)
     }
 }
 
@@ -2759,6 +2819,13 @@ async fn log_middleware(State(e): State<Estado>, req: Request, next: Next) -> Re
     let duracao = inicio.elapsed().as_secs_f64();
     let status = res.status().as_u16();
 
+    if e.config.dev {
+        eprintln!(
+            "[DEV] {method} {uri} -> {status} ({:.2}ms)",
+            duracao * 1000.0
+        );
+    }
+
     if uri.starts_with("/api/") && !uri.starts_with("/api/logs") {
         let level = if status >= 500 {
             8
@@ -2785,7 +2852,7 @@ async fn log_middleware(State(e): State<Estado>, req: Request, next: Next) -> Re
 
 /// As rotas do Forja.
 pub fn router(e: Estado) -> Router {
-    Router::new()
+    let r = Router::new()
         .route("/api/health", get(health))
         .route(
             "/api/collections/_superusers/auth-with-password",
@@ -2931,12 +2998,27 @@ pub fn router(e: Estado) -> Router {
         .route("/api/backups/{key}/restore", post(backups_restaurar_api))
         .route("/api/crons", get(crons_listar_api))
         .route("/api/crons/{id}", post(cron_executar_api))
-        .merge(painel::rotas())
-        .layer(middleware::from_fn_with_state(e.clone(), log_middleware))
+        .merge(painel::rotas());
+
+    let r = if let Some(ref p) = e.config.public_dir {
+        if p.exists() {
+            let fallback_serv = tower_http::services::ServeDir::new(p)
+                .append_index_html_on_directories(true)
+                .fallback(tower_http::services::ServeFile::new(p.join("index.html")));
+            r.fallback_service(fallback_serv)
+        } else {
+            r.route("/", get(painel::raiz))
+        }
+    } else {
+        r.route("/", get(painel::raiz))
+    };
+
+    r.layer(middleware::from_fn_with_state(e.clone(), log_middleware))
         .layer(middleware::from_fn_with_state(
             e.clone(),
             rate_limit::rate_limit_middleware,
         ))
+        .layer(cors_layer(&e.config))
         .layer(DefaultBodyLimit::max(MAX_CORPO))
         .with_state(e)
 }
@@ -2983,16 +3065,29 @@ async fn shutdown_signal() {
     }
 }
 
-/// Abre o projeto padrão no motor escolhido e atende até o processo terminar.
+/// Abre o projeto padrão no motor escolhido e atende até o processo terminar com configurações padrão.
 pub async fn serve(
     addr: SocketAddr,
     pasta: std::path::PathBuf,
     motor: Motor,
 ) -> std::io::Result<()> {
+    serve_com_config(addr, pasta, motor, ServidorConfig::default()).await
+}
+
+/// Abre o projeto padrão no motor escolhido com opções avançadas (origens CORS, pasta pública, modo dev).
+pub async fn serve_com_config(
+    addr: SocketAddr,
+    pasta: std::path::PathBuf,
+    motor: Motor,
+    config: ServidorConfig,
+) -> std::io::Result<()> {
     let io = |e: Erro| std::io::Error::other(e.to_string());
     let banco = Banco::abrir(&motor, &pasta, "default").await.map_err(io)?;
     let nome_motor = banco.motor();
-    let estado = Estado::novo(banco).await.map_err(io)?;
+    let estado = Estado::novo(banco)
+        .await
+        .map_err(io)?
+        .com_config(config.clone());
     let projetos = Arc::new(GerenciadorProjetos::novo(
         pasta.clone(),
         motor,
@@ -3010,6 +3105,12 @@ pub async fn serve(
         forja_core::VERSION,
         pasta.display()
     );
+    if config.dev {
+        eprintln!("* Modo DEV ativado (log detalhado de requisições)");
+    }
+    if let Some(ref pub_dir) = config.public_dir {
+        eprintln!("* Servindo arquivos estáticos de: {}", pub_dir.display());
+    }
     axum::serve(listener, router_com_projetos(estado, projetos))
         .with_graceful_shutdown(shutdown_signal())
         .await
@@ -6584,5 +6685,103 @@ QZsW/88VekgRw1uMBJnAOVmLF6rgxw9BFHjwoDinr9grT9ylHAqQb5kj\n\
         assert_eq!(rows[0][1], 99.9);
         assert_eq!(rows[1][0], "i2");
         assert_eq!(rows[1][1], 150.0);
+    }
+
+    #[tokio::test]
+    async fn api_cors_public_dir_e_dev_mode() {
+        let e_padrao = estado().await;
+
+        // 1. Testa CORS padrão (*)
+        let req_cors = Request::builder()
+            .method("OPTIONS")
+            .uri("/api/health")
+            .header("origin", "http://exemplo.com")
+            .header("access-control-request-method", "GET")
+            .body(Body::empty())
+            .unwrap();
+        let resp_cors = router(e_padrao.clone()).oneshot(req_cors).await.unwrap();
+        assert_eq!(resp_cors.status(), StatusCode::OK);
+        assert_eq!(
+            resp_cors
+                .headers()
+                .get("access-control-allow-origin")
+                .unwrap(),
+            "http://exemplo.com"
+        );
+
+        // 2. Testa redirecionamento de raiz para /_/ quando sem public_dir
+        let req_raiz = Request::builder()
+            .method("GET")
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        let resp_raiz = router(e_padrao.clone()).oneshot(req_raiz).await.unwrap();
+        assert_eq!(resp_raiz.status(), StatusCode::SEE_OTHER);
+        assert_eq!(resp_raiz.headers().get("location").unwrap(), "/_/");
+
+        // 3. Testa pasta pública com index.html e fallback SPA
+        let tmp = tempfile::tempdir().unwrap();
+        let index_path = tmp.path().join("index.html");
+        std::fs::write(&index_path, "<h1>SPA Forjabase</h1>").unwrap();
+
+        let e_pub = estado().await.com_config(ServidorConfig {
+            origins: vec!["https://meuapp.com".into()],
+            public_dir: Some(tmp.path().to_path_buf()),
+            dev: true,
+        });
+
+        // 3a. CORS restrito a https://meuapp.com
+        let req_cors_restrito = Request::builder()
+            .method("OPTIONS")
+            .uri("/api/health")
+            .header("origin", "https://meuapp.com")
+            .header("access-control-request-method", "GET")
+            .body(Body::empty())
+            .unwrap();
+        let resp_cors_restrito = router(e_pub.clone())
+            .oneshot(req_cors_restrito)
+            .await
+            .unwrap();
+        assert_eq!(resp_cors_restrito.status(), StatusCode::OK);
+        assert_eq!(
+            resp_cors_restrito
+                .headers()
+                .get("access-control-allow-origin")
+                .unwrap(),
+            "https://meuapp.com"
+        );
+
+        // 3b. Raiz serve o index.html da pasta pública
+        let req_pub_raiz = Request::builder()
+            .method("GET")
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        let resp_pub_raiz = router(e_pub.clone()).oneshot(req_pub_raiz).await.unwrap();
+        assert_eq!(resp_pub_raiz.status(), StatusCode::OK);
+        let corpo = resp_pub_raiz
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(
+            std::str::from_utf8(&corpo).unwrap(),
+            "<h1>SPA Forjabase</h1>"
+        );
+
+        // 3c. Rota SPA desconhecida cai no fallback index.html
+        let req_spa = Request::builder()
+            .method("GET")
+            .uri("/rota-do-frontend")
+            .body(Body::empty())
+            .unwrap();
+        let resp_spa = router(e_pub).oneshot(req_spa).await.unwrap();
+        assert_eq!(resp_spa.status(), StatusCode::OK);
+        let corpo_spa = resp_spa.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            std::str::from_utf8(&corpo_spa).unwrap(),
+            "<h1>SPA Forjabase</h1>"
+        );
     }
 }

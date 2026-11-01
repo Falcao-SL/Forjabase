@@ -96,7 +96,7 @@ fn com_cookie(mut resp: Response, valor: &str, max_age: u64) -> Response {
 
 // ── Telas ────────────────────────────────────────────────────────────────
 
-async fn raiz() -> Response {
+pub(crate) async fn raiz() -> Response {
     Redirect::to("/_/").into_response()
 }
 

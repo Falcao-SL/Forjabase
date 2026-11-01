@@ -56,6 +56,15 @@ enum Comando {
         /// Endereço e porta (a porta padrão é a mesma do PocketBase).
         #[arg(long, default_value = "127.0.0.1:8090")]
         http: SocketAddr,
+        /// Origens CORS permitidas (separadas por vírgula, padrão "*").
+        #[arg(long, default_value = "*")]
+        origins: String,
+        /// Pasta pública para arquivos estáticos (HTML/CSS/JS).
+        #[arg(long, alias = "publicDir", env = "FORJA_PUBLIC_DIR")]
+        public_dir: Option<PathBuf>,
+        /// Modo de desenvolvimento (logs detalhados e rastreio de erros).
+        #[arg(long, default_value_t = false)]
+        dev: bool,
     },
     /// Gerencia projetos (multi-tenancy).
     Projects {
@@ -142,9 +151,25 @@ async fn main() -> std::process::ExitCode {
 
 async fn executar(comando: Comando, dir: PathBuf, motor: Motor) -> Result<(), String> {
     match comando {
-        Comando::Serve { http } => forja_server::serve(http, dir, motor)
-            .await
-            .map_err(|e| e.to_string()),
+        Comando::Serve {
+            http,
+            origins,
+            public_dir,
+            dev,
+        } => {
+            let config = forja_server::ServidorConfig {
+                origins: origins
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+                public_dir,
+                dev,
+            };
+            forja_server::serve_com_config(http, dir, motor, config)
+                .await
+                .map_err(|e| e.to_string())
+        }
         Comando::Projects { acao } => match acao {
             AcaoProjetos::List => {
                 let gp = forja_server::GerenciadorProjetos::novo(
