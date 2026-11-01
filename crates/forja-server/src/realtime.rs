@@ -50,7 +50,7 @@ impl SessaoRt {
     }
 
     pub fn de(quem: &Chamador) -> SessaoRt {
-        match &quem.0 {
+        match &quem.identidade {
             Some(super::Identidade::Superusuario(su)) => SessaoRt {
                 chave: format!("su:{}", su.id),
                 superusuario: Some(su.clone()),
@@ -75,20 +75,22 @@ impl SessaoRt {
 
     fn chamador(&self) -> Chamador {
         if let Some(su) = &self.superusuario {
-            Chamador(Some(super::Identidade::Superusuario(su.clone())))
+            Chamador::com_identidade(Some(super::Identidade::Superusuario(su.clone())))
         } else if let (Some(colecao), Some(registro)) = (&self.colecao, &self.registro) {
-            Chamador(Some(super::Identidade::Registro {
+            Chamador::com_identidade(Some(super::Identidade::Registro {
                 colecao: colecao.clone(),
                 registro: registro.clone(),
             }))
         } else {
-            Chamador(None)
+            Chamador::anonimo()
         }
     }
 
     fn contexto(&self) -> Contexto {
         Contexto {
             auth: self.registro.as_ref().and_then(Value::as_object).cloned(),
+            context: Some("realtime".to_string()),
+            ..Default::default()
         }
     }
 }

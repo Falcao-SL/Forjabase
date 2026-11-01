@@ -26,7 +26,7 @@ pub use oauth2::{
     OAuth2MappedFields, OAuth2PerfilUsuario, OAuth2ProviderConfig, OAuth2TokenResponse, OtpConfig,
     PasswordAuthConfig, TokenConfig,
 };
-pub use store::{ExternalAuthRegistro, MfaRegistro, OtpRegistro};
+pub use store::{AuthOriginRegistro, ExternalAuthRegistro, MfaRegistro, OtpRegistro};
 
 /// Versão do Forja (a mesma do workspace).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -248,6 +248,10 @@ impl Collection {
 
     pub fn password_auth_config(&self) -> PasswordAuthConfig {
         self.password_auth.clone().unwrap_or_default()
+    }
+
+    pub fn auth_alert_config(&self) -> AuthAlertConfig {
+        self.auth_alert.clone().unwrap_or_default()
     }
 
     pub fn campo(&self, nome: &str) -> Option<&Field> {

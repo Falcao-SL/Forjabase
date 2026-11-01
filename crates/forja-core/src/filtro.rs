@@ -378,6 +378,16 @@ fn dias_no_mes(ano: i64, mes: u32) -> u32 {
 pub struct Contexto {
     /// Registro autenticado, já sem `password` e `tokenKey`.
     pub auth: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Contexto da chamada: "oauth2", "realtime", "default", etc.
+    pub context: Option<String>,
+    /// Método HTTP da requisição: "GET", "POST", etc.
+    pub method: Option<String>,
+    /// Dados enviados no corpo da requisição (JSON).
+    pub data: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Parâmetros de consulta (query string).
+    pub query: Option<std::collections::HashMap<String, String>>,
+    /// Cabeçalhos HTTP da requisição (normalizados em minúsculas).
+    pub headers: Option<std::collections::HashMap<String, String>>,
 }
 
 impl Contexto {
@@ -392,6 +402,50 @@ impl Contexto {
                 Some(serde_json::Value::Number(n)) => Literal::Numero(n.as_f64().unwrap_or(0.0)),
                 _ => Literal::Texto(String::new()),
             });
+        }
+
+        if nome == "@request.context" {
+            let ctx = self.context.as_deref().unwrap_or("default");
+            return Ok(Literal::Texto(ctx.to_string()));
+        }
+
+        if nome == "@request.method" {
+            let m = self.method.as_deref().unwrap_or("GET");
+            return Ok(Literal::Texto(m.to_string()));
+        }
+
+        if let Some(campo) = nome.strip_prefix("@request.data.") {
+            let Some(data) = self.data.as_ref() else {
+                return Ok(Literal::Texto(String::new()));
+            };
+            return Ok(match data.get(campo) {
+                Some(serde_json::Value::String(s)) => Literal::Texto(s.clone()),
+                Some(serde_json::Value::Bool(b)) => Literal::Bool(*b),
+                Some(serde_json::Value::Number(n)) => Literal::Numero(n.as_f64().unwrap_or(0.0)),
+                _ => Literal::Texto(String::new()),
+            });
+        }
+
+        if let Some(campo) = nome.strip_prefix("@request.query.") {
+            let val = self
+                .query
+                .as_ref()
+                .and_then(|q| q.get(campo))
+                .cloned()
+                .unwrap_or_default();
+            return Ok(Literal::Texto(val));
+        }
+
+        if let Some(campo) = nome.strip_prefix("@request.headers.") {
+            let campo_lower = campo.to_lowercase();
+            let campo_hifen = campo_lower.replace('_', "-");
+            let val = self
+                .headers
+                .as_ref()
+                .and_then(|h| h.get(&campo_lower).or_else(|| h.get(&campo_hifen)))
+                .cloned()
+                .unwrap_or_default();
+            return Ok(Literal::Texto(val));
         }
 
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -1076,6 +1130,7 @@ mod tests {
         let mapa = registro.as_object().unwrap();
         let ctx = Contexto {
             auth: Some(mapa.clone()),
+            ..Default::default()
         };
         let s = para_sql_com("@request.auth.id = nome", &campos, Dialeto::Sqlite, &ctx).unwrap();
         assert_eq!(s.texto, "? = \"nome\"");
@@ -1281,5 +1336,44 @@ mod tests {
             s_yr.params,
             vec![Literal::Numero(2026.0), Literal::Numero(2026.0)]
         );
+
+        // 4. Macros @request.context, @request.method, @request.data, @request.query, @request.headers
+        let mut headers = HashMap::new();
+        headers.insert("x-app-id".into(), "app-123".into());
+        let mut query = HashMap::new();
+        query.insert("preview".into(), "true".into());
+        let mut data = serde_json::Map::new();
+        data.insert("role".into(), serde_json::json!("editor"));
+        data.insert("score".into(), serde_json::json!(42));
+
+        let ctx = Contexto {
+            auth: None,
+            context: Some("oauth2".into()),
+            method: Some("POST".into()),
+            data: Some(data),
+            query: Some(query),
+            headers: Some(headers),
+        };
+
+        let valido = |_campo: &str| true;
+        let s_req = para_sql_com(
+            "@request.context = 'oauth2' && @request.method = 'POST' && @request.data.role = 'editor' && @request.data.score > 10 && @request.query.preview = 'true' && @request.headers.x_app_id = 'app-123'",
+            &valido,
+            Dialeto::Sqlite,
+            &ctx,
+        ).unwrap();
+
+        assert_eq!(s_req.params[0], Literal::Texto("oauth2".into()));
+        assert_eq!(s_req.params[1], Literal::Texto("oauth2".into()));
+        assert_eq!(s_req.params[2], Literal::Texto("POST".into()));
+        assert_eq!(s_req.params[3], Literal::Texto("POST".into()));
+        assert_eq!(s_req.params[4], Literal::Texto("editor".into()));
+        assert_eq!(s_req.params[5], Literal::Texto("editor".into()));
+        assert_eq!(s_req.params[6], Literal::Numero(42.0));
+        assert_eq!(s_req.params[7], Literal::Numero(10.0));
+        assert_eq!(s_req.params[8], Literal::Texto("true".into()));
+        assert_eq!(s_req.params[9], Literal::Texto("true".into()));
+        assert_eq!(s_req.params[10], Literal::Texto("app-123".into()));
+        assert_eq!(s_req.params[11], Literal::Texto("app-123".into()));
     }
 }

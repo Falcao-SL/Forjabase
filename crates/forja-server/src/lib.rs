@@ -3,6 +3,7 @@
 
 mod lote;
 mod painel;
+mod rate_limit;
 mod realtime;
 
 use axum::body::Body;
@@ -25,10 +26,12 @@ use forja_core::filtro::Contexto;
 use forja_core::oauth2::{self, AuthProviderInfo};
 use forja_core::store::{Banco, Consulta, Credenciais, Motor, Superusuario};
 use forja_core::{
-    Collection, CollectionType, Erro, Field, FieldType, agora_epoch_s, epoch_s_de_data_utc, id,
+    AuthOriginRegistro, Collection, CollectionType, Erro, Field, FieldType, agora_epoch_s,
+    epoch_s_de_data_utc, id,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -81,6 +84,7 @@ pub struct Estado {
     pub correio: Arc<dyn Correio>,
     pub instalador: Arc<Instalador>,
     pub realtime: Arc<realtime::Hub>,
+    pub rate_limiter: rate_limit::RateLimiter,
 }
 
 impl Estado {
@@ -111,6 +115,7 @@ impl Estado {
             correio,
             instalador: Arc::new(instalador),
             realtime,
+            rate_limiter: rate_limit::RateLimiter::novo(),
         })
     }
 }
@@ -161,11 +166,34 @@ pub enum Identidade {
     },
 }
 
-pub struct Chamador(pub Option<Identidade>);
+pub struct Chamador {
+    pub identidade: Option<Identidade>,
+    pub method: String,
+    pub headers: HashMap<String, String>,
+    pub query: HashMap<String, String>,
+}
 
 impl Chamador {
+    pub fn anonimo() -> Self {
+        Self {
+            identidade: None,
+            method: String::new(),
+            headers: HashMap::new(),
+            query: HashMap::new(),
+        }
+    }
+
+    pub fn com_identidade(identidade: Option<Identidade>) -> Self {
+        Self {
+            identidade,
+            method: String::new(),
+            headers: HashMap::new(),
+            query: HashMap::new(),
+        }
+    }
+
     fn superusuario(&self) -> bool {
-        matches!(self.0, Some(Identidade::Superusuario(_)))
+        matches!(self.identidade, Some(Identidade::Superusuario(_)))
     }
 
     fn exigir_superusuario(&self) -> Res<()> {
@@ -180,19 +208,46 @@ impl Chamador {
 
     /// O registro autenticado, quando é usuário de uma coleção `auth`.
     fn registro(&self) -> Option<(&Collection, &Value)> {
-        match &self.0 {
+        match &self.identidade {
             Some(Identidade::Registro { colecao, registro }) => Some((colecao, registro)),
             _ => None,
         }
     }
 
-    /// O que as macros `@request.auth.*` enxergam.
+    /// O que as macros `@request.*` enxergam.
     fn contexto(&self) -> Contexto {
-        match self.registro() {
-            Some((_, registro)) => Contexto {
-                auth: registro.as_object().cloned(),
-            },
-            None => Contexto::default(),
+        self.contexto_com(None)
+    }
+
+    fn contexto_com(&self, dados: Option<&Value>) -> Contexto {
+        let auth = match self.registro() {
+            Some((_, registro)) => registro.as_object().cloned(),
+            None => None,
+        };
+        let method = if self.method.is_empty() {
+            None
+        } else {
+            Some(self.method.clone())
+        };
+        let query = if self.query.is_empty() {
+            None
+        } else {
+            Some(self.query.clone())
+        };
+        let headers = if self.headers.is_empty() {
+            None
+        } else {
+            Some(self.headers.clone())
+        };
+        let data = dados.and_then(|v| v.as_object().cloned());
+
+        Contexto {
+            auth,
+            context: Some("default".to_string()),
+            method,
+            data,
+            query,
+            headers,
         }
     }
 }
@@ -205,18 +260,48 @@ impl FromRequestParts<Estado> for Chamador {
     type Rejection = ErroApi;
 
     async fn from_request_parts(parts: &mut Parts, e: &Estado) -> Result<Self, Self::Rejection> {
+        let method = parts.method.as_str().to_string();
+        let mut headers = HashMap::new();
+        for (name, val) in &parts.headers {
+            if let Ok(v) = val.to_str() {
+                headers.insert(name.as_str().to_lowercase(), v.to_string());
+            }
+        }
+        let mut query = HashMap::new();
+        if let Some(q) = parts.uri.query() {
+            for (k, v) in form_urlencoded::parse(q.as_bytes()) {
+                query.insert(k.into_owned(), v.into_owned());
+            }
+        }
+
         let Some(bruto) = parts
             .headers
             .get("authorization")
             .and_then(|v| v.to_str().ok())
         else {
-            return Ok(Chamador(None));
+            return Ok(Chamador {
+                identidade: None,
+                method,
+                headers,
+                query,
+            });
         };
         let token = token_do_header(bruto);
         if token.is_empty() {
-            return Ok(Chamador(None));
+            return Ok(Chamador {
+                identidade: None,
+                method,
+                headers,
+                query,
+            });
         }
-        identificar(e, &token, TIPO_AUTH).await
+        let identidade = identificar(e, &token, TIPO_AUTH).await?;
+        Ok(Chamador {
+            identidade,
+            method,
+            headers,
+            query,
+        })
     }
 }
 
@@ -228,7 +313,7 @@ fn token_do_header(bruto: &str) -> String {
         .to_string()
 }
 
-async fn identificar(e: &Estado, token: &str, tipo: &str) -> Res<Chamador> {
+async fn identificar(e: &Estado, token: &str, tipo: &str) -> Res<Option<Identidade>> {
     let claims = auth::validar(&e.segredo, token).map_err(|_| token_invalido())?;
     if claims.tipo != tipo {
         return Err(token_invalido());
@@ -242,7 +327,7 @@ async fn identificar(e: &Estado, token: &str, tipo: &str) -> Res<Chamador> {
         if su.token_key != claims.tk {
             return Err(token_invalido());
         }
-        return Ok(Chamador(Some(Identidade::Superusuario(su))));
+        return Ok(Some(Identidade::Superusuario(su)));
     }
     let colecao = e
         .banco
@@ -266,7 +351,7 @@ async fn identificar(e: &Estado, token: &str, tipo: &str) -> Res<Chamador> {
         .registro(&colecao, &claims.id, None)
         .await
         .map_err(|_| token_invalido())?;
-    Ok(Chamador(Some(Identidade::Registro { colecao, registro })))
+    Ok(Some(Identidade::Registro { colecao, registro }))
 }
 
 #[derive(Deserialize)]
@@ -293,7 +378,7 @@ async fn superuser_login(State(e): State<Estado>, Json(l): Json<Login>) -> Res<J
 }
 
 async fn superuser_refresh(State(e): State<Estado>, quem: Chamador) -> Res<Json<Value>> {
-    match quem.0 {
+    match quem.identidade {
         Some(Identidade::Superusuario(su)) => resposta_auth(&e, su),
         _ => Err(ErroApi(Erro::NaoAutorizado(
             "The request requires valid record authorization token.".into(),
@@ -469,6 +554,38 @@ async fn settings_test_email(
         .map_err(|err| ErroApi(Erro::invalido(format!("Failed to send email: {err}"))))?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GerarAppleSecretPayload {
+    #[serde(default)]
+    client_id: String,
+    #[serde(default)]
+    team_id: String,
+    #[serde(default)]
+    key_id: String,
+    #[serde(default)]
+    private_key: String,
+    #[serde(default)]
+    duration: Option<u64>,
+}
+
+async fn apple_generate_client_secret(
+    State(_e): State<Estado>,
+    quem: Chamador,
+    Json(p): Json<GerarAppleSecretPayload>,
+) -> Res<Json<Value>> {
+    quem.exigir_superusuario()?;
+    let duracao = p.duration.unwrap_or(15_777_000);
+    let secret = forja_core::oauth2::gerar_apple_client_secret(
+        &p.client_id,
+        &p.team_id,
+        &p.key_id,
+        &p.private_key,
+        duracao,
+    )?;
+    Ok(Json(json!({ "secret": secret })))
 }
 
 // ── Logs de Requisição ───────────────────────────────────────────────────
@@ -1022,14 +1139,21 @@ async fn criar_registro(
         dados.remove("verified");
     }
     let regra = regra_para(quem, &c.create_rule).map_err(|err| err.0)?;
+    let dados_ctx = Value::Object(dados.clone());
     let r = e
         .banco
-        .criar_com_arquivos(c, &dados, &quem.contexto(), quem.superusuario(), arquivos)
+        .criar_com_arquivos(
+            c,
+            &dados,
+            &quem.contexto_com(Some(&dados_ctx)),
+            quem.superusuario(),
+            arquivos,
+        )
         .await?;
     if let Some(regra) = regra {
         let id = r["id"].as_str().unwrap_or_default();
         if e.banco
-            .registro_com(c, id, Some(&regra), &quem.contexto())
+            .registro_com(c, id, Some(&regra), &quem.contexto_com(Some(&dados_ctx)))
             .await
             .is_err()
         {
@@ -1094,6 +1218,7 @@ async fn atualizar_registro(
             dados.remove("email");
         }
     }
+    let dados_ctx = Value::Object(dados.clone());
     let mut r = e
         .banco
         .atualizar_com_arquivos(
@@ -1101,7 +1226,7 @@ async fn atualizar_registro(
             id,
             &dados,
             regra.as_deref(),
-            &quem.contexto(),
+            &quem.contexto_com(Some(&dados_ctx)),
             quem.superusuario(),
             arquivos,
         )
@@ -1356,9 +1481,75 @@ fn resposta_mfa(mfa_id: &str) -> Response {
         .into_response()
 }
 
+fn extrair_ip_e_user_agent(headers: &axum::http::HeaderMap) -> (String, String) {
+    let ip = headers
+        .get("x-forwarded-for")
+        .or_else(|| headers.get("x-real-ip"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "127.0.0.1".into());
+    let user_agent = headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    (ip, user_agent)
+}
+
+async fn processar_auth_origin_e_alerta(
+    e: &Estado,
+    c: &Collection,
+    record_id: &str,
+    email: Option<&str>,
+    ip: &str,
+    user_agent: &str,
+) {
+    if let Ok(novo) = e
+        .banco
+        .auth_origin_registrar(&c.id, record_id, ip, user_agent)
+        .await
+    {
+        let alert_cfg = c.auth_alert_config();
+        if novo
+            && alert_cfg.enabled
+            && let Some(destinatario) = email.filter(|em| !em.is_empty())
+        {
+            let app_name = e.banco.configuracoes().await.meta.app_name;
+            let placeholders = [
+                ("{APP_NAME}", app_name.as_str()),
+                ("{RECORD_ID}", record_id),
+            ];
+            let tpl = alert_cfg.email_template.as_ref();
+            let assunto = if let Some(t) = tpl.filter(|t| !t.subject.is_empty()) {
+                let mut s = t.subject.clone();
+                for (k, v) in &placeholders {
+                    s = s.replace(k, v);
+                }
+                s
+            } else {
+                format!("Login from a new device to {app_name}")
+            };
+            let corpo = if let Some(t) = tpl.filter(|t| !t.body.is_empty()) {
+                let mut b = t.body.clone();
+                for (k, v) in &placeholders {
+                    b = b.replace(k, v);
+                }
+                b
+            } else {
+                format!(
+                    "Hello,\n\nWe detected a login to your {app_name} account from a new device (IP: {ip}).\n\nIf this was you, you can safely ignore this email.\n\nIf you did not authorize this login, please immediately change your password."
+                )
+            };
+            enviar(e, destinatario, &assunto, corpo).await;
+        }
+    }
+}
+
 async fn auth_com_senha(
     State(e): State<Estado>,
     Path(nome): Path<String>,
+    headers: axum::http::HeaderMap,
     Json(l): Json<LoginAuth>,
 ) -> Res<Response> {
     let c = colecao_auth(&e, nome).await?;
@@ -1407,6 +1598,9 @@ async fn auth_com_senha(
             return Ok(resposta_mfa(&novo_mfa_id));
         }
     }
+
+    let (ip, user_agent) = extrair_ip_e_user_agent(&headers);
+    processar_auth_origin_e_alerta(&e, &c, &cred.id, Some(&cred.email), &ip, &user_agent).await;
 
     let registro = e.banco.registro(&c, &cred.id, None).await?;
     let resp = resposta_registro(&e, &c, &cred, registro)?;
@@ -1816,6 +2010,7 @@ struct AuthComOtp {
 async fn auth_com_otp(
     State(e): State<Estado>,
     Path(nome): Path<String>,
+    headers: axum::http::HeaderMap,
     Json(p): Json<AuthComOtp>,
 ) -> Res<Response> {
     let c = colecao_auth(&e, nome).await?;
@@ -1890,6 +2085,9 @@ async fn auth_com_otp(
         }
     }
 
+    let (ip, user_agent) = extrair_ip_e_user_agent(&headers);
+    processar_auth_origin_e_alerta(&e, &c, &cred.id, Some(&cred.email), &ip, &user_agent).await;
+
     let registro = e.banco.registro(&c, &cred.id, None).await?;
     let resp = resposta_registro(&e, &c, &cred, registro)?;
     Ok(resp.into_response())
@@ -1913,6 +2111,7 @@ struct AuthComOAuth2 {
 async fn auth_com_oauth2(
     State(e): State<Estado>,
     Path(nome): Path<String>,
+    headers: axum::http::HeaderMap,
     Json(p): Json<AuthComOAuth2>,
 ) -> Res<Response> {
     let c = colecao_auth(&e, nome).await?;
@@ -2025,6 +2224,9 @@ async fn auth_com_oauth2(
         }
     }
 
+    let (ip, user_agent) = extrair_ip_e_user_agent(&headers);
+    processar_auth_origin_e_alerta(&e, &c, &record_id, Some(&cred.email), &ip, &user_agent).await;
+
     let registro = e.banco.registro(&c, &record_id, None).await?;
     let token = auth::emitir_tipo(
         &e.segredo,
@@ -2124,6 +2326,47 @@ async fn desvincular_external_auth(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn auth_origins_listar(
+    State(e): State<Estado>,
+    quem: Chamador,
+    Path((colecao_nome, id)): Path<(String, String)>,
+) -> Res<Json<Vec<AuthOriginRegistro>>> {
+    let c = colecao_auth(&e, colecao_nome).await?;
+    checar_dono_ou_superusuario(&quem, &c.id, &id)?;
+    let origens = e.banco.auth_origins_listar(&c.id, &id).await?;
+    Ok(Json(origens))
+}
+
+async fn auth_origins_apagar(
+    State(e): State<Estado>,
+    quem: Chamador,
+    Path((colecao_nome, id, origin_id)): Path<(String, String, String)>,
+) -> Res<StatusCode> {
+    let c = colecao_auth(&e, colecao_nome).await?;
+    checar_dono_ou_superusuario(&quem, &c.id, &id)?;
+    e.banco.auth_origin_apagar(&origin_id, &c.id, &id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn checar_dono_ou_superusuario(
+    quem: &Chamador,
+    colecao_id_ou_nome: &str,
+    record_id: &str,
+) -> Res<()> {
+    if quem.superusuario() {
+        return Ok(());
+    }
+    if let Some((c, reg)) = quem.registro()
+        && (c.id == colecao_id_ou_nome || c.name == colecao_id_ou_nome)
+        && reg.get("id").and_then(Value::as_str) == Some(record_id)
+    {
+        return Ok(());
+    }
+    Err(ErroApi(Erro::Proibido(
+        "You are not allowed to access this resource.".into(),
+    )))
+}
+
 // ── Arquivos ─────────────────────────────────────────────────────────────
 
 #[derive(Deserialize, Default)]
@@ -2135,7 +2378,7 @@ struct ParamsArquivo {
 }
 
 async fn arquivo_token(State(e): State<Estado>, quem: Chamador) -> Res<Json<Value>> {
-    let (id, colecao, chave) = match &quem.0 {
+    let (id, colecao, chave) = match &quem.identidade {
         Some(Identidade::Superusuario(su)) => (
             su.id.clone(),
             COLECAO_SUPERUSERS.to_string(),
@@ -2195,9 +2438,10 @@ async fn arquivo_baixar(
         let Some(token) = p.token.as_deref().filter(|t| !t.is_empty()) else {
             return arquivo_ausente();
         };
-        let Ok(quem) = identificar(&e, token, TIPO_ARQUIVO).await else {
+        let Ok(identidade) = identificar(&e, token, TIPO_ARQUIVO).await else {
             return arquivo_ausente();
         };
+        let quem = Chamador::com_identidade(identidade);
         let Ok(regra) = regra_para(&quem, &c.view_rule) else {
             return arquivo_ausente();
         };
@@ -2470,6 +2714,14 @@ pub fn router(e: Estado) -> Router {
             "/api/collections/{colecao}/records/{id}/external-auths/{provider}",
             delete(desvincular_external_auth),
         )
+        .route(
+            "/api/collections/{colecao}/records/{id}/auth-origins",
+            get(auth_origins_listar),
+        )
+        .route(
+            "/api/collections/{colecao}/records/{id}/auth-origins/{originId}",
+            delete(auth_origins_apagar),
+        )
         .route("/api/batch", post(lote::http))
         .route(
             "/api/realtime",
@@ -2486,6 +2738,10 @@ pub fn router(e: Estado) -> Router {
         )
         .route("/api/settings/test/s3", post(settings_test_s3))
         .route("/api/settings/test/email", post(settings_test_email))
+        .route(
+            "/api/settings/apple/generate-client-secret",
+            post(apple_generate_client_secret),
+        )
         .route("/api/logs", get(logs_listar_api))
         .route("/api/logs/stats", get(logs_stats_api))
         .route("/api/logs/{id}", get(logs_obter_api))
@@ -2503,6 +2759,10 @@ pub fn router(e: Estado) -> Router {
         .route("/api/crons/{id}", post(cron_executar_api))
         .merge(painel::rotas())
         .layer(middleware::from_fn_with_state(e.clone(), log_middleware))
+        .layer(middleware::from_fn_with_state(
+            e.clone(),
+            rate_limit::rate_limit_middleware,
+        ))
         .layer(DefaultBodyLimit::max(MAX_CORPO))
         .with_state(e)
 }
@@ -2597,6 +2857,35 @@ mod tests {
         (
             status,
             serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    async fn chamar_com_headers(
+        e: &Estado,
+        metodo: &str,
+        uri: &str,
+        headers: &[(&str, &str)],
+        corpo: Option<Value>,
+    ) -> (StatusCode, Value, axum::http::HeaderMap) {
+        let mut req = Request::builder().method(metodo).uri(uri);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let req = match corpo {
+            Some(c) => req
+                .header("content-type", "application/json")
+                .body(Body::from(c.to_string()))
+                .unwrap(),
+            None => req.body(Body::empty()).unwrap(),
+        };
+        let resp = router(e.clone()).oneshot(req).await.unwrap();
+        let status = resp.status();
+        let resp_headers = resp.headers().clone();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+            resp_headers,
         )
     }
 
@@ -5337,5 +5626,346 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(ext_list_vazia.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn api_rate_limit_middleware() {
+        let e = estado().await;
+        let admin = login(&e).await;
+
+        // Ativa o rate limiting nas configurações: max 2 requisições por 60s em /api/health
+        let (s, _) = chamar(
+            &e,
+            "PATCH",
+            "/api/settings",
+            Some(&admin),
+            Some(json!({
+                "rateLimits": {
+                    "enabled": true,
+                    "rules": [
+                        {
+                            "label": "/api/health",
+                            "audience": "",
+                            "duration": 60,
+                            "maxRequests": 2
+                        }
+                    ]
+                }
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+
+        // 1ª requisição permitida
+        let (s1, _, _) = chamar_com_headers(&e, "GET", "/api/health", &[], None).await;
+        assert_eq!(s1, StatusCode::OK);
+
+        // 2ª requisição permitida
+        let (s2, _, _) = chamar_com_headers(&e, "GET", "/api/health", &[], None).await;
+        assert_eq!(s2, StatusCode::OK);
+
+        // 3ª requisição bloqueada: 429 Too Many Requests com Retry-After
+        let (s3, v3, h3) = chamar_com_headers(&e, "GET", "/api/health", &[], None).await;
+        assert_eq!(s3, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(v3["code"], 429);
+        assert_eq!(v3["message"], "Too Many Requests.");
+        assert!(h3.contains_key("retry-after"));
+
+        // Rota não afetada (/api/settings) continua respondendo 200 com admin
+        let (sh, _) = chamar(&e, "GET", "/api/settings", Some(&admin), None).await;
+        assert_eq!(sh, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_apple_generate_client_secret() {
+        let e = estado().await;
+        let admin = login(&e).await;
+
+        let pem = "-----BEGIN PRIVATE KEY-----\n\
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQglbUl3Ab4lTleMGWQ\n\
+wNmWknZqnbDvkmVzBWKOaVVfu+6hRANCAATUv2JuIgcVNotB/RyDLw7ByDHB9Uhq\n\
+QZsW/88VekgRw1uMBJnAOVmLF6rgxw9BFHjwoDinr9grT9ylHAqQb5kj\n\
+-----END PRIVATE KEY-----";
+
+        // 1. Visitante anônimo recebe 403 Forbidden
+        let (s, _) = chamar(
+            &e,
+            "POST",
+            "/api/settings/apple/generate-client-secret",
+            None,
+            Some(json!({
+                "clientId": "com.exemplo.app",
+                "teamId": "ABC12345",
+                "keyId": "KEY12345",
+                "privateKey": pem
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+
+        // 2. Superusuário com campos faltantes recebe 400 Bad Request
+        let (s_bad, v_bad) = chamar(
+            &e,
+            "POST",
+            "/api/settings/apple/generate-client-secret",
+            Some(&admin),
+            Some(json!({
+                "clientId": "",
+                "teamId": "",
+                "keyId": "",
+                "privateKey": ""
+            })),
+        )
+        .await;
+        assert_eq!(s_bad, StatusCode::BAD_REQUEST);
+        assert!(v_bad["data"].get("clientId").is_some());
+
+        // 3. Superusuário com chave válida gera o client secret JWT
+        let (s_ok, v_ok) = chamar(
+            &e,
+            "POST",
+            "/api/settings/apple/generate-client-secret",
+            Some(&admin),
+            Some(json!({
+                "clientId": "com.exemplo.app",
+                "teamId": "ABC12345",
+                "keyId": "KEY12345",
+                "privateKey": pem,
+                "duration": 3600
+            })),
+        )
+        .await;
+        assert_eq!(s_ok, StatusCode::OK, "{v_ok}");
+        let secret = v_ok["secret"].as_str().unwrap();
+        assert!(
+            secret.starts_with("eyJ"),
+            "secret deve ser um JWT: {secret}"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_auth_origins_e_alerta_novo_dispositivo() {
+        let (e, memoria) = estado_com_memoria().await;
+        let admin = login(&e).await;
+
+        // 1. Cria uma coleção de auth com authAlert ativado
+        let (s_col, c_res) = chamar(
+            &e,
+            "POST",
+            "/api/collections",
+            Some(&admin),
+            Some(json!({
+                "name": "colaboradores",
+                "type": "auth",
+                "authAlert": {
+                    "enabled": true
+                }
+            })),
+        )
+        .await;
+        assert_eq!(s_col, StatusCode::OK, "{c_res}");
+
+        // 2. Cria um usuário
+        let (s_u, u_res) = chamar(
+            &e,
+            "POST",
+            "/api/collections/colaboradores/records",
+            Some(&admin),
+            Some(json!({
+                "email": "colaborador@exemplo.com",
+                "password": "senha-segura-123",
+                "passwordConfirm": "senha-segura-123"
+            })),
+        )
+        .await;
+        assert_eq!(s_u, StatusCode::OK, "{u_res}");
+        let user_id = u_res["id"].as_str().unwrap().to_string();
+
+        // Limpa mensagens anteriores
+        memoria.0.lock().unwrap().clear();
+
+        // 3. Primeiro login: dispositivo inicial (IP 192.168.1.50, User-Agent 'Terminal Alpha')
+        // Não envia email de alerta no primeiro login (origem inicial)
+        let (s_l1, v_l1, _) = chamar_com_headers(
+            &e,
+            "POST",
+            "/api/collections/colaboradores/auth-with-password",
+            &[
+                ("x-real-ip", "192.168.1.50"),
+                ("user-agent", "Terminal Alpha"),
+            ],
+            Some(json!({
+                "identity": "colaborador@exemplo.com",
+                "password": "senha-segura-123"
+            })),
+        )
+        .await;
+        assert_eq!(s_l1, StatusCode::OK, "{v_l1}");
+        let user_token = v_l1["token"].as_str().unwrap().to_string();
+        assert_eq!(memoria.0.lock().unwrap().len(), 0);
+
+        // 4. Segundo login a partir de um NOVO dispositivo (IP 203.0.113.195, User-Agent 'Terminal Beta')
+        // Deve disparar o email de alerta de novo dispositivo
+        let (s_l2, v_l2, _) = chamar_com_headers(
+            &e,
+            "POST",
+            "/api/collections/colaboradores/auth-with-password",
+            &[
+                ("x-real-ip", "203.0.113.195"),
+                ("user-agent", "Terminal Beta"),
+            ],
+            Some(json!({
+                "identity": "colaborador@exemplo.com",
+                "password": "senha-segura-123"
+            })),
+        )
+        .await;
+        assert_eq!(s_l2, StatusCode::OK, "{v_l2}");
+
+        let enviados = memoria.0.lock().unwrap().clone();
+        assert_eq!(enviados.len(), 1);
+        assert_eq!(enviados[0].para, "colaborador@exemplo.com");
+        assert!(enviados[0].assunto.contains("Login from a new device"));
+
+        // 5. Lista as 2 origens do usuário autenticado
+        let (s_orig, v_orig) = chamar(
+            &e,
+            "GET",
+            &format!("/api/collections/colaboradores/records/{user_id}/auth-origins"),
+            Some(&user_token),
+            None,
+        )
+        .await;
+        assert_eq!(s_orig, StatusCode::OK, "{v_orig}");
+        let arr = v_orig.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        let origin_id = arr[0]["id"].as_str().unwrap().to_string();
+
+        // 6. Login novamente a partir do segundo dispositivo (já conhecido) -> Não envia alerta repetido
+        memoria.0.lock().unwrap().clear();
+        let (s_l3, _, _) = chamar_com_headers(
+            &e,
+            "POST",
+            "/api/collections/colaboradores/auth-with-password",
+            &[
+                ("x-real-ip", "203.0.113.195"),
+                ("user-agent", "Terminal Beta"),
+            ],
+            Some(json!({
+                "identity": "colaborador@exemplo.com",
+                "password": "senha-segura-123"
+            })),
+        )
+        .await;
+        assert_eq!(s_l3, StatusCode::OK);
+        assert_eq!(memoria.0.lock().unwrap().len(), 0);
+
+        // 7. Apaga uma das origens de autenticação
+        let (s_del, _) = chamar(
+            &e,
+            "DELETE",
+            &format!("/api/collections/colaboradores/records/{user_id}/auth-origins/{origin_id}"),
+            Some(&user_token),
+            None,
+        )
+        .await;
+        assert_eq!(s_del, StatusCode::NO_CONTENT);
+
+        // Origens agora têm 1 item
+        let (s_orig2, v_orig2) = chamar(
+            &e,
+            "GET",
+            &format!("/api/collections/colaboradores/records/{user_id}/auth-origins"),
+            Some(&user_token),
+            None,
+        )
+        .await;
+        assert_eq!(s_orig2, StatusCode::OK);
+        assert_eq!(v_orig2.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn api_regras_com_macros_data_headers_query_method() {
+        let e = estado().await;
+        let admin = login(&e).await;
+
+        // Cria coleção com regras usando @request.data, @request.headers e @request.method
+        let (s_col, _) = chamar(
+            &e,
+            "POST",
+            "/api/collections",
+            Some(&admin),
+            Some(json!({
+                "name": "pedidos",
+                "type": "base",
+                "fields": [
+                    { "name": "cliente", "type": "text", "required": true },
+                    { "name": "total", "type": "number" },
+                    { "name": "status", "type": "text" }
+                ],
+                "createRule": "@request.data.total > 100 && @request.headers.x_origem = 'mobile' && @request.method = 'POST'",
+                "updateRule": "@request.data.status != ''"
+            })),
+        )
+        .await;
+        assert_eq!(s_col, StatusCode::OK);
+
+        // 1. Tenta criar sem o cabeçalho x-origem: recusado pela regra
+        let (s_falha1, _, _) = chamar_com_headers(
+            &e,
+            "POST",
+            "/api/collections/pedidos/records",
+            &[],
+            Some(json!({
+                "cliente": "Empresa A",
+                "total": 250
+            })),
+        )
+        .await;
+        assert_eq!(s_falha1, StatusCode::BAD_REQUEST);
+
+        // 2. Tenta criar com total <= 100: recusado pela regra
+        let (s_falha2, _, _) = chamar_com_headers(
+            &e,
+            "POST",
+            "/api/collections/pedidos/records",
+            &[("x-origem", "mobile")],
+            Some(json!({
+                "cliente": "Empresa A",
+                "total": 50
+            })),
+        )
+        .await;
+        assert_eq!(s_falha2, StatusCode::BAD_REQUEST);
+
+        // 3. Cria com total > 100 e cabeçalho x-origem: aceito!
+        let (s_ok, v_ok, _) = chamar_com_headers(
+            &e,
+            "POST",
+            "/api/collections/pedidos/records",
+            &[("x-origem", "mobile")],
+            Some(json!({
+                "cliente": "Empresa A",
+                "total": 250,
+                "status": "novo"
+            })),
+        )
+        .await;
+        assert_eq!(s_ok, StatusCode::OK, "{v_ok}");
+        let rec_id = v_ok["id"].as_str().unwrap().to_string();
+
+        // 4. Atualiza registro com status preenchido: aceito!
+        let (s_up_ok, v_up_ok, _) = chamar_com_headers(
+            &e,
+            "PATCH",
+            &format!("/api/collections/pedidos/records/{rec_id}"),
+            &[],
+            Some(json!({
+                "status": "pago"
+            })),
+        )
+        .await;
+        assert_eq!(s_up_ok, StatusCode::OK, "{v_up_ok}");
+        assert_eq!(v_up_ok["status"], "pago");
     }
 }

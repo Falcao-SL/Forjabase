@@ -16,7 +16,7 @@ deadpool-postgres = { version = "0.14.2", optional = true }
 hex = "0.4"
 hmac = "0.12"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
-jsonwebtoken = { version = "11.1.0", default-features = false, features = ["rust_crypto"] }
+jsonwebtoken = { version = "11.1.0", default-features = false, features = ["rust_crypto", "use_pem"] }
 rand = "0.10.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 rusqlite = { optional = true, version = "0.40.2", features = ["bundled"] }

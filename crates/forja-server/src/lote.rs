@@ -60,11 +60,12 @@ async fn despachar(e: &Estado, externo: &Chamador, item: &Item) -> Result<(u16, 
     let quem = if let Some(bruto) = header_auth(&item.headers) {
         let token = token_do_header(bruto);
         quem_local = if token.is_empty() {
-            Chamador(None)
+            Chamador::anonimo()
         } else {
-            identificar(e, &token, TIPO_AUTH)
+            let id = identificar(e, &token, TIPO_AUTH)
                 .await
-                .map_err(|err| err.0)?
+                .map_err(|err| err.0)?;
+            Chamador::com_identidade(id)
         };
         &quem_local
     } else {

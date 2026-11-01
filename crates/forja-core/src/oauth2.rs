@@ -44,6 +44,91 @@ pub fn gerar_codigo_otp(tamanho: usize) -> String {
     digitos
 }
 
+#[derive(Debug, Serialize)]
+struct AppleClaims {
+    iss: String,
+    sub: String,
+    aud: String,
+    iat: u64,
+    exp: u64,
+}
+
+/// Gera o segredo de cliente para Sign in with Apple (JWT assinado com ES256).
+pub fn gerar_apple_client_secret(
+    client_id: &str,
+    team_id: &str,
+    key_id: &str,
+    private_key_pem: &str,
+    duration_secs: u64,
+) -> Resultado<String> {
+    let mut erros = serde_json::Map::new();
+    if client_id.trim().is_empty() {
+        erros.insert(
+            "clientId".into(),
+            serde_json::json!({
+                "code": "validation_required",
+                "message": "Missing required value."
+            }),
+        );
+    }
+    if team_id.trim().is_empty() {
+        erros.insert(
+            "teamId".into(),
+            serde_json::json!({
+                "code": "validation_required",
+                "message": "Missing required value."
+            }),
+        );
+    }
+    if key_id.trim().is_empty() {
+        erros.insert(
+            "keyId".into(),
+            serde_json::json!({
+                "code": "validation_required",
+                "message": "Missing required value."
+            }),
+        );
+    }
+    if private_key_pem.trim().is_empty() {
+        erros.insert(
+            "privateKey".into(),
+            serde_json::json!({
+                "code": "validation_required",
+                "message": "Missing required value."
+            }),
+        );
+    }
+    if !erros.is_empty() {
+        return Err(Erro::Invalido {
+            mensagem: "Failed to generate Apple client secret.".into(),
+            campos: erros,
+        });
+    }
+
+    let duracao = duration_secs.clamp(1, 15_777_000); // máx ~6 meses
+    let now_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+    header.kid = Some(key_id.to_string());
+
+    let claims = AppleClaims {
+        iss: team_id.to_string(),
+        sub: client_id.to_string(),
+        aud: "https://appleid.apple.com".into(),
+        iat: now_s,
+        exp: now_s + duracao,
+    };
+
+    let key = jsonwebtoken::EncodingKey::from_ec_pem(private_key_pem.as_bytes())
+        .map_err(|e| Erro::invalido(format!("Invalid Apple private key: {e}")))?;
+
+    jsonwebtoken::encode(&header, &claims, &key)
+        .map_err(|e| Erro::invalido(format!("Failed to sign Apple secret: {e}")))
+}
+
 /// Configuração de um provedor OAuth2 na coleção de autenticação.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -794,5 +879,13 @@ mod tests {
             perfil.avatar_url,
             "https://github.com/images/error/octocat_happy.gif"
         );
+    }
+
+    #[test]
+    fn gerador_apple_client_secret_valida_campos_obrigatorios() {
+        assert!(gerar_apple_client_secret("", "team", "key", "pk", 100).is_err());
+        assert!(gerar_apple_client_secret("client", "", "key", "pk", 100).is_err());
+        assert!(gerar_apple_client_secret("client", "team", "", "pk", 100).is_err());
+        assert!(gerar_apple_client_secret("client", "team", "key", "", 100).is_err());
     }
 }

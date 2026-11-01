@@ -156,12 +156,13 @@ com uma mensagem clara. "✅" quer dizer validado e guardado.
 | Redefinir senha (pedir e confirmar) | ✅ |
 | Trocar e-mail (pedir e confirmar) | ✅ |
 | Personificação: superusuário gera token de outro usuário (`impersonate`) | ✅ |
-| Alerta de login de novo dispositivo (`authAlert`) | 📋 |
+| Alerta de login de novo dispositivo (`authAlert`) e rastreamento de origens (`_authOrigins`) | ✅ |
 | Métodos de login disponíveis por coleção (`auth-methods`) | ✅ |
 | Token JWT de autenticação, invalidado ao trocar a senha | ✅ |
 | Tokens de verificação, senha, e-mail e arquivo | ✅ |
 | Modelos de e-mail editáveis (verificação, senha, troca de e-mail, OTP, alerta) | ✅ |
-| Gerador do segredo do Sign in with Apple | 📋 |
+| Gerador do segredo do Sign in with Apple (`POST /api/settings/apple/generate-client-secret`) | ✅ |
+| Rate limiting ativo em memória com sliding window, cabeçalho `Retry-After` e resposta 429 | ✅ |
 
 ## 6. Arquivos
 
@@ -320,7 +321,7 @@ remoto (com token).
 
 | Funcionalidade | Estado |
 |---|---|
-| Testes de unidade e de API em todo crate | ✅ (37 testes) |
+| Testes de unidade e de API em todo crate | ✅ (87 testes, 100% passando) |
 | Cliente Python do PocketBase (`pocketbase` 0.16) funciona contra o Forja: login, CRUD, filtro e ordenação | ✅ (conferido à mão em 2026-10-21) |
 | Suíte de compatibilidade: as mesmas chamadas contra PocketBase e Forja, respostas iguais | 📋 |
 | CI no GitHub Actions (formatação, lint e testes nos três SOs) | ✅ |

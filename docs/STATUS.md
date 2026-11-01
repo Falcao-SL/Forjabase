@@ -1,21 +1,30 @@
 # Status — Forja
 
-> Atualizado em **2026-10-31**. Este arquivo é a fonte única de "em que pé está".
+> Atualizado em **2026-11-01**. Este arquivo é a fonte única de "em que pé está".
 
 | Campo | Valor |
 |---|---|
-| **Estágio** | **Em desenvolvimento** — Marcos 0.1, 0.2, 0.3, 0.4, 0.5 e 0.6 concluídos! OAuth2 com PKCE e normalização de perfis, OTP por e-mail com uso único e auto-verificação, MFA em dois fatores com desafio 401 e `mfaId`, endpoint `auth-methods`, SMTP/e-mails, agendador cron in-process, logs estruturados com agregações horárias, backups em zip com restauração e upload, encerramento gracioso, e telas completas no painel administrativo |
+| **Estágio** | **Em desenvolvimento** — Marcos 0.1 a 0.7 concluídos! Cyber Brutalist Design System aplicado no painel administrativo, Rate Limiting ativo em memória com sliding window, Segredo do Sign in with Apple (JWT ES256 ECDSA P-256), Rastreamento de origens de autenticação (`_authOrigins`) e alertas de novo dispositivo (`authAlert`), Macros avançadas de regras (`@request.data.*`, `@request.headers.*`, `@request.query.*`, `@request.method`, `@request.context`), além de OAuth2 com PKCE, OTP, MFA, backups zip, cron e logs estruturados |
 | **Plataformas** | Servidor: macOS, Linux, Windows (Rust); painel: navegador, HTML no servidor + htmx (sem build de front-end) |
 | **Stack** | Rust (axum; SQLite), maud + htmx, wasmtime in-process na 0.8. Decisão: [ADR-001](arquitetura/ADR-001-um-binario.md) |
 | **Site** | Landing em `site/` (inglês na raiz, português em `index.pt.html`). O host previsto é https://forja.falcaosl.com, no Coolify, com `deploy/site/Dockerfile`. O DNS ainda não existe; o endereço público segue o repositório. |
 | **Monetização** | Nenhuma: código aberto, MIT |
-| **Próximo marco** | Marco 0.7 (Segredo Apple OAuth2, Alertas de login e Rate limiting) |
+| **Próximo marco** | Marco 0.8 (Multi-projetos, migrações automáticas e SDK hooks WASM) |
 | **Data-alvo** | A definir; 1.0.0 só quando estável (PLANO §6) |
 
 ## O que já está pronto
 
-- Workspace com 4 crates e 82 testes passando.
-- Autenticação avançada (Marco 0.6 completo):
+- Workspace com 4 crates e 87 testes passando (100% de sucesso).
+- **Design System Cyber Brutalist (UI 2.0)**:
+  - Totalmente reimplementado no painel administrativo (`forja-admin`), sem build steps externos (apenas maud + htmx).
+  - Filosofia inspirada em terminais operacionais industriais e ficção científica: Void Black (`#0a0b0d`), Neon Lime (`#d4ff00`), cinzas funcionais e listras de advertência (*hazard stripes*).
+  - Tipografia dual técnica (Display sem serifa limpa + JetBrains Mono), cantos vivos sem arredondamento (`border-radius: 0`), bordas nítidas de 1px com acentos de foco de 2px.
+  - Telemetria de cabeçalho em tempo real (`SYS: ONLINE_`, relógio UTC `HH:MM:SS`, ping de latência `LATENCY: 4MS`), KPI cards de status operacional e badges mono.
+- **Marco 0.7 Concluído**:
+  - **Rate Limiting em memória**: sliding window por regra (`label`, `audience`, `duration`, `maxRequests`), headers HTTP `Retry-After`, resposta padronizada `429 Too Many Requests`.
+  - **Gerador de Segredo Apple OAuth2**: endpoint `POST /api/settings/apple/generate-client-secret` com assinatura ES256 ECDSA P-256 (PKCS#8 PEM) via `jsonwebtoken` e `p256`.
+  - **Rastreamento de Origens & Alertas de Login**: tabela `_authOrigins`, hash fingerprint (IP + User-Agent), endpoints `GET /api/collections/{colecao}/records/{id}/auth-origins` e `DELETE .../auth-origins/{originId}`, detecção de novos dispositivos com envio automático de e-mail de alerta de segurança (`authAlert`).
+  - **Macros Avançadas do Pedido nas Regras**: `@request.data.<campo>`, `@request.headers.<campo>`, `@request.query.<param>`, `@request.method` e `@request.context` avaliadas dinamicamente em filtros e regras de coleção (`create_rule`, `update_rule`, `list_rule`, `view_rule`).
   - **OAuth2**: suporte aos provedores do PocketBase (Google, GitHub, GitLab, Discord, Microsoft, generic OIDC, etc.), fluxo de autorização com geração automática de PKCE (S256) e State, troca de código e consulta de perfil com normalização de dados, vínculo com tabela `_externalAuths`, endpoints `POST /api/collections/{colecao}/auth-with-oauth2`, `GET /api/collections/{colecao}/records/{id}/external-auths`, `DELETE /api/collections/{colecao}/records/{id}/external-auths/{provider}` e página de redirecionamento `GET /api/oauth2-redirect` via postMessage compatível com popups dos SDKs.
   - **OTP (One-Time Password)**: geração criptográfica de códigos numéricos com expiração configurável, entrega por e-mail com templates personalizáveis, proteção contra enumeração de e-mails, validação com expiração e uso único, endpoints `POST /api/collections/{colecao}/request-otp` e `POST /api/collections/{colecao}/auth-with-otp`, validação automática de e-mail (`verified = true`).
   - **MFA (Multi-Factor Authentication)**: autenticação em dois fatores sequenciais distintos (senha + OTP, OAuth2 + OTP, etc.), emissão de desafio com código de status HTTP `401 Unauthorized` contendo `{"mfaId": "..."}`, expiração de sessão e prevenção de repetição do mesmo fator.

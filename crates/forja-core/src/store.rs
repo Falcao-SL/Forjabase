@@ -17,6 +17,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use sha2::Digest;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
@@ -405,6 +406,19 @@ pub struct ExternalAuthRegistro {
     pub record_id: String,
     pub provider: String,
     pub provider_id: String,
+    pub created: String,
+    pub updated: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthOriginRegistro {
+    pub id: String,
+    pub collection_id: String,
+    pub record_id: String,
+    pub fingerprint: String,
+    pub ip: String,
+    pub user_agent: String,
     pub created: String,
     pub updated: String,
 }
@@ -805,6 +819,18 @@ fn esquema(d: Dialeto) -> Vec<String> {
             \"updated\" TEXT NOT NULL
         )".to_string(),
         "CREATE INDEX IF NOT EXISTS \"idx__mfas_created\" ON \"_mfas\" (\"created\")".to_string(),
+        "CREATE TABLE IF NOT EXISTS \"_authOrigins\" (
+            \"id\" TEXT PRIMARY KEY NOT NULL,
+            \"collectionId\" TEXT NOT NULL,
+            \"recordId\" TEXT NOT NULL,
+            \"fingerprint\" TEXT NOT NULL,
+            \"ip\" TEXT NOT NULL,
+            \"userAgent\" TEXT NOT NULL DEFAULT '',
+            \"created\" TEXT NOT NULL,
+            \"updated\" TEXT NOT NULL
+        )".to_string(),
+        "CREATE UNIQUE INDEX IF NOT EXISTS \"idx__authOrigins_unique\" ON \"_authOrigins\" (\"collectionId\", \"recordId\", \"fingerprint\")".to_string(),
+        "CREATE INDEX IF NOT EXISTS \"idx__authOrigins_record\" ON \"_authOrigins\" (\"collectionId\", \"recordId\")".to_string(),
     ];
     if d == Dialeto::Postgres {
         v.push("CREATE UNIQUE INDEX IF NOT EXISTS \"_collections_name_ci\" ON \"_collections\" (lower(\"name\"))".into());
@@ -1817,6 +1843,18 @@ impl Banco {
                 \"updated\" TEXT NOT NULL
             )",
             "CREATE INDEX IF NOT EXISTS \"idx__mfas_created\" ON \"_mfas\" (\"created\")",
+            "CREATE TABLE IF NOT EXISTS \"_authOrigins\" (
+                \"id\" TEXT PRIMARY KEY NOT NULL,
+                \"collectionId\" TEXT NOT NULL,
+                \"recordId\" TEXT NOT NULL,
+                \"fingerprint\" TEXT NOT NULL,
+                \"ip\" TEXT NOT NULL,
+                \"userAgent\" TEXT NOT NULL DEFAULT '',
+                \"created\" TEXT NOT NULL,
+                \"updated\" TEXT NOT NULL
+            )",
+            "CREATE UNIQUE INDEX IF NOT EXISTS \"idx__authOrigins_unique\" ON \"_authOrigins\" (\"collectionId\", \"recordId\", \"fingerprint\")",
+            "CREATE INDEX IF NOT EXISTS \"idx__authOrigins_record\" ON \"_authOrigins\" (\"collectionId\", \"recordId\")",
         ];
         for cmd in extras {
             self.ex.executar(cmd, vec![]).await?;
@@ -3776,6 +3814,115 @@ impl Banco {
         Ok(())
     }
 
+    // ── Auth Origins (Detecção de Novo Dispositivo / IP) ─────────────────────
+
+    pub async fn auth_origin_registrar(
+        &self,
+        colecao_id: &str,
+        record_id: &str,
+        ip: &str,
+        user_agent: &str,
+    ) -> Resultado<bool> {
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(format!("{ip}:{user_agent}").as_bytes());
+        let fingerprint = hex::encode(hasher.finalize());
+
+        let ja_existe = self
+            .ex
+            .consultar(
+                "SELECT \"id\" FROM \"_authOrigins\" WHERE \"collectionId\" = ? AND \"recordId\" = ? AND \"fingerprint\" = ?",
+                vec![colecao_id.into(), record_id.into(), fingerprint.clone().into()],
+            )
+            .await?;
+
+        if !ja_existe.is_empty() {
+            return Ok(false);
+        }
+
+        let anteriores = self
+            .ex
+            .consultar(
+                "SELECT COUNT(*) FROM \"_authOrigins\" WHERE \"collectionId\" = ? AND \"recordId\" = ?",
+                vec![colecao_id.into(), record_id.into()],
+            )
+            .await?
+            .into_iter()
+            .next()
+            .and_then(|r| r.into_iter().next())
+            .map(|v| match v {
+                Valor::Int(i) => i,
+                _ => 0,
+            })
+            .unwrap_or(0);
+
+        let id = id::novo();
+        let agora_str = agora();
+
+        self.ex
+            .executar(
+                "INSERT INTO \"_authOrigins\" (\"id\", \"collectionId\", \"recordId\", \"fingerprint\", \"ip\", \"userAgent\", \"created\", \"updated\") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                vec![
+                    id.into(),
+                    colecao_id.into(),
+                    record_id.into(),
+                    fingerprint.into(),
+                    ip.into(),
+                    user_agent.into(),
+                    agora_str.clone().into(),
+                    agora_str.into(),
+                ],
+            )
+            .await?;
+
+        Ok(anteriores > 0)
+    }
+
+    pub async fn auth_origins_listar(
+        &self,
+        colecao_id: &str,
+        record_id: &str,
+    ) -> Resultado<Vec<AuthOriginRegistro>> {
+        let linhas = self
+            .ex
+            .consultar(
+                "SELECT \"id\", \"collectionId\", \"recordId\", \"fingerprint\", \"ip\", \"userAgent\", \"created\", \"updated\" FROM \"_authOrigins\" WHERE \"collectionId\" = ? AND \"recordId\" = ? ORDER BY \"created\" DESC",
+                vec![colecao_id.into(), record_id.into()],
+            )
+            .await?;
+        Ok(linhas
+            .into_iter()
+            .map(|l| {
+                let mut it = l.into_iter();
+                let mut prox = || it.next().unwrap_or(Valor::Nulo);
+                AuthOriginRegistro {
+                    id: prox().texto_ou_vazio(),
+                    collection_id: prox().texto_ou_vazio(),
+                    record_id: prox().texto_ou_vazio(),
+                    fingerprint: prox().texto_ou_vazio(),
+                    ip: prox().texto_ou_vazio(),
+                    user_agent: prox().texto_ou_vazio(),
+                    created: prox().texto_ou_vazio(),
+                    updated: prox().texto_ou_vazio(),
+                }
+            })
+            .collect())
+    }
+
+    pub async fn auth_origin_apagar(
+        &self,
+        id: &str,
+        colecao_id: &str,
+        record_id: &str,
+    ) -> Resultado<()> {
+        self.ex
+            .executar(
+                "DELETE FROM \"_authOrigins\" WHERE \"id\" = ? AND \"collectionId\" = ? AND \"recordId\" = ?",
+                vec![id.into(), colecao_id.into(), record_id.into()],
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn superuser_salvar(&self, email: &str, senha: &str) -> Resultado<Superusuario> {
         let mut erros = Map::new();
         let email = email.trim().to_string();
@@ -5267,6 +5414,7 @@ mod tests {
 
         let ctx = Contexto {
             auth: u1.as_object().cloned(),
+            ..Default::default()
         };
         let q = Consulta {
             regra: notas.list_rule.clone(),
@@ -6186,5 +6334,38 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+
+        // 4. Testa detecção e registro de Auth Origins
+        let alertar_primeiro = b
+            .auth_origin_registrar("col1", "rec1", "192.168.1.100", "Mozilla/5.0 Mac")
+            .await
+            .unwrap();
+        assert!(
+            !alertar_primeiro,
+            "primeiro login não gera alerta de dispositivo secundário"
+        );
+
+        let alertar_repetido = b
+            .auth_origin_registrar("col1", "rec1", "192.168.1.100", "Mozilla/5.0 Mac")
+            .await
+            .unwrap();
+        assert!(!alertar_repetido, "mesmo dispositivo não gera alerta");
+
+        let alertar_segundo = b
+            .auth_origin_registrar("col1", "rec1", "203.0.113.42", "iPhone iOS")
+            .await
+            .unwrap();
+        assert!(alertar_segundo, "segundo dispositivo diferente gera alerta");
+
+        let origens = b.auth_origins_listar("col1", "rec1").await.unwrap();
+        assert_eq!(origens.len(), 2);
+        assert!(origens.iter().any(|o| o.ip == "203.0.113.42"));
+        assert!(origens.iter().any(|o| o.ip == "192.168.1.100"));
+
+        b.auth_origin_apagar(&origens[0].id, "col1", "rec1")
+            .await
+            .unwrap();
+        let origens_depois = b.auth_origins_listar("col1", "rec1").await.unwrap();
+        assert_eq!(origens_depois.len(), 1);
     }
 }
