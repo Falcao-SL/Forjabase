@@ -79,11 +79,11 @@ Versão atual: **0.0.2**. O Forja só vira **1.0.0** quando estiver estável
 | Tipo **view** (consulta SQL somente leitura) | ✅ |
 | Listar, criar, ver e apagar coleções (`/api/collections`) | ✅ |
 | Atualizar coleção (`PATCH`, com mudança de campos) | ✅ |
-| Importar coleções em lote (`PUT /api/collections/import`) | 📋 |
-| Esvaziar coleção (`DELETE /api/collections/{c}/truncate`) | 📋 |
-| Modelos prontos de coleção (`/api/collections/meta/scaffolds`) | 📋 |
+| Importar coleções em lote (`PUT /api/collections/import`) | ✅ |
+| Esvaziar coleção (`DELETE /api/collections/{c}/truncate`) | ✅ |
+| Modelos prontos de coleção (`/api/collections/meta/scaffolds`) | ✅ |
 | Testar a consulta de uma view antes de salvar (`dry-run-view`) | ✅ |
-| Coleções de sistema: `_superusers`, `_externalAuths`, `_mfas`, `_otps`, `_authOrigins` | 📋 |
+| Coleções de sistema: `_superusers`, `_externalAuths`, `_mfas`, `_otps`, `_authOrigins` | ✅ |
 | Renomear campos e coleções sem perder dados | ✅ (renomear coleção e adicionar colunas) |
 
 ### 3.1 Tipos de campo
@@ -114,11 +114,11 @@ com uma mensagem clara. "✅" quer dizer validado e guardado.
 | Funcionalidade | Estado |
 |---|---|
 | Regras por operação: listar, ver, criar, atualizar, apagar, com filtros sobre os campos do registro | ✅ |
-| Regras de auth: login (`authRule`) e gerenciar outros usuários (`manageRule`) | 📋 |
+| Regras de auth: login (`authRule`) e gerenciar outros usuários (`manageRule`) | ✅ |
 | Regra nula = só superusuário; `""` = público | ✅ |
 | Regras com `@request.auth.*` | ✅ |
 | Regras com `@collection.colecao.campo` (join por `EXISTS`) | ✅ |
-| Regras com `@request.body.*`, `@request.query.*`, `@request.headers.*` e `@request.context` | 📋 |
+| Regras com `@request.body.*`, `@request.query.*`, `@request.headers.*` e `@request.context` | ✅ |
 
 ## 4. Registros (CRUD) e consulta
 
@@ -225,15 +225,15 @@ O PocketBase atende um projeto por processo. O Forja atende vários, isolados.
 
 | Funcionalidade | Estado |
 |---|---|
-| Cada projeto com o próprio banco, coleções, usuários, arquivos, configurações e logs (`data/<projeto>/`) | 📋 |
-| Endereço por caminho: `https://host/p/<projeto>/api/...` (a URL base dos SDKs) | 📋 |
+| Cada projeto com o próprio banco, coleções, usuários, arquivos, configurações e logs (`data/<projeto>/`) | ✅ |
+| Endereço por caminho: `https://host/p/<projeto>/api/...` (a URL base dos SDKs) | ✅ |
 | Endereço por domínio ou subdomínio (`app.exemplo.com` → projeto) | 📋 |
-| Projeto padrão na raiz (`/api/...`), compatível com clientes do PocketBase sem mudança | 📋 |
-| Criar, renomear, pausar, apagar e duplicar projetos (CLI, API e painel) | 📋 |
+| Projeto padrão na raiz (`/api/...`), compatível com clientes do PocketBase sem mudança | ✅ |
+| Criar, renomear, pausar, apagar e duplicar projetos (CLI, API e painel) | 🔨 (`forja projects list | create | delete` ✅) |
 | Superusuários da instância (todos os projetos) e de projeto (só um) | 📋 |
 | Limites por projeto: tamanho do banco, armazenamento, requisições | 📋 |
 | Backup e restauração por projeto | 📋 |
-| Importar um `pb_data` do PocketBase como um projeto | 📋 |
+| Importar um `pb_data` do PocketBase como um projeto | ✅ (`forja projects import-pb` e API) |
 
 ## 11. ➕ Extensões em WebAssembly (no lugar do JavaScript)
 
