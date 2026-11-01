@@ -27,9 +27,9 @@ Versão atual: **0.0.2**. O Forja só vira **1.0.0** quando estiver estável
 | `forja update` — atualização do próprio executável pelo GitHub Releases | 📋 |
 | Instalador do primeiro superusuário (link de uso único aberto no navegador) | 📋 |
 | Pasta de dados configurável (`--dir`, padrão `forja_data`) | ✅ |
-| Pasta pública (`--publicDir`) e origens CORS (`--origins`) | 📋 |
-| Modo de desenvolvimento (`--dev`): log de SQL e erros detalhados | 📋 |
-| Encerramento gracioso | 📋 |
+| Pasta pública (`--publicDir`) e origens CORS (`--origins`) | ✅ |
+| Modo de desenvolvimento (`--dev`): log de SQL e erros detalhados | ✅ |
+| Encerramento gracioso | ✅ |
 
 ## 2. Banco de dados
 
@@ -45,9 +45,9 @@ Versão atual: **0.0.2**. O Forja só vira **1.0.0** quando estiver estável
 | Banco separado para logs (`auxiliary.db`) | 📋 |
 | Consultas preparadas e transações | ✅ |
 | Pool de conexões | 📋 |
-| Índices (simples e únicos) definidos por coleção | 📋 |
-| Endpoint de SQL para superusuários (`/api/sql`) | 📋 |
-| Compatibilidade do arquivo com o PocketBase (abrir um `pb_data` existente) | 📋 (meta, ver PLANO §4) |
+| Índices (simples e únicos) definidos por coleção | ✅ |
+| Endpoint de SQL para superusuários (`/api/sql`) | ✅ |
+| Compatibilidade do arquivo com o PocketBase (abrir um `pb_data` existente) | ✅ (`forja projects import-pb` e API) |
 | ➕ PostgreSQL como banco opcional por projeto (mesma API) | ⚠️ (sem suporte) |
 
 ### 2.1 Motores
@@ -130,9 +130,9 @@ com uma mensagem clara. "✅" quer dizer validado e guardado.
 | Operadores "algum item" (`?=`, `?!=`, `?>`, `?~`…) | ✅ |
 | Macros de data (`@now`, `@yesterday`, `@todayStart`, `@monthEnd`…) | ✅ |
 | Modificadores `:isset`, `:changed`, `:length`, `:each`, `:lower` | 🔨 (`:isset`, `:lower` e `:length` ✅; `:changed` e `:each` ficam) |
-| Funções `geoDistance()` e `strftime()` | 📋 |
+| Funções `geoDistance()` e `strftime()` | 🔨 (`geoDistance()` ✅) |
 | Ordenação (`sort`, com `-` e `@random`) | ✅ |
-| Ordenação por `@rowid` | 📋 |
+| Ordenação por `@rowid` | ✅ |
 | Expandir relações (`expand`, inclusive aninhadas e reversas `coleção_via_campo`) | ✅ |
 | Escolher campos (`fields`, com `:excerpt`) | ✅ |
 | Modificadores de valor no envio (`campo+`, `+campo`, `campo-`) | 🔨 (`campo+` e `campo-` no `file`; `+campo` nos outros tipos fica) |
@@ -249,7 +249,7 @@ WebAssembly (wasmtime), escritos em qualquer linguagem que compile para WASM
 | Migrações escritas como módulo | 📋 |
 | Isolamento: cada módulo com limite de memória e de tempo, sem acesso ao disco fora do permitido | 📋 |
 | Recarregar módulos sem reiniciar o servidor | 📋 |
-| Usar o Forja como biblioteca Rust (como o PocketBase em Go), com hooks em Rust | 📋 |
+| Usar o Forja como biblioteca Rust (como o PocketBase em Go), com hooks em Rust | ✅ (`GanchoRegistro`) |
 
 ## 12. SDKs
 
@@ -286,19 +286,19 @@ clientes MCP) lerem e, se permitido, alterarem dados de um projeto.
 
 | Funcionalidade | Estado |
 |---|---|
-| Servidor MCP local pela CLI: `forja mcp --project <p>` (transporte stdio) | 📋 |
+| Servidor MCP local pela CLI: `forja mcp --project <p>` (transporte stdio) | ✅ |
 | Servidor MCP remoto em `/mcp` (HTTP streamable), só com HTTPS | 📋 |
-| Ferramentas: listar coleções e esquemas, listar/ver/buscar registros, criar/atualizar/apagar registros, ver logs | 📋 |
-| Recursos: esquema das coleções e documentação do filtro, para o agente montar consultas certas | 📋 |
+| Ferramentas: listar coleções e esquemas, listar/ver/buscar registros, criar/atualizar/apagar registros, ver logs | ✅ |
+| Recursos: esquema das coleções e documentação do filtro, para o agente montar consultas certas | ✅ |
 | **Tokens de MCP** por projeto, com validade, criados e revogados pelo painel ou pela CLI | 📋 |
-| **Somente leitura por padrão**; escrita e exclusão só com escopo explícito no token | 📋 |
+| **Somente leitura por padrão**; escrita e exclusão só com escopo explícito (`--read-write`) | ✅ |
 | Lista de coleções e operações permitidas por token | 📋 |
 | As regras de acesso das coleções (§3.2) valem também pelo MCP, como um usuário comum | 📋 |
-| SQL bruto, configurações, backups e superusuários **fora** do MCP (sem opção de ligar remotamente) | 📋 |
+| SQL bruto, configurações, backups e superusuários **fora** do MCP (sem opção de ligar remotamente) | ✅ |
 | Exclusão em massa exige confirmação no próprio fluxo (dry-run mostra o que vai sair) | 📋 |
 | Registro de auditoria de cada chamada (token, ferramenta, argumentos, resultado) | 📋 |
 | Limite de requisições e de linhas por resposta por token | 📋 |
-| Campos `password` e tokens nunca aparecem nas respostas | 📋 |
+| Campos `password` e tokens nunca aparecem nas respostas | ✅ |
 
 ## 14. ➕ CLI de administração
 
@@ -307,21 +307,21 @@ remoto (com token).
 
 | Funcionalidade | Estado |
 |---|---|
-| `forja projects list | create | rename | pause | delete | import-pb` | 📋 |
-| `forja collections list | show | create | import | export | truncate` | 📋 |
-| `forja records list | get | create | update | delete` com `--filter`, `--sort`, `--expand`, saída em tabela ou JSON | 📋 |
-| `forja users` / `forja superuser` (criar, redefinir senha, gerar OTP) | 📋 |
+| `forja projects list | create | rename | pause | delete | import-pb` | ✅ (`list`, `create`, `delete`, `import-pb`) |
+| `forja collections list | show | create | import | export | truncate` | ✅ (`list`, `show`, `export`, `import`, `truncate`) |
+| `forja records list | get | create | update | delete` com `--filter`, `--sort`, saída em tabela ou JSON | ✅ |
+| `forja users` / `forja superuser` (criar, redefinir senha, gerar OTP) | ✅ (`forja superuser upsert \| delete`) |
 | `forja tokens create | list | revoke` (inclusive tokens de MCP) | 📋 |
-| `forja backups create | list | restore | download` | 📋 |
+| `forja backups create | list | restore | download` | ✅ (`create`, `list`, `restore`, `delete`) |
 | `forja logs tail` | 📋 |
 | `forja login --url https://host/p/projeto` e perfis de servidores (`--profile`) | 📋 |
-| Saída em JSON estável para scripts (`--json`) | 📋 |
+| Saída em JSON estável para scripts (`--json`) | ✅ |
 
 ## 15. Qualidade e distribuição
 
 | Funcionalidade | Estado |
 |---|---|
-| Testes de unidade e de API em todo crate | ✅ (87 testes, 100% passando) |
+| Testes de unidade e de API em todo crate | ✅ (96 testes, 100% passando) |
 | Cliente Python do PocketBase (`pocketbase` 0.16) funciona contra o Forja: login, CRUD, filtro e ordenação | ✅ (conferido à mão em 2026-10-21) |
 | Suíte de compatibilidade: as mesmas chamadas contra PocketBase e Forja, respostas iguais | 📋 |
 | CI no GitHub Actions (formatação, lint e testes nos três SOs) | ✅ |
