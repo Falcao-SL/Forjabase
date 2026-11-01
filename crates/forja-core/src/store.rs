@@ -2619,6 +2619,9 @@ impl Banco {
         // Toda coleção `auth` ganha os cinco campos de sistema do PocketBase.
         if c.kind == CollectionType::Auth {
             c.fields = injetar_campos_auth(c.fields);
+            if c.auth_rule.is_none() {
+                c.auth_rule = Some(String::new());
+            }
             if c.password_auth.is_none() {
                 c.password_auth = Some(PasswordAuthConfig::default());
             }
@@ -2820,12 +2823,6 @@ impl Banco {
         }
         if c.kind == CollectionType::Auth {
             c.fields = injetar_campos_auth(c.fields);
-            if c.auth_rule.is_none() {
-                c.auth_rule = antiga.auth_rule;
-            }
-            if c.manage_rule.is_none() {
-                c.manage_rule = antiga.manage_rule;
-            }
             if c.auth_alert.is_none() {
                 c.auth_alert = antiga.auth_alert;
             }
@@ -2972,6 +2969,94 @@ impl Banco {
 
         self.ex.lote(comandos).await?;
         Ok(c)
+    }
+
+    pub async fn colecao_esvaziar(&self, c: &Collection) -> Resultado<()> {
+        if c.kind == CollectionType::View {
+            return Err(Erro::invalido("View collections cannot be truncated."));
+        }
+        if c.system {
+            return Err(Erro::invalido("System collections cannot be truncated."));
+        }
+        if let Some(pasta) = &self.pasta {
+            let col_dir = arquivos::pasta_colecao(pasta, &c.id);
+            if col_dir.exists() {
+                let _ = std::fs::remove_dir_all(&col_dir);
+                let _ = std::fs::create_dir_all(&col_dir);
+            }
+        }
+        let sql = format!("DELETE FROM \"{}\"", c.name);
+        self.ex.executar(&sql, vec![]).await?;
+
+        if c.kind == CollectionType::Auth {
+            let _ = self
+                .ex
+                .executar(
+                    "DELETE FROM \"_externalAuths\" WHERE \"collectionId\" = ?",
+                    vec![c.id.clone().into()],
+                )
+                .await;
+            let _ = self
+                .ex
+                .executar(
+                    "DELETE FROM \"_mfas\" WHERE \"collectionId\" = ?",
+                    vec![c.id.clone().into()],
+                )
+                .await;
+            let _ = self
+                .ex
+                .executar(
+                    "DELETE FROM \"_otps\" WHERE \"collectionId\" = ?",
+                    vec![c.id.clone().into()],
+                )
+                .await;
+            let _ = self
+                .ex
+                .executar(
+                    "DELETE FROM \"_authOrigins\" WHERE \"collectionId\" = ?",
+                    vec![c.id.clone().into()],
+                )
+                .await;
+        }
+
+        Ok(())
+    }
+
+    pub async fn colecoes_importar(
+        &self,
+        colecoes: &[Collection],
+        delete_missing: bool,
+    ) -> Resultado<()> {
+        let existentes = self.colecoes().await?;
+
+        for c in colecoes {
+            let mut nova = c.clone();
+            if nova.id.is_empty() {
+                nova.id = id::novo();
+            }
+            if let Some(existente) = existentes
+                .iter()
+                .find(|e| e.id == nova.id || e.name == nova.name)
+            {
+                let _ = self.atualizar_colecao(&existente.id, nova).await?;
+            } else {
+                let _ = self.criar_colecao(nova).await?;
+            }
+        }
+
+        if delete_missing {
+            for existente in &existentes {
+                if !existente.system
+                    && !colecoes
+                        .iter()
+                        .any(|c| c.id == existente.id || c.name == existente.name)
+                {
+                    let _ = self.apagar_colecao(&existente.id).await;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub async fn listar(&self, c: &Collection, q: &Consulta) -> Resultado<Lista> {

@@ -3,8 +3,11 @@
 
 mod lote;
 mod painel;
+pub mod projetos;
 mod rate_limit;
 mod realtime;
+
+pub use projetos::GerenciadorProjetos;
 
 use axum::body::Body;
 use axum::extract::{
@@ -14,7 +17,7 @@ use axum::http::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CON
 use axum::http::{StatusCode, request::Parts};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use forja_core::arquivos::{self, Recebido};
 use forja_core::auth::{
@@ -462,6 +465,46 @@ async fn colecoes_dry_run_view(
     Ok(Json(json!({ "fields": fields })))
 }
 
+async fn colecoes_scaffolds(quem: Chamador) -> Res<Json<Value>> {
+    quem.exigir_superusuario()?;
+    Ok(Json(json!({
+        "base": Collection::scaffold_base(),
+        "auth": Collection::scaffold_auth(),
+        "view": Collection::scaffold_view(),
+    })))
+}
+
+async fn colecoes_esvaziar(
+    State(e): State<Estado>,
+    quem: Chamador,
+    Path(colecao): Path<String>,
+) -> Res<StatusCode> {
+    quem.exigir_superusuario()?;
+    let c = colecao_de(&e, colecao).await?;
+    e.banco.colecao_esvaziar(&c).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ColecoesImportarRequisicao {
+    collections: Vec<Collection>,
+    #[serde(default)]
+    delete_missing: bool,
+}
+
+async fn colecoes_importar_api(
+    State(e): State<Estado>,
+    quem: Chamador,
+    Json(p): Json<ColecoesImportarRequisicao>,
+) -> Res<StatusCode> {
+    quem.exigir_superusuario()?;
+    e.banco
+        .colecoes_importar(&p.collections, p.delete_missing)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn settings_obter(
     State(e): State<Estado>,
     quem: Chamador,
@@ -807,6 +850,25 @@ fn regra_para(quem: &Chamador, regra: &Option<String>) -> Res<Option<String>> {
     }
 }
 
+async fn pode_gerenciar_auth(e: &Estado, quem: &Chamador, c: &Collection, alvo_id: &str) -> bool {
+    if quem.superusuario() {
+        return true;
+    }
+    if c.kind != CollectionType::Auth {
+        return false;
+    }
+    let Some(regra) = &c.manage_rule else {
+        return false;
+    };
+    if regra.trim().is_empty() {
+        return true;
+    }
+    e.banco
+        .visivel(c, alvo_id, Some(regra), &quem.contexto())
+        .await
+        .unwrap_or(false)
+}
+
 /// Campos `hidden` só aparecem para superusuários. E-mail de coleção `auth`
 /// só aparece para o próprio dono, para superusuários, ou se `emailVisibility`.
 fn esconder(c: &Collection, quem: &Chamador, mut v: Value) -> Value {
@@ -842,7 +904,17 @@ fn apresentar<'a>(
     v: Value,
 ) -> Pin<Box<dyn Future<Output = Value> + Send + 'a>> {
     Box::pin(async move {
-        let mut v = esconder(c, quem, v);
+        let id = v.get("id").and_then(Value::as_str).unwrap_or_default();
+        let pode_gerenciar = if c.kind == CollectionType::Auth && !id.is_empty() {
+            pode_gerenciar_auth(e, quem, c, id).await
+        } else {
+            false
+        };
+        let mut v = if pode_gerenciar {
+            v
+        } else {
+            esconder(c, quem, v)
+        };
         let Some(exp) = v.as_object_mut().and_then(|m| m.remove("expand")) else {
             return v;
         };
@@ -1200,8 +1272,13 @@ async fn atualizar_registro(
     if c.kind == CollectionType::View {
         return Err(Erro::invalido("The collection is not writable."));
     }
-    let regra = regra_para(quem, &c.update_rule).map_err(|err| err.0)?;
-    if c.kind == CollectionType::Auth && !quem.superusuario() {
+    let pode_gerenciar = pode_gerenciar_auth(e, quem, c, id).await;
+    let regra = if pode_gerenciar {
+        None
+    } else {
+        regra_para(quem, &c.update_rule).map_err(|err| err.0)?
+    };
+    if c.kind == CollectionType::Auth && !quem.superusuario() && !pode_gerenciar {
         dados.remove("verified");
         if let Some(novo) = dados.get("email").and_then(Value::as_str) {
             let atual = e.banco.registro(c, id, None).await?;
@@ -1227,7 +1304,7 @@ async fn atualizar_registro(
             &dados,
             regra.as_deref(),
             &quem.contexto_com(Some(&dados_ctx)),
-            quem.superusuario(),
+            quem.superusuario() || pode_gerenciar,
             arquivos,
         )
         .await?;
@@ -1260,7 +1337,12 @@ async fn apagar_registro(
     if c.kind == CollectionType::View {
         return Err(Erro::invalido("The collection is not writable."));
     }
-    let regra = regra_para(quem, &c.delete_rule).map_err(|err| err.0)?;
+    let pode_gerenciar = pode_gerenciar_auth(e, quem, c, id).await;
+    let regra = if pode_gerenciar {
+        None
+    } else {
+        regra_para(quem, &c.delete_rule).map_err(|err| err.0)?
+    };
     e.banco
         .apagar_com(c, id, regra.as_deref(), &quem.contexto())
         .await
@@ -1481,6 +1563,57 @@ fn resposta_mfa(mfa_id: &str) -> Response {
         .into_response()
 }
 
+fn contexto_auth(
+    registro: &Value,
+    headers: &axum::http::HeaderMap,
+    metodo: &str,
+    contexto_nome: &str,
+) -> Contexto {
+    let mut h_map = HashMap::new();
+    for (name, val) in headers {
+        if let Ok(v) = val.to_str() {
+            h_map.insert(name.as_str().to_lowercase(), v.to_string());
+        }
+    }
+    Contexto {
+        auth: registro.as_object().cloned(),
+        context: Some(contexto_nome.to_string()),
+        method: Some(metodo.to_string()),
+        data: None,
+        query: None,
+        headers: if h_map.is_empty() { None } else { Some(h_map) },
+    }
+}
+
+async fn conferir_auth_rule(
+    e: &Estado,
+    c: &Collection,
+    registro_id: &str,
+    ctx: &Contexto,
+) -> Res<()> {
+    if c.kind != CollectionType::Auth {
+        return Ok(());
+    }
+    match &c.auth_rule {
+        None => Err(ErroApi(Erro::Proibido(
+            "Authentication is disabled for this collection.".into(),
+        ))),
+        Some(regra) if regra.trim().is_empty() => Ok(()),
+        Some(regra) => {
+            let ok = e
+                .banco
+                .visivel(c, registro_id, Some(regra), ctx)
+                .await
+                .map_err(ErroApi)?;
+            if ok {
+                Ok(())
+            } else {
+                Err(ErroApi(Erro::invalido("Failed to authenticate.")))
+            }
+        }
+    }
+}
+
 fn extrair_ip_e_user_agent(headers: &axum::http::HeaderMap) -> (String, String) {
     let ip = headers
         .get("x-forwarded-for")
@@ -1599,10 +1732,13 @@ async fn auth_com_senha(
         }
     }
 
+    let registro = e.banco.registro(&c, &cred.id, None).await?;
+    let ctx = contexto_auth(&registro, &headers, "POST", "auth-with-password");
+    conferir_auth_rule(&e, &c, &cred.id, &ctx).await?;
+
     let (ip, user_agent) = extrair_ip_e_user_agent(&headers);
     processar_auth_origin_e_alerta(&e, &c, &cred.id, Some(&cred.email), &ip, &user_agent).await;
 
-    let registro = e.banco.registro(&c, &cred.id, None).await?;
     let resp = resposta_registro(&e, &c, &cred, registro)?;
     Ok(resp.into_response())
 }
@@ -1620,6 +1756,10 @@ async fn auth_refresh(
         return Err(nao_autorizado());
     }
     let id = registro["id"].as_str().unwrap_or_default().to_string();
+    if !quem.superusuario() {
+        let ctx = quem.contexto();
+        conferir_auth_rule(&e, &c, &id, &ctx).await?;
+    }
     let cred = credenciais_de(&e, &c, &id).await?;
     resposta_registro(&e, &c, &cred, registro.clone())
 }
@@ -2085,10 +2225,13 @@ async fn auth_com_otp(
         }
     }
 
+    let registro = e.banco.registro(&c, &cred.id, None).await?;
+    let ctx = contexto_auth(&registro, &headers, "POST", "auth-with-otp");
+    conferir_auth_rule(&e, &c, &cred.id, &ctx).await?;
+
     let (ip, user_agent) = extrair_ip_e_user_agent(&headers);
     processar_auth_origin_e_alerta(&e, &c, &cred.id, Some(&cred.email), &ip, &user_agent).await;
 
-    let registro = e.banco.registro(&c, &cred.id, None).await?;
     let resp = resposta_registro(&e, &c, &cred, registro)?;
     Ok(resp.into_response())
 }
@@ -2224,10 +2367,12 @@ async fn auth_com_oauth2(
         }
     }
 
+    let registro = e.banco.registro(&c, &record_id, None).await?;
+    let ctx = contexto_auth(&registro, &headers, "POST", "auth-with-oauth2");
+    conferir_auth_rule(&e, &c, &record_id, &ctx).await?;
+
     let (ip, user_agent) = extrair_ip_e_user_agent(&headers);
     processar_auth_origin_e_alerta(&e, &c, &record_id, Some(&cred.email), &ip, &user_agent).await;
-
-    let registro = e.banco.registro(&c, &record_id, None).await?;
     let token = auth::emitir_tipo(
         &e.segredo,
         &cred.id,
@@ -2628,6 +2773,8 @@ pub fn router(e: Estado) -> Router {
             "/api/collections/_superusers/auth-refresh",
             post(superuser_refresh),
         )
+        .route("/api/collections/meta/scaffolds", get(colecoes_scaffolds))
+        .route("/api/collections/import", put(colecoes_importar_api))
         .route(
             "/api/collections/meta/dry-run-view",
             post(colecoes_dry_run_view),
@@ -2636,6 +2783,10 @@ pub fn router(e: Estado) -> Router {
         .route(
             "/api/collections",
             get(colecoes_listar).post(colecoes_criar),
+        )
+        .route(
+            "/api/collections/{colecao}/truncate",
+            delete(colecoes_esvaziar),
         )
         .route(
             "/api/collections/{colecao}",
@@ -2767,6 +2918,23 @@ pub fn router(e: Estado) -> Router {
         .with_state(e)
 }
 
+/// Roteador do Forja com suporte a multi-projetos em `/p/{projeto}/...`.
+pub fn router_com_projetos(default_estado: Estado, projetos: Arc<GerenciadorProjetos>) -> Router {
+    let r_default = router(default_estado);
+    let r_projetos = Router::new()
+        .route(
+            "/p/{projeto}/{*resto}",
+            axum::routing::any(projetos::despachar_projeto),
+        )
+        .route(
+            "/p/{projeto}",
+            axum::routing::any(projetos::despachar_projeto_raiz),
+        )
+        .with_state(projetos);
+
+    r_default.merge(r_projetos)
+}
+
 async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
@@ -2802,6 +2970,11 @@ pub async fn serve(
     let banco = Banco::abrir(&motor, &pasta, "default").await.map_err(io)?;
     let nome_motor = banco.motor();
     let estado = Estado::novo(banco).await.map_err(io)?;
+    let projetos = Arc::new(GerenciadorProjetos::novo(
+        pasta.clone(),
+        motor,
+        estado.correio.clone(),
+    ));
     if estado.banco.total_superusers().await.unwrap_or(0) == 0 {
         eprintln!(
             "Nenhum superusuário ainda. Crie um com:\n  forja superuser upsert <email> <senha> --dir {}",
@@ -2814,7 +2987,7 @@ pub async fn serve(
         forja_core::VERSION,
         pasta.display()
     );
-    axum::serve(listener, router(estado))
+    axum::serve(listener, router_com_projetos(estado, projetos))
         .with_graceful_shutdown(shutdown_signal())
         .await
 }
@@ -5967,5 +6140,337 @@ QZsW/88VekgRw1uMBJnAOVmLF6rgxw9BFHjwoDinr9grT9ylHAqQb5kj\n\
         .await;
         assert_eq!(s_up_ok, StatusCode::OK, "{v_up_ok}");
         assert_eq!(v_up_ok["status"], "pago");
+    }
+
+    #[tokio::test]
+    async fn api_auth_rule_e_manage_rule() {
+        let e = estado().await;
+        let admin = login(&e).await;
+
+        // Cria coleção auth com authRule exigindo verified = true e manageRule para cargo = 'gerente'
+        let mut col = colecao_auth_teste("contas");
+        col.auth_rule = Some("verified = true".into());
+        col.manage_rule = Some("@request.auth.cargo = 'gerente'".into());
+        col.update_rule = Some("id = @request.auth.id".into());
+        col.fields.push(Field {
+            name: "cargo".into(),
+            kind: FieldType::Text,
+            ..Default::default()
+        });
+        let col = e.banco.criar_colecao(col).await.unwrap();
+
+        // 1. Cria usuário Ana com verified = false
+        let ana = e
+            .banco
+            .criar(
+                &col,
+                json!({
+                    "email": "ana@exemplo.com",
+                    "password": "senha-segura-123",
+                    "cargo": "analista",
+                    "verified": false,
+                })
+                .as_object()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let ana_id = ana["id"].as_str().unwrap().to_string();
+
+        // Tentativa de login da Ana: recusada pelo authRule (verified = false)
+        let (s_login_falha, v_login_falha) = chamar(
+            &e,
+            "POST",
+            "/api/collections/contas/auth-with-password",
+            None,
+            Some(json!({ "identity": "ana@exemplo.com", "password": "senha-segura-123" })),
+        )
+        .await;
+        assert_eq!(s_login_falha, StatusCode::BAD_REQUEST, "{v_login_falha}");
+        assert_eq!(v_login_falha["message"], "Failed to authenticate.");
+
+        // 2. Cria usuário Carlos com verified = true e cargo = 'gerente'
+        let carlos = e
+            .banco
+            .criar(
+                &col,
+                json!({
+                    "email": "carlos@exemplo.com",
+                    "password": "senha-segura-123",
+                    "cargo": "gerente",
+                    "verified": true,
+                })
+                .as_object()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(carlos["cargo"], "gerente");
+
+        // Login do Carlos: aceito pelo authRule!
+        let (s_login_carlos, v_login_carlos) = chamar(
+            &e,
+            "POST",
+            "/api/collections/contas/auth-with-password",
+            None,
+            Some(json!({ "identity": "carlos@exemplo.com", "password": "senha-segura-123" })),
+        )
+        .await;
+        assert_eq!(s_login_carlos, StatusCode::OK, "{v_login_carlos}");
+        let carlos_token = format!("Bearer {}", v_login_carlos["token"].as_str().unwrap());
+
+        // 3. Carlos atualiza o registro da Ana usando manageRule:
+        // altera verified diretamente para true e altera o e-mail diretamente!
+        let (s_patch, v_patch) = chamar(
+            &e,
+            "PATCH",
+            &format!("/api/collections/contas/records/{ana_id}"),
+            Some(&carlos_token),
+            Some(json!({
+                "verified": true,
+                "email": "ana_promovida@exemplo.com"
+            })),
+        )
+        .await;
+        assert_eq!(s_patch, StatusCode::OK, "{v_patch}");
+        assert_eq!(v_patch["verified"], true);
+        assert_eq!(v_patch["email"], "ana_promovida@exemplo.com");
+
+        // 4. Agora que verified = true, Ana consegue autenticar com o novo e-mail!
+        let (s_login_ana_ok, v_login_ana_ok) = chamar(
+            &e,
+            "POST",
+            "/api/collections/contas/auth-with-password",
+            None,
+            Some(
+                json!({ "identity": "ana_promovida@exemplo.com", "password": "senha-segura-123" }),
+            ),
+        )
+        .await;
+        assert_eq!(s_login_ana_ok, StatusCode::OK, "{v_login_ana_ok}");
+        assert_eq!(
+            v_login_ana_ok["record"]["email"],
+            "ana_promovida@exemplo.com"
+        );
+
+        // 5. Se authRule for configurada como null (None), autenticação é desativada
+        let mut col_desativada = col.clone();
+        col_desativada.auth_rule = None;
+        let _ = e
+            .banco
+            .atualizar_colecao(&col.id, col_desativada)
+            .await
+            .unwrap();
+
+        let (s_desativado, v_desativado) = chamar(
+            &e,
+            "POST",
+            "/api/collections/contas/auth-with-password",
+            None,
+            Some(
+                json!({ "identity": "ana_promovida@exemplo.com", "password": "senha-segura-123" }),
+            ),
+        )
+        .await;
+        assert_eq!(s_desativado, StatusCode::FORBIDDEN, "{v_desativado}");
+        assert!(
+            v_desativado["message"]
+                .as_str()
+                .unwrap()
+                .contains("Authentication is disabled")
+        );
+
+        let _ = admin;
+    }
+
+    #[tokio::test]
+    async fn api_collections_truncate_scaffolds_e_import() {
+        let e = estado().await;
+        let admin = login(&e).await;
+
+        // 1. GET /api/collections/meta/scaffolds
+        let (s_scaffolds, v_scaffolds) = chamar(
+            &e,
+            "GET",
+            "/api/collections/meta/scaffolds",
+            Some(&admin),
+            None,
+        )
+        .await;
+        assert_eq!(s_scaffolds, StatusCode::OK, "{v_scaffolds}");
+        assert!(v_scaffolds.get("base").is_some());
+        assert!(v_scaffolds.get("auth").is_some());
+        assert!(v_scaffolds.get("view").is_some());
+
+        // 2. DELETE /api/collections/{col}/truncate
+        let mut c_notas = Collection {
+            name: "notas".into(),
+            kind: CollectionType::Base,
+            ..Default::default()
+        };
+        c_notas.fields.push(Field {
+            name: "titulo".into(),
+            kind: FieldType::Text,
+            ..Default::default()
+        });
+        let c_notas = e.banco.criar_colecao(c_notas).await.unwrap();
+
+        let _ = e
+            .banco
+            .criar(
+                &c_notas,
+                json!({ "titulo": "Primeira" }).as_object().unwrap(),
+            )
+            .await
+            .unwrap();
+        let _ = e
+            .banco
+            .criar(
+                &c_notas,
+                json!({ "titulo": "Segunda" }).as_object().unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let (s_list_antes, v_list_antes) = chamar(
+            &e,
+            "GET",
+            "/api/collections/notas/records",
+            Some(&admin),
+            None,
+        )
+        .await;
+        assert_eq!(s_list_antes, StatusCode::OK);
+        assert_eq!(v_list_antes["totalItems"], 2);
+
+        // Executa truncate
+        let (s_trunc, _) = chamar(
+            &e,
+            "DELETE",
+            "/api/collections/notas/truncate",
+            Some(&admin),
+            None,
+        )
+        .await;
+        assert_eq!(s_trunc, StatusCode::NO_CONTENT);
+
+        let (s_list_depois, v_list_depois) = chamar(
+            &e,
+            "GET",
+            "/api/collections/notas/records",
+            Some(&admin),
+            None,
+        )
+        .await;
+        assert_eq!(s_list_depois, StatusCode::OK);
+        assert_eq!(v_list_depois["totalItems"], 0);
+
+        // 3. PUT /api/collections/import com deleteMissing: true
+        let mut c_tarefas = Collection {
+            name: "tarefas".into(),
+            kind: CollectionType::Base,
+            ..Default::default()
+        };
+        c_tarefas.id = "col_tarefas_123".into();
+        c_tarefas.fields.push(Field {
+            name: "descricao".into(),
+            kind: FieldType::Text,
+            ..Default::default()
+        });
+
+        let payload_import = json!({
+            "collections": [c_tarefas],
+            "deleteMissing": true
+        });
+
+        let (s_imp, _) = chamar(
+            &e,
+            "PUT",
+            "/api/collections/import",
+            Some(&admin),
+            Some(payload_import),
+        )
+        .await;
+        assert_eq!(s_imp, StatusCode::NO_CONTENT);
+
+        // 'tarefas' deve existir
+        let (s_tar, v_tar) =
+            chamar(&e, "GET", "/api/collections/tarefas", Some(&admin), None).await;
+        assert_eq!(s_tar, StatusCode::OK, "{v_tar}");
+        assert_eq!(v_tar["name"], "tarefas");
+
+        // 'notas' deve ter sido deletada por deleteMissing: true
+        let (s_notas_del, _) =
+            chamar(&e, "GET", "/api/collections/notas", Some(&admin), None).await;
+        assert_eq!(s_notas_del, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn api_multi_projetos_e_pb_import() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path().to_path_buf();
+        let motor = Motor::Sqlite;
+        let correio = Arc::new(forja_core::correio::Console);
+
+        let gp = Arc::new(GerenciadorProjetos::novo(
+            dir.clone(),
+            motor.clone(),
+            correio.clone(),
+        ));
+
+        // Cria o projeto 'cliente_alpha'
+        let _proj_alpha = gp.criar("cliente_alpha").await.unwrap();
+
+        // Abre o default
+        let estado_default = gp.obter("default").await.unwrap();
+
+        let app = router_com_projetos(estado_default, gp.clone());
+
+        // 1. Testa rota default
+        let req_default = Request::builder()
+            .uri("/api/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp_default = app.clone().oneshot(req_default).await.unwrap();
+        assert_eq!(resp_default.status(), StatusCode::OK);
+
+        // 2. Testa rota do projeto cliente_alpha
+        let req_alpha = Request::builder()
+            .uri("/p/cliente_alpha/api/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp_alpha = app.clone().oneshot(req_alpha).await.unwrap();
+        assert_eq!(resp_alpha.status(), StatusCode::OK);
+        let bytes = resp_alpha.into_body().collect().await.unwrap().to_bytes();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["code"], 200);
+
+        // 3. Testa projeto inexistente -> 404
+        let req_inexistente = Request::builder()
+            .uri("/p/inexistente/api/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp_inexistente = app.clone().oneshot(req_inexistente).await.unwrap();
+        assert_eq!(resp_inexistente.status(), StatusCode::NOT_FOUND);
+
+        // 4. Testa importação de mock pb_data
+        let pb_mock = temp_dir.path().join("mock_pb_data");
+        std::fs::create_dir_all(&pb_mock).unwrap();
+        let _ = Banco::sqlite(&pb_mock).await.unwrap(); // cria data.db válido
+
+        let _proj_importado = gp.importar_pb(&pb_mock, "cliente_beta").await.unwrap();
+
+        let req_beta = Request::builder()
+            .uri("/p/cliente_beta/api/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp_beta = app.oneshot(req_beta).await.unwrap();
+        assert_eq!(resp_beta.status(), StatusCode::OK);
+
+        // 5. Lista de projetos
+        let lista = gp.listar().await;
+        assert!(lista.contains(&"default".to_string()));
+        assert!(lista.contains(&"cliente_alpha".to_string()));
+        assert!(lista.contains(&"cliente_beta".to_string()));
     }
 }

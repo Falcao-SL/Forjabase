@@ -32,6 +32,10 @@ impl Erro {
         }
     }
 
+    pub fn nao_encontrado(mensagem: impl Into<String>) -> Erro {
+        Erro::NaoEncontrado(mensagem.into())
+    }
+
     /// Erro de validação de um campo, com código e mensagem como no PocketBase.
     pub fn campo(nome: &str, codigo: &str, mensagem: &str) -> Erro {
         let mut campos = Map::new();

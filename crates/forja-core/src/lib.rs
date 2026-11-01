@@ -141,6 +141,19 @@ pub struct Field {
 }
 
 impl Field {
+    /// Campo normal do usuário: `system: false`.
+    pub fn novo(name: &str, kind: FieldType) -> Field {
+        Field {
+            id: String::new(),
+            name: name.into(),
+            kind,
+            required: false,
+            hidden: false,
+            system: false,
+            options: Map::new(),
+        }
+    }
+
     /// Campo de sistema: nome, tipo e opções fixos, `system: true`.
     pub fn sistema(name: &str, kind: FieldType) -> Field {
         Field {
@@ -172,6 +185,12 @@ impl Field {
             self.kind,
             FieldType::Select | FieldType::Relation | FieldType::File
         ) && self.opcao_f64("maxSelect").unwrap_or(1.0) > 1.0
+    }
+}
+
+impl Default for Field {
+    fn default() -> Self {
+        Self::novo("", FieldType::Text)
     }
 }
 
@@ -252,6 +271,66 @@ impl Collection {
 
     pub fn auth_alert_config(&self) -> AuthAlertConfig {
         self.auth_alert.clone().unwrap_or_default()
+    }
+
+    pub fn scaffold_base() -> Collection {
+        let mut id = Field::sistema("id", FieldType::Text);
+        id.required = true;
+        let created = Field::sistema("created", FieldType::Autodate);
+        let updated = Field::sistema("updated", FieldType::Autodate);
+        Collection {
+            id: String::new(),
+            name: String::new(),
+            kind: CollectionType::Base,
+            system: false,
+            fields: vec![id, created, updated],
+            indexes: vec![],
+            list_rule: None,
+            view_rule: None,
+            create_rule: None,
+            update_rule: None,
+            delete_rule: None,
+            created: String::new(),
+            updated: String::new(),
+            view_query: None,
+            auth_rule: None,
+            manage_rule: None,
+            auth_alert: None,
+            oauth2: None,
+            password_auth: None,
+            mfa: None,
+            otp: None,
+            auth_token: None,
+            password_reset_token: None,
+            email_change_token: None,
+            verification_token: None,
+            file_token: None,
+        }
+    }
+
+    pub fn scaffold_auth() -> Collection {
+        let mut c = Self::scaffold_base();
+        c.kind = CollectionType::Auth;
+        c.auth_rule = Some(String::new());
+        c.auth_alert = Some(AuthAlertConfig {
+            enabled: true,
+            email_template: None,
+        });
+        c.password_auth = Some(PasswordAuthConfig::default());
+        c.oauth2 = Some(OAuth2Config::default());
+        c.mfa = Some(MfaConfig::default());
+        c.otp = Some(OtpConfig::default());
+        c.auth_token = Some(TokenConfig {
+            duration: 1_209_600,
+        });
+        c
+    }
+
+    pub fn scaffold_view() -> Collection {
+        let mut c = Self::scaffold_base();
+        c.kind = CollectionType::View;
+        c.view_query = Some(String::new());
+        c
     }
 
     pub fn campo(&self, nome: &str) -> Option<&Field> {

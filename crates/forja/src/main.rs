@@ -57,6 +57,16 @@ enum Comando {
         #[arg(long, default_value = "127.0.0.1:8090")]
         http: SocketAddr,
     },
+    /// Gerencia projetos (multi-tenancy).
+    Projects {
+        #[command(subcommand)]
+        acao: AcaoProjetos,
+    },
+    /// Gerencia coleções.
+    Collections {
+        #[command(subcommand)]
+        acao: AcaoColecoes,
+    },
     /// Gerencia superusuários.
     Superuser {
         #[command(subcommand)]
@@ -65,9 +75,53 @@ enum Comando {
 }
 
 #[derive(Subcommand)]
+enum AcaoProjetos {
+    /// Lista todos os projetos disponíveis.
+    List,
+    /// Cria um novo projeto vazio.
+    Create { name: String },
+    /// Apaga um projeto e seus dados.
+    Delete { name: String },
+    /// Importa uma pasta pb_data do PocketBase para um projeto do Forja.
+    ImportPb {
+        /// Caminho para a pasta pb_data que contém data.db (e opcionalmente storage).
+        path: PathBuf,
+        /// Nome do projeto destino no Forja.
+        #[arg(long)]
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AcaoColecoes {
+    /// Lista as coleções do projeto.
+    List {
+        #[arg(long, default_value = "default")]
+        project: String,
+    },
+    /// Esvazia (truncate) todos os registros e arquivos de uma coleção.
+    Truncate {
+        name: String,
+        #[arg(long, default_value = "default")]
+        project: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum AcaoSuperuser {
     /// Cria o superusuário, ou troca a senha se o e-mail já existir.
-    Upsert { email: String, senha: String },
+    Upsert {
+        email: String,
+        senha: String,
+        #[arg(long, default_value = "default")]
+        project: String,
+    },
+    /// Remove um superusuário pelo e-mail.
+    Delete {
+        email: String,
+        #[arg(long, default_value = "default")]
+        project: String,
+    },
 }
 
 #[tokio::main]
@@ -91,21 +145,113 @@ async fn executar(comando: Comando, dir: PathBuf, motor: Motor) -> Result<(), St
         Comando::Serve { http } => forja_server::serve(http, dir, motor)
             .await
             .map_err(|e| e.to_string()),
-        Comando::Superuser {
-            acao: AcaoSuperuser::Upsert { email, senha },
-        } => async {
-            let b = Banco::abrir(&motor, &dir, "default").await?;
-            b.superuser_salvar(&email, &senha).await
-        }
-        .await
-        .map(|s| println!("Superusuário {} salvo.", s.email))
-        .map_err(|e| match e {
-            forja_core::Erro::Invalido { campos, .. } => campos
-                .values()
-                .filter_map(|v| v["message"].as_str())
-                .collect::<Vec<_>>()
-                .join(" "),
-            outro => outro.to_string(),
-        }),
+        Comando::Projects { acao } => match acao {
+            AcaoProjetos::List => {
+                let gp = forja_server::GerenciadorProjetos::novo(
+                    dir,
+                    motor,
+                    std::sync::Arc::new(forja_core::correio::Console),
+                );
+                let lista = gp.listar().await;
+                println!("Projetos encontrados:");
+                for p in lista {
+                    println!("  - {p}");
+                }
+                Ok(())
+            }
+            AcaoProjetos::Create { name } => {
+                let gp = forja_server::GerenciadorProjetos::novo(
+                    dir,
+                    motor,
+                    std::sync::Arc::new(forja_core::correio::Console),
+                );
+                gp.criar(&name).await.map_err(|e| e.to_string())?;
+                println!("Projeto '{name}' criado com sucesso.");
+                Ok(())
+            }
+            AcaoProjetos::Delete { name } => {
+                let gp = forja_server::GerenciadorProjetos::novo(
+                    dir,
+                    motor,
+                    std::sync::Arc::new(forja_core::correio::Console),
+                );
+                gp.apagar(&name).await.map_err(|e| e.to_string())?;
+                println!("Projeto '{name}' apagado.");
+                Ok(())
+            }
+            AcaoProjetos::ImportPb { path, name } => {
+                let gp = forja_server::GerenciadorProjetos::novo(
+                    dir,
+                    motor,
+                    std::sync::Arc::new(forja_core::correio::Console),
+                );
+                gp.importar_pb(&path, &name)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                println!(
+                    "Projeto '{name}' importado com sucesso de {}.",
+                    path.display()
+                );
+                Ok(())
+            }
+        },
+        Comando::Collections { acao } => match acao {
+            AcaoColecoes::List { project } => {
+                let b = Banco::abrir(&motor, &dir, &project)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let cols = b.colecoes().await.map_err(|e| e.to_string())?;
+                println!("Coleções no projeto '{project}':");
+                for c in cols {
+                    let tipo = match c.kind {
+                        forja_core::CollectionType::Base => "base",
+                        forja_core::CollectionType::Auth => "auth",
+                        forja_core::CollectionType::View => "view",
+                    };
+                    println!("  - {} (id: {}, tipo: {})", c.name, c.id, tipo);
+                }
+                Ok(())
+            }
+            AcaoColecoes::Truncate { name, project } => {
+                let b = Banco::abrir(&motor, &dir, &project)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let c = b.colecao(&name).await.map_err(|e| e.to_string())?;
+                b.colecao_esvaziar(&c).await.map_err(|e| e.to_string())?;
+                println!("Coleção '{name}' no projeto '{project}' esvaziada com sucesso.");
+                Ok(())
+            }
+        },
+        Comando::Superuser { acao } => match acao {
+            AcaoSuperuser::Upsert {
+                email,
+                senha,
+                project,
+            } => async {
+                let b = Banco::abrir(&motor, &dir, &project).await?;
+                b.superuser_salvar(&email, &senha).await
+            }
+            .await
+            .map(|s| println!("Superusuário {} salvo no projeto '{project}'.", s.email))
+            .map_err(formatar_erro),
+            AcaoSuperuser::Delete { email, project } => async {
+                let b = Banco::abrir(&motor, &dir, &project).await?;
+                b.superuser_apagar(&email).await
+            }
+            .await
+            .map(|s| println!("Superusuário {} apagado do projeto '{project}'.", s.email))
+            .map_err(formatar_erro),
+        },
+    }
+}
+
+fn formatar_erro(e: forja_core::Erro) -> String {
+    match e {
+        forja_core::Erro::Invalido { campos, .. } => campos
+            .values()
+            .filter_map(|v| v["message"].as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+        outro => outro.to_string(),
     }
 }
