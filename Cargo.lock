@@ -1193,6 +1193,8 @@ dependencies = [
  "clap",
  "forja-core",
  "forja-server",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 
